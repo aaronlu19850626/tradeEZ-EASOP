@@ -157,7 +157,7 @@ input int    Inp_SyncIntervalMin   = 5;                            // 常规同�
 input int    Inp_AlignIntervalHours= 6;                            // 哈希校准频率(小时)
 input int    Inp_RequestTimeoutMS  = 10000;                        // HTTP请求超时(毫秒)
 input int    Inp_MaxBatchSize      = 100;                          // 单批次最大订单数
-input bool   Inp_DebugSync         = false;                        // 调试模式(详细日志)
+input bool   Inp_DebugSync         = true;                         // 调试模式(逐步输出专家日志)
 
 //+------------------------------------------------------------------+
 //| 枚举                                                              |
@@ -235,6 +235,7 @@ int            g_AskDir  = 0;
 // 限价输入框已提交内容(ENDEDIT 时保存,重建时填回)
 string         g_ScPriceTxt = "";
 string         g_TrPriceTxt = "";
+bool           g_PriceEditActive = false; // 输入期间暂停整面板重建,避免编辑控件层级被新卡片覆盖
 
 // 下单去抖(防止一次点击触发重复下单)
 ulong          g_LastOrderMs = 0;
@@ -2030,19 +2031,13 @@ void CreateButton(string name, int x, int y, int w, int h, string text, color bg
     ObjectSetInteger(0, objName, OBJPROP_STATE, false);
 }
 
-// 删除本EA所有对象(每次重建UI时调用,但不删除输入框避免用户输入丢失)
+// 删除本EA所有对象。输入框内容已先缓存,随后按“卡片→白框→输入框”顺序完整重建。
 void DeleteUIKeepEdits()
 {
     for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
     {
         string nm = ObjectName(0, i);
         if(StringFind(nm, Prefix) != 0) continue;
-        // 保留剥头皮输入框及其背景
-        if(nm == Prefix + "Edt_Sc_Price") continue;
-        if(nm == Prefix + "Edt_Sc_PriceBg") continue;
-        // 保留趋势输入框及其背景
-        if(nm == Prefix + "Edt_Tr_Price") continue;
-        if(nm == Prefix + "Edt_Tr_PriceBg") continue;
         ObjectDelete(0, nm);
     }
 }
@@ -2341,7 +2336,7 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
         color qbTx = allowed ? COLOR_SIGNAL_WARNING   : COLOR_BTN_DISABLED_TXT;
         color qbBd = allowed ? COLOR_SIGNAL_WARNING   : COLOR_BTN_DISABLED_BG;
         CreateButton("Btn_Sc_QuickBE",       leftX + 2*(bw+4),  contentY, bw, 30, Lang("改趋势", "TREND"), qbBg, qbBd, qbTx, 9, true);
-        // 撤止盈按钮:白色字体+淡灰边框(仅在有剥头皮持仓进入峰值追踪时激活)
+        // 撤止盈按钮:始终保持白色字体和淡灰边框,背景仍区分是否可用
         bool hasTracking = false;
         for(int i = 0; i < ArraySize(g_ScalpTrackTicket); i++)
         {
@@ -2351,9 +2346,9 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
                 break;
             }
         }
-        color tpBg = (allowed && hasTracking) ? COLOR_BTN_SYS_BG      : COLOR_BTN_DISABLED_BG;
-        color tpTx = (allowed && hasTracking) ? COLOR_TEXT_HEADER     : COLOR_BTN_DISABLED_TXT;  // 白色字体
-        color tpBd = (allowed && hasTracking) ? C'58,68,85'           : COLOR_BTN_DISABLED_BG;   // 淡灰色边框(COLOR_BTN_SYS_BORDER)
+        color tpBg = (allowed && hasTracking) ? COLOR_BTN_SYS_BG : COLOR_BTN_DISABLED_BG;
+        color tpTx = C'255,255,255';  // 纯白字体
+        color tpBd = C'176,186,201';  // 淡灰边框
         CreateButton("Btn_Sc_ClearTP",       leftX + 3*(bw+4),  contentY, bw, 30, Lang("撤止盈", "RM TP"), tpBg, tpBd, tpTx, 9, true);
     }
     else
@@ -2366,11 +2361,12 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     }
     contentY += 38;
 
-    // 限价挂单行:标签 + 白色边框矩形 + 透明输入框(浮在矩形上) + 两个限价按钮
+    // 限价挂单行:标签 + 透明白框 + 透明输入框(浮在白框上) + 两个限价按钮
     int rowH = 30;
+    int lbtnW = 78;
     CreateLabel(tag + "_Limit_Lbl", cardX + LeftPad, contentY + 9, Lang("挂单价", "PX"), COLOR_TEXT_MUTED, 8);
     int editX = cardX + LeftPad + 46;
-    int editW = 76;
+    int editW = lbtnW;  // 与后面的限价空/限价多按钮同宽
 
     // 读取输入框当前内容(含正在输入未提交的)
     string editName = Prefix + "Edt_" + tag + "_Price";
@@ -2385,14 +2381,14 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     else if((kind == SOP_SCALP && g_ScPriceTxt != "") || (kind == SOP_TREND && g_TrPriceTxt != ""))
         editVal = (kind == SOP_SCALP) ? g_ScPriceTxt : g_TrPriceTxt;
 
-    // 创建白色边框矩形背景(底层)
+    // 创建无填充的白色边框矩形(底层)
     string bgName = Prefix + "Edt_" + tag + "_PriceBg";
     ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
     ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, editX);
     ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, contentY);
     ObjectSetInteger(0, bgName, OBJPROP_XSIZE, editW);
     ObjectSetInteger(0, bgName, OBJPROP_YSIZE, rowH);
-    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, COLOR_APP_BG);
+    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, clrNONE);
     ObjectSetInteger(0, bgName, OBJPROP_BORDER_COLOR, COLOR_TEXT_HEADER);  // 白色边框
     ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
     ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
@@ -2409,15 +2405,14 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     ObjectSetString(0, editName, OBJPROP_FONT, PANEL_FONT);
     ObjectSetInteger(0, editName, OBJPROP_FONTSIZE, 10);
     ObjectSetInteger(0, editName, OBJPROP_ALIGN, ALIGN_CENTER);
-    ObjectSetInteger(0, editName, OBJPROP_BGCOLOR, COLOR_APP_BG);
-    ObjectSetInteger(0, editName, OBJPROP_BORDER_COLOR, COLOR_APP_BG);  // 无边框
+    ObjectSetInteger(0, editName, OBJPROP_BGCOLOR, clrNONE);           // 无背景色
+    ObjectSetInteger(0, editName, OBJPROP_BORDER_COLOR, clrNONE);      // 无边框
     ObjectSetInteger(0, editName, OBJPROP_COLOR, COLOR_TEXT_HEADER);
     ObjectSetInteger(0, editName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
     ObjectSetInteger(0, editName, OBJPROP_SELECTABLE, false);
     ObjectSetInteger(0, editName, OBJPROP_READONLY, false);
     ObjectSetInteger(0, editName, OBJPROP_ZORDER, 100);
 
-    int lbtnW  = 78;
     int lbuyX  = cardX + CardW - RightPad - lbtnW;   // 限价多在右
     int lsellX = lbuyX - lbtnW - 8;                   // 限价空在左
     CreateButton("Btn_" + tag + "_LSell", lsellX, contentY, lbtnW, rowH, Lang("限价空", "LIMIT SELL"), sellBg, sellBd, sellTx, 9, true);
@@ -2660,12 +2655,16 @@ void RenderChangelogPanel()
 //+------------------------------------------------------------------+
 void RenderPerfectUI()
 {
-    // 重绘前:抓取输入框当前内容存入缓存(含正在输入未提交的),再删除所有UI对象(但保留输入框)
+    // 编辑期间只保留当前画面,避免每秒重建卡片后把旧输入框压到背景层。
+    // 风控、追踪止损和同步计时仍由 OnTick/OnTimer 正常执行。
+    if(g_PriceEditActive) return;
+
+    // 重绘前抓取输入内容,再删除并按正确层级完整重建所有对象。
     if(ObjectFind(0, Prefix + "Edt_Sc_Price") >= 0)
         g_ScPriceTxt = ObjectGetString(0, Prefix + "Edt_Sc_Price", OBJPROP_TEXT);
     if(ObjectFind(0, Prefix + "Edt_Tr_Price") >= 0)
         g_TrPriceTxt = ObjectGetString(0, Prefix + "Edt_Tr_Price", OBJPROP_TEXT);
-    DeleteUIKeepEdits();  // 关键修复：保留输入框，避免用户输入丢失
+    DeleteUIKeepEdits();
 
     // 底层背景
     CreatePanel("AppBg", StartX, StartY, PanelWidth, PanelHeight, COLOR_APP_BG, COLOR_GOLD);
@@ -3241,18 +3240,31 @@ void LoadArrays()
 //+------------------------------------------------------------------+
 // 全局变量：服务器端最后同步时间（从服务器获取，缓存在本地）
 datetime g_ServerLastSyncTime = 0;
+bool     g_LastSyncQueryOK = false;  // 区分“服务器返回0”与“请求失败”
 
 // 获取服务器端的最后同步时间
 datetime GetServerLastSyncTime()
 {
-    if(!Inp_EnableSync) return 0;
-    if(Inp_SecretKey == "") return 0;
+    g_LastSyncQueryOK = false;
+    if(!Inp_EnableSync)
+    {
+        if(Inp_DebugSync) Print("[Sync Cursor] 跳过:订单同步未启用");
+        return 0;
+    }
+    if(Inp_SecretKey == "")
+    {
+        if(Inp_DebugSync) Print("[Sync Cursor] 失败:账户密钥为空");
+        return 0;
+    }
 
     // 分割Key: prefix.secret
     string parts[];
     int split = StringSplit(Inp_SecretKey, '.', parts);
-    if(split != 2) return 0;
-    string prefix = parts[0];
+    if(split != 2)
+    {
+        if(Inp_DebugSync) Print("[Sync Cursor] 失败:密钥格式无效,期望 prefix.secret");
+        return 0;
+    }
     string secret = parts[1];
 
     long login = AccountInfoInteger(ACCOUNT_LOGIN);
@@ -3272,11 +3284,20 @@ datetime GetServerLastSyncTime()
     ArrayResize(post, ArraySize(post) - 1);
 
     string url = Inp_ApiBaseURL + "/api/v1/sync/last_sync_time";
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, headers);
+    string responseHeaders = "";
+    if(Inp_DebugSync)
+        Print("[Sync Cursor] POST ", url, " | 账户=", login, " | 请求字节=", ArraySize(post));
+
+    ResetLastError();
+    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
+    int webError = GetLastError();
+    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+
+    if(Inp_DebugSync)
+        Print("[Sync Cursor] HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
 
     if(res == 200)
     {
-        string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
         // 解析JSON响应: {"last_sync_time": 1234567890}
         // 简化版JSON解析
         int pos = StringFind(response, "\"last_sync_time\"");
@@ -3294,16 +3315,20 @@ datetime GetServerLastSyncTime()
                 StringTrimLeft(numStr);
                 StringTrimRight(numStr);
                 datetime lastTime = (datetime)StringToInteger(numStr);
+                g_LastSyncQueryOK = true;
                 if(Inp_DebugSync)
-                    Print("[Sync] Server last sync time: ", TimeToString(lastTime, TIME_DATE|TIME_MINUTES));
+                    Print("[Sync Cursor] 解析成功:服务器最后同步时间=", lastTime == 0 ? "0" : TimeToString(lastTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS));
                 return lastTime;
             }
         }
+
+        if(Inp_DebugSync)
+            Print("[Sync Cursor] 失败:HTTP成功但响应缺少 last_sync_time");
     }
     else
     {
         if(Inp_DebugSync)
-            Print("[Sync] Failed to get last sync time: ", res);
+            Print("[Sync Cursor] 请求失败;若HTTP=-1,请检查WebRequest白名单和专家日志中的MT5错误码");
     }
 
     return 0; // 返回0表示从头开始同步
@@ -3325,9 +3350,10 @@ string ComputeHMAC(string secret, string body)
 }
 
 // 收集指定时间范围内的成交记录
-int CollectDealsAfterTime(datetime afterTime, string &dealsJson[])
+int CollectDealsAfterTime(datetime afterTime, string &dealsJson[], bool &collectionOK)
 {
     ArrayResize(dealsJson, 0);
+    collectionOK = false;
 
     // 选择历史范围：从 afterTime 到现在（加1秒避免边界重复）
     datetime fromTime = afterTime + 1; // 避免重复上传边界时间的订单
@@ -3335,6 +3361,7 @@ int CollectDealsAfterTime(datetime afterTime, string &dealsJson[])
 
     if(fromTime >= toTime)
     {
+        collectionOK = true;
         if(Inp_DebugSync)
             Print("[Sync] No new deals after ", TimeToString(afterTime, TIME_DATE|TIME_MINUTES));
         return 0;
@@ -3387,6 +3414,7 @@ int CollectDealsAfterTime(datetime afterTime, string &dealsJson[])
         dealsJson[n] = json;
     }
 
+    collectionOK = true;
     return ArraySize(dealsJson);
 }
 
@@ -3418,9 +3446,21 @@ datetime GetLatestDealTime(const string &dealsJson[])
 // 上传成交批次到服务器（增量同步版本）
 bool SyncDeals()
 {
-    if(!Inp_EnableSync) return false;
-    if(Inp_SecretKey == "") return false;
-    if(g_SyncInProgress) return false;
+    if(!Inp_EnableSync)
+    {
+        if(Inp_DebugSync) Print("[Sync Deals] 跳过:订单同步未启用");
+        return false;
+    }
+    if(Inp_SecretKey == "")
+    {
+        if(Inp_DebugSync) Print("[Sync Deals] 失败:账户密钥为空");
+        return false;
+    }
+    if(g_SyncInProgress)
+    {
+        if(Inp_DebugSync) Print("[Sync Deals] 跳过:已有同步任务执行中");
+        return false;
+    }
 
     g_SyncInProgress = true;
 
@@ -3455,17 +3495,35 @@ bool SyncDeals()
     if(Inp_DebugSync)
         Print("[Sync Deals] 步骤2: 收集成交记录 (从 ", TimeToString(serverLastTime, TIME_DATE|TIME_MINUTES), " 到现在)...");
     string deals[];
-    int count = CollectDealsAfterTime(serverLastTime, deals);
+    bool collectionOK = false;
+    int count = CollectDealsAfterTime(serverLastTime, deals, collectionOK);
 
     if(Inp_DebugSync)
         Print("[Sync Deals] 收集到 ", count, " 笔成交");
 
+    if(!collectionOK)
+    {
+        g_SyncInProgress = false;
+        if(Inp_DebugSync)
+            Print("[Sync Deals] 失败:MT5历史成交读取失败,不更新面板同步状态");
+        return false;
+    }
+
     if(count == 0)
     {
-        if(Inp_DebugSync)
-            Print("[Sync Deals] 没有新成交,跳过上传");
         g_SyncInProgress = false;
-        return true; // 没有新成交，视为成功
+        if(!g_LastSyncQueryOK)
+        {
+            if(Inp_DebugSync)
+                Print("[Sync Deals] 失败:服务器游标查询失败且没有可上传成交,不更新面板同步状态");
+            return false;
+        }
+
+        // 已成功查询服务器，只是没有新增成交，也属于一次成功同步。
+        g_LastSyncTime = TimeCurrent();
+        if(Inp_DebugSync)
+            Print("[Sync Deals] 完成:没有新成交,服务器状态已核对,面板更新为已同步");
+        return true;
     }
 
     // 3. 获取最后一笔成交的时间（用于更新服务器端同步时间）
@@ -3483,7 +3541,6 @@ bool SyncDeals()
         g_SyncInProgress = false;
         return false;
     }
-    string prefix = parts[0];
     string secret = parts[1];
 
     // 4. 构造请求体（包含 last_deal_time）
@@ -3511,7 +3568,14 @@ bool SyncDeals()
     string signature = ComputeHMAC(secret, body);
 
     if(Inp_DebugSync)
-        Print("[Sync Deals] 步骤4: 计算HMAC签名...");
+        Print("[Sync Deals] 步骤4: 计算请求签名... 结果=", signature == "" ? "失败" : "成功");
+
+    if(signature == "")
+    {
+        g_SyncInProgress = false;
+        if(Inp_DebugSync) Print("[Sync Deals] 失败:请求签名生成失败");
+        return false;
+    }
 
     // 准备请求头
     string headers =
@@ -3527,12 +3591,16 @@ bool SyncDeals()
 
     string url = Inp_ApiBaseURL + "/api/v1/ingest/deals";
     if(Inp_DebugSync)
-        Print("[Sync Deals] 步骤5: 发送HTTP POST请求到 ", url, " ...");
+        Print("[Sync Deals] 步骤5: POST ", url, " | 成交数=", count, " | 请求字节=", ArraySize(post));
 
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, headers);
+    string responseHeaders = "";
+    ResetLastError();
+    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
+    int webError = GetLastError();
+    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
 
     if(Inp_DebugSync)
-        Print("[Sync Deals] HTTP响应码: ", res);
+        Print("[Sync Deals] 步骤6: HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
 
     g_SyncInProgress = false;
 
@@ -3543,15 +3611,14 @@ bool SyncDeals()
         g_LastSyncTime = TimeCurrent();
 
         if(Inp_DebugSync)
-            Print("[Sync Deals] ✓ 同步成功! 已上传 ", count, " 笔成交. 最新成交时间: ",
+            Print("[Sync Deals] 完成:已上传 ", count, " 笔成交. 最新成交时间: ",
                   TimeToString(latestDealTime, TIME_DATE|TIME_MINUTES));
         return true;
     }
     else
     {
-        string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
         if(Inp_DebugSync)
-            Print("[Sync Deals] ✗ 同步失败! HTTP ", res, " 响应: ", response);
+            Print("[Sync Deals] 失败:HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
         return false;
     }
 }
@@ -3559,13 +3626,25 @@ bool SyncDeals()
 // 上传品种规格
 bool SyncSymbols()
 {
-    if(!Inp_EnableSync) return false;
-    if(Inp_SecretKey == "") return false;
+    if(Inp_DebugSync) Print("[Sync Symbols] ========== 开始同步品种规格 ==========");
+    if(!Inp_EnableSync)
+    {
+        if(Inp_DebugSync) Print("[Sync Symbols] 跳过:订单同步未启用");
+        return false;
+    }
+    if(Inp_SecretKey == "")
+    {
+        if(Inp_DebugSync) Print("[Sync Symbols] 失败:账户密钥为空");
+        return false;
+    }
 
     string parts[];
     int split = StringSplit(Inp_SecretKey, '.', parts);
-    if(split != 2) return false;
-    string prefix = parts[0];
+    if(split != 2)
+    {
+        if(Inp_DebugSync) Print("[Sync Symbols] 失败:密钥格式无效,期望 prefix.secret");
+        return false;
+    }
     string secret = parts[1];
 
     long login = AccountInfoInteger(ACCOUNT_LOGIN);
@@ -3594,27 +3673,51 @@ bool SyncSymbols()
     ArrayResize(post, ArraySize(post) - 1);
 
     string url = Inp_ApiBaseURL + "/api/v1/ingest/symbols";
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, headers);
+    if(Inp_DebugSync)
+        Print("[Sync Symbols] POST ", url, " | 品种=", _Symbol, " | digits=", digits,
+              " | point=", DoubleToString(point, digits), " | 请求字节=", ArraySize(post));
+
+    string responseHeaders = "";
+    ResetLastError();
+    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
+    int webError = GetLastError();
+    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+
+    if(Inp_DebugSync)
+        Print("[Sync Symbols] HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
 
     if(res == 200)
     {
         if(Inp_DebugSync)
-            Print("[Sync] Symbol specs synced");
+            Print("[Sync Symbols] 完成:品种规格同步成功");
         return true;
     }
+    if(Inp_DebugSync) Print("[Sync Symbols] 失败:品种规格未被服务器接受");
     return false;
 }
 
 // 上传账户快照
 bool SyncSnapshot()
 {
-    if(!Inp_EnableSync) return false;
-    if(Inp_SecretKey == "") return false;
+    if(Inp_DebugSync) Print("[Sync Snapshot] ========== 开始同步账户快照 ==========");
+    if(!Inp_EnableSync)
+    {
+        if(Inp_DebugSync) Print("[Sync Snapshot] 跳过:订单同步未启用");
+        return false;
+    }
+    if(Inp_SecretKey == "")
+    {
+        if(Inp_DebugSync) Print("[Sync Snapshot] 失败:账户密钥为空");
+        return false;
+    }
 
     string parts[];
     int split = StringSplit(Inp_SecretKey, '.', parts);
-    if(split != 2) return false;
-    string prefix = parts[0];
+    if(split != 2)
+    {
+        if(Inp_DebugSync) Print("[Sync Snapshot] 失败:密钥格式无效,期望 prefix.secret");
+        return false;
+    }
     string secret = parts[1];
 
     long login = AccountInfoInteger(ACCOUNT_LOGIN);
@@ -3644,21 +3747,46 @@ bool SyncSnapshot()
     ArrayResize(post, ArraySize(post) - 1);
 
     string url = Inp_ApiBaseURL + "/api/v1/ingest/snapshots";
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, headers);
+    if(Inp_DebugSync)
+        Print("[Sync Snapshot] POST ", url, " | balance=", DoubleToString(balance, 2),
+              " | equity=", DoubleToString(equity, 2), " | 请求字节=", ArraySize(post));
 
-    return (res == 200);
+    string responseHeaders = "";
+    ResetLastError();
+    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
+    int webError = GetLastError();
+    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+    bool ok = (res == 200);
+
+    if(Inp_DebugSync)
+        Print("[Sync Snapshot] ", ok ? "完成" : "失败", ":HTTP=", res,
+              " | MT5错误=", webError, " | 响应=", response);
+
+    return ok;
 }
 
 // 发送心跳
 bool SyncHeartbeat()
 {
-    if(!Inp_EnableSync) return false;
-    if(Inp_SecretKey == "") return false;
+    if(Inp_DebugSync) Print("[Sync Heartbeat] ========== 开始发送心跳 ==========");
+    if(!Inp_EnableSync)
+    {
+        if(Inp_DebugSync) Print("[Sync Heartbeat] 跳过:订单同步未启用");
+        return false;
+    }
+    if(Inp_SecretKey == "")
+    {
+        if(Inp_DebugSync) Print("[Sync Heartbeat] 失败:账户密钥为空");
+        return false;
+    }
 
     string parts[];
     int split = StringSplit(Inp_SecretKey, '.', parts);
-    if(split != 2) return false;
-    string prefix = parts[0];
+    if(split != 2)
+    {
+        if(Inp_DebugSync) Print("[Sync Heartbeat] 失败:密钥格式无效,期望 prefix.secret");
+        return false;
+    }
     string secret = parts[1];
 
     long login = AccountInfoInteger(ACCOUNT_LOGIN);
@@ -3678,9 +3806,21 @@ bool SyncHeartbeat()
     ArrayResize(post, ArraySize(post) - 1);
 
     string url = Inp_ApiBaseURL + "/api/v1/ingest/heartbeat";
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, headers);
+    if(Inp_DebugSync)
+        Print("[Sync Heartbeat] POST ", url, " | 账户=", login, " | 请求字节=", ArraySize(post));
 
-    return (res == 200);
+    string responseHeaders = "";
+    ResetLastError();
+    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
+    int webError = GetLastError();
+    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+    bool ok = (res == 200);
+
+    if(Inp_DebugSync)
+        Print("[Sync Heartbeat] ", ok ? "完成" : "失败", ":HTTP=", res,
+              " | MT5错误=", webError, " | 响应=", response);
+
+    return ok;
 }
 
 //+------------------------------------------------------------------+
@@ -3727,39 +3867,39 @@ int OnInit()
 
     EventSetTimer(MathMax(1, Inp_RefreshSeconds));
 
-    // 数据同步初始化
-    if(Inp_EnableSync && Inp_SecretKey != "")
+    // 数据同步初始化:启用后立即执行一次,不等待首个定时周期
+    g_LastSyncTime = 0;
+    g_ServerLastSyncTime = 0;
+    g_SyncTimerCounter = 0;
+    g_AlignTimerCounter = 0;
+
+    if(Inp_EnableSync)
     {
-        if(Inp_DebugSync)
-            Print("[Sync Init] 数据同步模块启动...");
-
-        // 首次启动时上传品种规格
-        if(Inp_DebugSync)
-            Print("[Sync Init] 步骤1: 上传品种规格...");
-        bool symbolOk = SyncSymbols();
-        if(Inp_DebugSync)
-            Print("[Sync Init] 品种规格上传", (symbolOk ? "成功" : "失败"));
-
-        // 获取服务器端最后同步时间并缓存
-        if(Inp_DebugSync)
-            Print("[Sync Init] 步骤2: 获取服务器最后同步时间...");
-        g_ServerLastSyncTime = GetServerLastSyncTime();
-
-        if(Inp_DebugSync)
+        if(Inp_SecretKey == "")
         {
-            if(g_ServerLastSyncTime == 0)
-                Print("[Sync Init] 服务器最后同步时间: 0 (首次同步,将从7天前开始)");
-            else
-                Print("[Sync Init] 服务器最后同步时间: ", TimeToString(g_ServerLastSyncTime, TIME_DATE|TIME_MINUTES));
+            Print("[Sync Init] 初始化失败:已启用订单同步,但账户密钥为空");
         }
+        else
+        {
+            if(Inp_DebugSync)
+                Print("[Sync Init] ========== 数据同步模块启动 ==========",
+                      " | API=", Inp_ApiBaseURL, " | 周期=", Inp_SyncIntervalMin, "分钟");
 
-        // 初始化同步状态为"未同步"
-        g_LastSyncTime = 0;
-        g_SyncTimerCounter = 0;
-        g_AlignTimerCounter = 0;
+            if(Inp_DebugSync) Print("[Sync Init] 步骤1/2:上传当前品种规格");
+            bool symbolOk = SyncSymbols();
 
-        if(Inp_DebugSync)
-            Print("[Sync Init] 数据同步模块初始化完成. 首次同步将在 ", Inp_SyncIntervalMin, " 分钟后执行");
+            if(Inp_DebugSync) Print("[Sync Init] 步骤2/2:立即同步成交");
+            bool dealsOk = SyncDeals();
+
+            if(Inp_DebugSync)
+                Print("[Sync Init] 初始化完成 | 品种规格=", symbolOk ? "成功" : "失败",
+                      " | 成交同步=", dealsOk ? "成功" : "失败",
+                      " | 下次同步=", Inp_SyncIntervalMin, "分钟后");
+
+            // 立即刷新标题栏同步状态。
+            RenderPerfectUI();
+            ChartRedraw();
+        }
     }
 
     return INIT_SUCCEEDED;
@@ -3787,23 +3927,26 @@ void OnTimer()
     CheckAllRiskControl();
     RenderPerfectUI();
 
-    // 数据同步定时器(每秒递增计数器)
+    // 数据同步定时器(按实际定时器周期累计秒数)
     if(Inp_EnableSync)
     {
-        g_SyncTimerCounter++;
-        g_AlignTimerCounter++;
+        int timerStep = MathMax(1, Inp_RefreshSeconds);
+        g_SyncTimerCounter += timerStep;
+        g_AlignTimerCounter += timerStep;
 
         // 每N分钟常规同步成交
-        int syncInterval = Inp_SyncIntervalMin * 60; // 转换为秒
+        int syncInterval = MathMax(1, Inp_SyncIntervalMin * 60); // 转换为秒
         if(g_SyncTimerCounter >= syncInterval)
         {
             g_SyncTimerCounter = 0;
             SyncDeals();
+            RenderPerfectUI();
+            ChartRedraw();
         }
 
         // 每30秒上传一次快照(净值曲线)
         static int snapshotCounter = 0;
-        snapshotCounter++;
+        snapshotCounter += timerStep;
         if(snapshotCounter >= 30)
         {
             snapshotCounter = 0;
@@ -3812,7 +3955,7 @@ void OnTimer()
 
         // 每5分钟发送一次心跳
         static int heartbeatCounter = 0;
-        heartbeatCounter++;
+        heartbeatCounter += timerStep;
         if(heartbeatCounter >= 300)
         {
             heartbeatCounter = 0;
@@ -3838,18 +3981,35 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 //+------------------------------------------------------------------+
 void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
 {
+    // 点击价格输入框后进入编辑保护状态。在收到 ENDEDIT 前不重建整套UI。
+    if(id == CHARTEVENT_OBJECT_CLICK &&
+       (sparam == Prefix + "Edt_Sc_Price" || sparam == Prefix + "Edt_Tr_Price"))
+    {
+        g_PriceEditActive = true;
+        return;
+    }
+
     // 输入框编辑结束(回车/失焦):把值实时存入全局
     if(id == CHARTEVENT_OBJECT_ENDEDIT)
     {
+        bool priceEditEnded = false;
         if(sparam == Prefix + "Edt_Sc_Price")
         {
             g_ScPriceTxt = ObjectGetString(0, Prefix + "Edt_Sc_Price", OBJPROP_TEXT);
             PrintFormat("[输入框提交] 剥头皮挂单价=\"%s\"", g_ScPriceTxt);
+            priceEditEnded = true;
         }
         else if(sparam == Prefix + "Edt_Tr_Price")
         {
             g_TrPriceTxt = ObjectGetString(0, Prefix + "Edt_Tr_Price", OBJPROP_TEXT);
             PrintFormat("[输入框提交] 趋势挂单价=\"%s\"", g_TrPriceTxt);
+            priceEditEnded = true;
+        }
+
+        if(priceEditEnded)
+        {
+            g_PriceEditActive = false;
+            RenderPerfectUI(); // 失焦后按正确创建顺序重建,输入框不会再被卡片背景覆盖
         }
         return;
     }
