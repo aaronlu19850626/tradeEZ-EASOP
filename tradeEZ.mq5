@@ -1,6 +1,7 @@
 //+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
+//|                  最后修改时间：2026-09-17 19:30（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -2403,7 +2404,7 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     ObjectSetInteger(0, editName, OBJPROP_YSIZE, rowH - 4);
     ObjectSetString(0, editName, OBJPROP_TEXT, editVal);
     ObjectSetString(0, editName, OBJPROP_FONT, PANEL_FONT);
-    ObjectSetInteger(0, editName, OBJPROP_FONTSIZE, 10);
+    ObjectSetInteger(0, editName, OBJPROP_FONTSIZE, 12);
     ObjectSetInteger(0, editName, OBJPROP_ALIGN, ALIGN_CENTER);
     ObjectSetInteger(0, editName, OBJPROP_BGCOLOR, clrNONE);           // 无背景色
     ObjectSetInteger(0, editName, OBJPROP_BORDER_COLOR, clrNONE);      // 无边框
