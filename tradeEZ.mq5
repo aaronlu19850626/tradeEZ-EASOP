@@ -2030,53 +2030,7 @@ void CreateButton(string name, int x, int y, int w, int h, string text, color bg
     ObjectSetInteger(0, objName, OBJPROP_STATE, false);
 }
 
-void CreateEdit(string name, int x, int y, int w, int h, string default_text)
-{
-    string objName = Prefix + name;
-    string bgName = Prefix + name + "_Bg";  // 底层白色边框矩形
-
-    // 关键修复：如果输入框已存在，不重建，只更新内容（保持焦点状态）
-    if(ObjectFind(0, objName) >= 0)
-    {
-        // 输入框已存在，只更新文本内容（不影响焦点）
-        ObjectSetString(0, objName, OBJPROP_TEXT, default_text);
-        return;
-    }
-
-    // 1. 先创建底层白色边框矩形（提供视觉边框）
-    ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
-    ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, x);
-    ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, y);
-    ObjectSetInteger(0, bgName, OBJPROP_XSIZE, w);
-    ObjectSetInteger(0, bgName, OBJPROP_YSIZE, h);
-    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, COLOR_APP_BG);           // 深色底
-    ObjectSetInteger(0, bgName, OBJPROP_BORDER_COLOR, COLOR_TEXT_HEADER); // 白色边框
-    ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
-    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-    ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE, false);
-    ObjectSetInteger(0, bgName, OBJPROP_ZORDER, 99);  // 在输入框下层
-
-    // 2. 再创建无边框输入框（浮在矩形上层）
-    ObjectCreate(0, objName, OBJ_EDIT, 0, 0, 0);
-    ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, x + 2);  // 向右2px避开边框
-    ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, y + 2);  // 向下2px避开边框
-    ObjectSetInteger(0, objName, OBJPROP_XSIZE, w - 4);      // 宽度减4px（左右各2px）
-    ObjectSetInteger(0, objName, OBJPROP_YSIZE, h - 4);      // 高度减4px（上下各2px）
-    ObjectSetString(0, objName, OBJPROP_TEXT, default_text);
-    ObjectSetString(0, objName, OBJPROP_FONT, PANEL_FONT " Bold");
-    ObjectSetInteger(0, objName, OBJPROP_FONTSIZE, 11);
-    ObjectSetInteger(0, objName, OBJPROP_ALIGN, ALIGN_CENTER);
-    // 关键：无边框，透明背景，浮在白色矩形边框上
-    ObjectSetInteger(0, objName, OBJPROP_BGCOLOR, COLOR_APP_BG);           // 深色底
-    ObjectSetInteger(0, objName, OBJPROP_BORDER_COLOR, COLOR_APP_BG);      // 无边框（同底色）
-    ObjectSetInteger(0, objName, OBJPROP_COLOR, COLOR_TEXT_HEADER);        // 白色文字
-    ObjectSetInteger(0, objName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-    ObjectSetInteger(0, objName, OBJPROP_SELECTABLE, false);
-    ObjectSetInteger(0, objName, OBJPROP_ZORDER, 100);  // 在矩形上层
-    ObjectSetInteger(0, objName, OBJPROP_READONLY, false);  // 确保可编辑
-}
-
-// 删除本EA所有对象,但保留两个限价输入框及其背景矩形(它们不随刷新重建)
+// 删除本EA所有对象(每次重建UI时调用,但不删除输入框避免用户输入丢失)
 void DeleteUIKeepEdits()
 {
     for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
@@ -2085,10 +2039,10 @@ void DeleteUIKeepEdits()
         if(StringFind(nm, Prefix) != 0) continue;
         // 保留剥头皮输入框及其背景
         if(nm == Prefix + "Edt_Sc_Price") continue;
-        if(nm == Prefix + "Edt_Sc_Price_Bg") continue;
+        if(nm == Prefix + "Edt_Sc_PriceBg") continue;
         // 保留趋势输入框及其背景
         if(nm == Prefix + "Edt_Tr_Price") continue;
-        if(nm == Prefix + "Edt_Tr_Price_Bg") continue;
+        if(nm == Prefix + "Edt_Tr_PriceBg") continue;
         ObjectDelete(0, nm);
     }
 }
@@ -2387,7 +2341,7 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
         color qbTx = allowed ? COLOR_SIGNAL_WARNING   : COLOR_BTN_DISABLED_TXT;
         color qbBd = allowed ? COLOR_SIGNAL_WARNING   : COLOR_BTN_DISABLED_BG;
         CreateButton("Btn_Sc_QuickBE",       leftX + 2*(bw+4),  contentY, bw, 30, Lang("改趋势", "TREND"), qbBg, qbBd, qbTx, 9, true);
-        // 撤止盈按钮(仅在有剥头皮持仓进入峰值追踪时激活)
+        // 撤止盈按钮:白色字体+淡灰边框(仅在有剥头皮持仓进入峰值追踪时激活)
         bool hasTracking = false;
         for(int i = 0; i < ArraySize(g_ScalpTrackTicket); i++)
         {
@@ -2398,8 +2352,8 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
             }
         }
         color tpBg = (allowed && hasTracking) ? COLOR_BTN_SYS_BG      : COLOR_BTN_DISABLED_BG;
-        color tpTx = (allowed && hasTracking) ? COLOR_TEXT_HEADER      : COLOR_BTN_DISABLED_TXT;  // 白色字体
-        color tpBd = (allowed && hasTracking) ? COLOR_BTN_SYS_BORDER   : COLOR_BTN_DISABLED_BG;   // 淡灰色边框
+        color tpTx = (allowed && hasTracking) ? COLOR_TEXT_HEADER     : COLOR_BTN_DISABLED_TXT;  // 白色字体
+        color tpBd = (allowed && hasTracking) ? C'58,68,85'           : COLOR_BTN_DISABLED_BG;   // 淡灰色边框(COLOR_BTN_SYS_BORDER)
         CreateButton("Btn_Sc_ClearTP",       leftX + 3*(bw+4),  contentY, bw, 30, Lang("撤止盈", "RM TP"), tpBg, tpBd, tpTx, 9, true);
     }
     else
@@ -2412,27 +2366,56 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     }
     contentY += 38;
 
-    // 限价挂单行:标签 + 输入框(与按钮同高)+ 间距 + 两个限价按钮
+    // 限价挂单行:标签 + 白色边框矩形 + 透明输入框(浮在矩形上) + 两个限价按钮
     int rowH = 30;
     CreateLabel(tag + "_Limit_Lbl", cardX + LeftPad, contentY + 9, Lang("挂单价", "PX"), COLOR_TEXT_MUTED, 8);
     int editX = cardX + LeftPad + 46;
     int editW = 76;
 
-    // 关键修复：先读取输入框当前实时内容（含正在输入未提交的），优先级最高
+    // 读取输入框当前内容(含正在输入未提交的)
     string editName = Prefix + "Edt_" + tag + "_Price";
     string liveText = "";
     if(ObjectFind(0, editName) >= 0)
         liveText = ObjectGetString(0, editName, OBJPROP_TEXT);
 
-    // 决定显示内容：实时输入 > 已提交缓存 > 空白（不自动填充现价，让用户主动输入）
+    // 决定显示内容:实时输入 > 已提交缓存 > 空白
     string editVal = "";
     if(liveText != "")
-        editVal = liveText;  // 用户正在输入或已输入未提交 → 保留
+        editVal = liveText;
     else if((kind == SOP_SCALP && g_ScPriceTxt != "") || (kind == SOP_TREND && g_TrPriceTxt != ""))
-        editVal = (kind == SOP_SCALP) ? g_ScPriceTxt : g_TrPriceTxt;  // 已提交缓存
-    // else 不填充默认值，保持空白，让用户主动输入
+        editVal = (kind == SOP_SCALP) ? g_ScPriceTxt : g_TrPriceTxt;
 
-    CreateEdit("Edt_" + tag + "_Price", editX, contentY, editW, rowH, editVal);
+    // 创建白色边框矩形背景(底层)
+    string bgName = Prefix + "Edt_" + tag + "_PriceBg";
+    ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, editX);
+    ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, contentY);
+    ObjectSetInteger(0, bgName, OBJPROP_XSIZE, editW);
+    ObjectSetInteger(0, bgName, OBJPROP_YSIZE, rowH);
+    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, COLOR_APP_BG);
+    ObjectSetInteger(0, bgName, OBJPROP_BORDER_COLOR, COLOR_TEXT_HEADER);  // 白色边框
+    ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, bgName, OBJPROP_ZORDER, 99);
+
+    // 创建透明输入框(上层,浮在矩形上,内缩2px)
+    ObjectCreate(0, editName, OBJ_EDIT, 0, 0, 0);
+    ObjectSetInteger(0, editName, OBJPROP_XDISTANCE, editX + 2);
+    ObjectSetInteger(0, editName, OBJPROP_YDISTANCE, contentY + 2);
+    ObjectSetInteger(0, editName, OBJPROP_XSIZE, editW - 4);
+    ObjectSetInteger(0, editName, OBJPROP_YSIZE, rowH - 4);
+    ObjectSetString(0, editName, OBJPROP_TEXT, editVal);
+    ObjectSetString(0, editName, OBJPROP_FONT, PANEL_FONT);
+    ObjectSetInteger(0, editName, OBJPROP_FONTSIZE, 10);
+    ObjectSetInteger(0, editName, OBJPROP_ALIGN, ALIGN_CENTER);
+    ObjectSetInteger(0, editName, OBJPROP_BGCOLOR, COLOR_APP_BG);
+    ObjectSetInteger(0, editName, OBJPROP_BORDER_COLOR, COLOR_APP_BG);  // 无边框
+    ObjectSetInteger(0, editName, OBJPROP_COLOR, COLOR_TEXT_HEADER);
+    ObjectSetInteger(0, editName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, editName, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, editName, OBJPROP_READONLY, false);
+    ObjectSetInteger(0, editName, OBJPROP_ZORDER, 100);
 
     int lbtnW  = 78;
     int lbuyX  = cardX + CardW - RightPad - lbtnW;   // 限价多在右
@@ -3441,32 +3424,54 @@ bool SyncDeals()
 
     g_SyncInProgress = true;
 
+    if(Inp_DebugSync)
+        Print("[Sync Deals] ========== 开始同步成交 ==========");
+
     // 1. 获取服务器端最后同步时间
+    if(Inp_DebugSync)
+        Print("[Sync Deals] 步骤1: 获取服务器最后同步时间...");
     datetime serverLastTime = GetServerLastSyncTime();
 
     // 如果获取失败且有缓存值，使用缓存
     if(serverLastTime == 0 && g_ServerLastSyncTime > 0)
+    {
         serverLastTime = g_ServerLastSyncTime;
+        if(Inp_DebugSync)
+            Print("[Sync Deals] 服务器返回0,使用缓存值: ", TimeToString(serverLastTime, TIME_DATE|TIME_MINUTES));
+    }
 
     // 如果还是0，从7天前开始（首次同步）
     if(serverLastTime == 0)
+    {
         serverLastTime = TimeCurrent() - 7 * 86400;
+        if(Inp_DebugSync)
+            Print("[Sync Deals] 首次同步,从7天前开始: ", TimeToString(serverLastTime, TIME_DATE|TIME_MINUTES));
+    }
 
     // 更新缓存
     g_ServerLastSyncTime = serverLastTime;
 
     // 2. 收集 serverLastTime 之后的所有成交
+    if(Inp_DebugSync)
+        Print("[Sync Deals] 步骤2: 收集成交记录 (从 ", TimeToString(serverLastTime, TIME_DATE|TIME_MINUTES), " 到现在)...");
     string deals[];
     int count = CollectDealsAfterTime(serverLastTime, deals);
 
+    if(Inp_DebugSync)
+        Print("[Sync Deals] 收集到 ", count, " 笔成交");
+
     if(count == 0)
     {
+        if(Inp_DebugSync)
+            Print("[Sync Deals] 没有新成交,跳过上传");
         g_SyncInProgress = false;
         return true; // 没有新成交，视为成功
     }
 
     // 3. 获取最后一笔成交的时间（用于更新服务器端同步时间）
     datetime latestDealTime = GetLatestDealTime(deals);
+    if(Inp_DebugSync)
+        Print("[Sync Deals] 最后一笔成交时间: ", TimeToString(latestDealTime, TIME_DATE|TIME_MINUTES));
 
     // 分割Key: prefix.secret
     string parts[];
@@ -3474,7 +3479,7 @@ bool SyncDeals()
     if(split != 2)
     {
         if(Inp_DebugSync)
-            Print("[Sync] Invalid key format, expected prefix.secret");
+            Print("[Sync Deals] 错误: 密钥格式无效,期望 prefix.secret");
         g_SyncInProgress = false;
         return false;
     }
@@ -3484,6 +3489,9 @@ bool SyncDeals()
     // 4. 构造请求体（包含 last_deal_time）
     long login = AccountInfoInteger(ACCOUNT_LOGIN);
     int gmtOffset = ServerGmtOffset();
+
+    if(Inp_DebugSync)
+        Print("[Sync Deals] 步骤3: 构造请求体 (MT5账户: ", login, ", GMT偏移: ", gmtOffset, "秒)...");
 
     string bodyDeals = "";
     for(int i = 0; i < ArraySize(deals); i++)
@@ -3502,6 +3510,9 @@ bool SyncDeals()
     long timestamp = TimeGMT();
     string signature = ComputeHMAC(secret, body);
 
+    if(Inp_DebugSync)
+        Print("[Sync Deals] 步骤4: 计算HMAC签名...");
+
     // 准备请求头
     string headers =
         "Content-Type: application/json\r\n" +
@@ -3515,7 +3526,13 @@ bool SyncDeals()
     ArrayResize(post, ArraySize(post) - 1);
 
     string url = Inp_ApiBaseURL + "/api/v1/ingest/deals";
+    if(Inp_DebugSync)
+        Print("[Sync Deals] 步骤5: 发送HTTP POST请求到 ", url, " ...");
+
     int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, headers);
+
+    if(Inp_DebugSync)
+        Print("[Sync Deals] HTTP响应码: ", res);
 
     g_SyncInProgress = false;
 
@@ -3526,7 +3543,7 @@ bool SyncDeals()
         g_LastSyncTime = TimeCurrent();
 
         if(Inp_DebugSync)
-            Print("[Sync] Successfully synced ", count, " deals. Latest deal time: ",
+            Print("[Sync Deals] ✓ 同步成功! 已上传 ", count, " 笔成交. 最新成交时间: ",
                   TimeToString(latestDealTime, TIME_DATE|TIME_MINUTES));
         return true;
     }
@@ -3534,7 +3551,7 @@ bool SyncDeals()
     {
         string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
         if(Inp_DebugSync)
-            Print("[Sync] Failed: ", res, " ", response);
+            Print("[Sync Deals] ✗ 同步失败! HTTP ", res, " 响应: ", response);
         return false;
     }
 }
@@ -3713,15 +3730,36 @@ int OnInit()
     // 数据同步初始化
     if(Inp_EnableSync && Inp_SecretKey != "")
     {
+        if(Inp_DebugSync)
+            Print("[Sync Init] 数据同步模块启动...");
+
         // 首次启动时上传品种规格
-        SyncSymbols();
+        if(Inp_DebugSync)
+            Print("[Sync Init] 步骤1: 上传品种规格...");
+        bool symbolOk = SyncSymbols();
+        if(Inp_DebugSync)
+            Print("[Sync Init] 品种规格上传", (symbolOk ? "成功" : "失败"));
 
         // 获取服务器端最后同步时间并缓存
+        if(Inp_DebugSync)
+            Print("[Sync Init] 步骤2: 获取服务器最后同步时间...");
         g_ServerLastSyncTime = GetServerLastSyncTime();
 
         if(Inp_DebugSync)
-            Print("[Sync] Module initialized. Server last sync time: ",
-                  TimeToString(g_ServerLastSyncTime, TIME_DATE|TIME_MINUTES));
+        {
+            if(g_ServerLastSyncTime == 0)
+                Print("[Sync Init] 服务器最后同步时间: 0 (首次同步,将从7天前开始)");
+            else
+                Print("[Sync Init] 服务器最后同步时间: ", TimeToString(g_ServerLastSyncTime, TIME_DATE|TIME_MINUTES));
+        }
+
+        // 初始化同步状态为"未同步"
+        g_LastSyncTime = 0;
+        g_SyncTimerCounter = 0;
+        g_AlignTimerCounter = 0;
+
+        if(Inp_DebugSync)
+            Print("[Sync Init] 数据同步模块初始化完成. 首次同步将在 ", Inp_SyncIntervalMin, " 分钟后执行");
     }
 
     return INIT_SUCCEEDED;
