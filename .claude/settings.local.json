@@ -9,7 +9,8 @@
       "PowerShell($pwd.Path)",
       "PowerShell($file = \"Gold_SOP_EA.mq5\"; if\\(Test-Path $file\\) { $lines = Get-Content $file; Write-Output \"File has $\\($lines.Count\\) lines\"; $lines | Select-String -Pattern \"void OnTimer|void OnTradeTransaction|AppendDealToQueue|SyncDeals\" | Select-Object -First 10 LineNumber, Line } else { Write-Output \"File not found\" })",
       "PowerShell($file = \"Gold_SOP_EA.mq5\"; $lines = Get-Content $file; Write-Output \"Total lines: $\\($lines.Count\\)\"; Write-Output \"`nSync module section:\"; $lines | Select-String -Pattern \"数据同步|Data Sync|Sync\" -Context 0,0 | Select-Object -First 15 LineNumber, Line | Format-Table -AutoSize)",
-      "PowerShell($file = \"Gold_SOP_EA.mq5\"; $lines = Get-Content $file; Write-Output \"Total lines: $\\($lines.Count\\)\"; Write-Output \"`nKey incremental sync functions:\"; $lines | Select-String -Pattern \"GetServerLastSyncTime|CollectDealsAfterTime|GetLatestDealTime|g_ServerLastSyncTime\" | Select-Object -First 10 LineNumber, Line | Format-Table -Wrap)"
+      "PowerShell($file = \"Gold_SOP_EA.mq5\"; $lines = Get-Content $file; Write-Output \"Total lines: $\\($lines.Count\\)\"; Write-Output \"`nKey incremental sync functions:\"; $lines | Select-String -Pattern \"GetServerLastSyncTime|CollectDealsAfterTime|GetLatestDealTime|g_ServerLastSyncTime\" | Select-Object -First 10 LineNumber, Line | Format-Table -Wrap)",
+      "Bash(git add *)"
     ]
   }
 }

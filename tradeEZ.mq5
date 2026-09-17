@@ -866,6 +866,41 @@ bool ModifySLClearTP(ulong ticket, double newSL)
 }
 
 //+------------------------------------------------------------------+
+//| 剥头皮撤止盈:仅清除已进入峰值追踪的持仓的止盈,保留止损            |
+//+------------------------------------------------------------------+
+void ClearScalpTP()
+{
+    int found = 0, cleared = 0;
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong tk = PositionGetTicket(i);
+        if(tk == 0) continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        if(PosType() != SOP_SCALP) continue;
+
+        // 必须已进入峰值追踪(在 g_ScalpTrackTicket 名单中)
+        int idx = ScalpTrackIndex(tk);
+        if(idx < 0) continue;  // 未进入峰值追踪,跳过
+
+        found++;
+
+        double curSL = PositionGetDouble(POSITION_SL);
+        double curTP = PositionGetDouble(POSITION_TP);
+        if(curTP == 0.0) continue;  // 已无止盈,跳过
+
+        // 清除止盈,保留止损
+        if(g_trade.PositionModify(tk, curSL, 0.0))
+            cleared++;
+    }
+
+    if(found == 0)
+        Alert(Lang("无剥头皮持仓已进入峰值追踪", "No scalp in peak trail"));
+    else if(cleared > 0)
+        Alert(StringFormat(Lang("已清除 %d 单止盈", "Cleared %d TP"), cleared));
+}
+
+//+------------------------------------------------------------------+
 //| 剥头皮一键改趋势单:必须盈利达趋势第一目标才允许转换              |
 //+------------------------------------------------------------------+
 void ConvertScalpToTrend()
@@ -1998,33 +2033,62 @@ void CreateButton(string name, int x, int y, int w, int h, string text, color bg
 void CreateEdit(string name, int x, int y, int w, int h, string default_text)
 {
     string objName = Prefix + name;
-    ObjectCreate(0, objName, OBJ_EDIT, 0, 0, 0);   // 每次重建,保证在最上层可见
-    ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, x);
-    ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, y);
-    ObjectSetInteger(0, objName, OBJPROP_XSIZE, w);
-    ObjectSetInteger(0, objName, OBJPROP_YSIZE, h);
+    string bgName = Prefix + name + "_Bg";  // 底层白色边框矩形
+
+    // 关键修复：如果输入框已存在，不重建，只更新内容（保持焦点状态）
+    if(ObjectFind(0, objName) >= 0)
+    {
+        // 输入框已存在，只更新文本内容（不影响焦点）
+        ObjectSetString(0, objName, OBJPROP_TEXT, default_text);
+        return;
+    }
+
+    // 1. 先创建底层白色边框矩形（提供视觉边框）
+    ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, bgName, OBJPROP_XSIZE, w);
+    ObjectSetInteger(0, bgName, OBJPROP_YSIZE, h);
+    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, COLOR_APP_BG);           // 深色底
+    ObjectSetInteger(0, bgName, OBJPROP_BORDER_COLOR, COLOR_TEXT_HEADER); // 白色边框
+    ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, bgName, OBJPROP_ZORDER, 99);  // 在输入框下层
+
+    // 2. 再创建无边框输入框（浮在矩形上层）
+    ObjectCreate(0, objName, OBJ_EDIT, 0, 0, 0);
+    ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, x + 2);  // 向右2px避开边框
+    ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, y + 2);  // 向下2px避开边框
+    ObjectSetInteger(0, objName, OBJPROP_XSIZE, w - 4);      // 宽度减4px（左右各2px）
+    ObjectSetInteger(0, objName, OBJPROP_YSIZE, h - 4);      // 高度减4px（上下各2px）
     ObjectSetString(0, objName, OBJPROP_TEXT, default_text);
     ObjectSetString(0, objName, OBJPROP_FONT, PANEL_FONT " Bold");
     ObjectSetInteger(0, objName, OBJPROP_FONTSIZE, 11);
     ObjectSetInteger(0, objName, OBJPROP_ALIGN, ALIGN_CENTER);
-    // 可见输入框:深色底 + 明显边框
-    ObjectSetInteger(0, objName, OBJPROP_BGCOLOR, COLOR_APP_BG);
-    ObjectSetInteger(0, objName, OBJPROP_BORDER_COLOR, COLOR_SIGNAL_WARNING);
-    ObjectSetInteger(0, objName, OBJPROP_COLOR, COLOR_TEXT_HEADER);
+    // 关键：无边框，透明背景，浮在白色矩形边框上
+    ObjectSetInteger(0, objName, OBJPROP_BGCOLOR, COLOR_APP_BG);           // 深色底
+    ObjectSetInteger(0, objName, OBJPROP_BORDER_COLOR, COLOR_APP_BG);      // 无边框（同底色）
+    ObjectSetInteger(0, objName, OBJPROP_COLOR, COLOR_TEXT_HEADER);        // 白色文字
     ObjectSetInteger(0, objName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
     ObjectSetInteger(0, objName, OBJPROP_SELECTABLE, false);
-    ObjectSetInteger(0, objName, OBJPROP_ZORDER, 100);
+    ObjectSetInteger(0, objName, OBJPROP_ZORDER, 100);  // 在矩形上层
+    ObjectSetInteger(0, objName, OBJPROP_READONLY, false);  // 确保可编辑
 }
 
-// 删除本EA所有对象,但保留两个限价输入框(它们不随刷新重建)
+// 删除本EA所有对象,但保留两个限价输入框及其背景矩形(它们不随刷新重建)
 void DeleteUIKeepEdits()
 {
     for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
     {
         string nm = ObjectName(0, i);
         if(StringFind(nm, Prefix) != 0) continue;
+        // 保留剥头皮输入框及其背景
         if(nm == Prefix + "Edt_Sc_Price") continue;
+        if(nm == Prefix + "Edt_Sc_Price_Bg") continue;
+        // 保留趋势输入框及其背景
         if(nm == Prefix + "Edt_Tr_Price") continue;
+        if(nm == Prefix + "Edt_Tr_Price_Bg") continue;
         ObjectDelete(0, nm);
     }
 }
@@ -2315,14 +2379,28 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     int leftX = cardX + LeftPad;
     if(kind == SOP_SCALP)
     {
-        // 剥头皮:做空(左) / 做多(右) / 快速移损(三按钮均分)
-        int bw = (CardW - LeftPad - RightPad - 2 * 6) / 3;
+        // 剥头皮:做空(左) / 做多(右) / 改趋势单 / 撤止盈(四按钮均分)
+        int bw = (CardW - LeftPad - RightPad - 3 * 4) / 4;
         CreateButton("Btn_" + tag + "_Sell", leftX,             contentY, bw, 30, Lang("做空", "SELL"), sellBg, sellBd, sellTx, 9, true);
-        CreateButton("Btn_" + tag + "_Buy",  leftX + bw + 6,    contentY, bw, 30, Lang("做多", "BUY"),  buyBg,  buyBd,  buyTx,  9, true);
+        CreateButton("Btn_" + tag + "_Buy",  leftX + bw + 4,    contentY, bw, 30, Lang("做多", "BUY"),  buyBg,  buyBd,  buyTx,  9, true);
         color qbBg = allowed ? COLOR_BTN_SYS_BG      : COLOR_BTN_DISABLED_BG;
         color qbTx = allowed ? COLOR_SIGNAL_WARNING   : COLOR_BTN_DISABLED_TXT;
         color qbBd = allowed ? COLOR_SIGNAL_WARNING   : COLOR_BTN_DISABLED_BG;
-        CreateButton("Btn_Sc_QuickBE",       leftX + 2*(bw+6),  contentY, bw, 30, Lang("改趋势单", "TO TREND"), qbBg, qbBd, qbTx, 8, true);
+        CreateButton("Btn_Sc_QuickBE",       leftX + 2*(bw+4),  contentY, bw, 30, Lang("改趋势", "TREND"), qbBg, qbBd, qbTx, 9, true);
+        // 撤止盈按钮(仅在有剥头皮持仓进入峰值追踪时激活)
+        bool hasTracking = false;
+        for(int i = 0; i < ArraySize(g_ScalpTrackTicket); i++)
+        {
+            if(PositionSelectByTicket(g_ScalpTrackTicket[i]))
+            {
+                hasTracking = true;
+                break;
+            }
+        }
+        color tpBg = (allowed && hasTracking) ? COLOR_BTN_SYS_BG      : COLOR_BTN_DISABLED_BG;
+        color tpTx = (allowed && hasTracking) ? COLOR_TEXT_HEADER      : COLOR_BTN_DISABLED_TXT;  // 白色字体
+        color tpBd = (allowed && hasTracking) ? COLOR_BTN_SYS_BORDER   : COLOR_BTN_DISABLED_BG;   // 淡灰色边框
+        CreateButton("Btn_Sc_ClearTP",       leftX + 3*(bw+4),  contentY, bw, 30, Lang("撤止盈", "RM TP"), tpBg, tpBd, tpTx, 9, true);
     }
     else
     {
@@ -2339,15 +2417,28 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     CreateLabel(tag + "_Limit_Lbl", cardX + LeftPad, contentY + 9, Lang("挂单价", "PX"), COLOR_TEXT_MUTED, 8);
     int editX = cardX + LeftPad + 46;
     int editW = 76;
-    string editVal = (kind == SOP_SCALP) ? g_ScPriceTxt : g_TrPriceTxt; // 填回已提交内容
-    if(editVal == "") editVal = DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_BID), _Digits); // 首次默认现价
+
+    // 关键修复：先读取输入框当前实时内容（含正在输入未提交的），优先级最高
+    string editName = Prefix + "Edt_" + tag + "_Price";
+    string liveText = "";
+    if(ObjectFind(0, editName) >= 0)
+        liveText = ObjectGetString(0, editName, OBJPROP_TEXT);
+
+    // 决定显示内容：实时输入 > 已提交缓存 > 空白（不自动填充现价，让用户主动输入）
+    string editVal = "";
+    if(liveText != "")
+        editVal = liveText;  // 用户正在输入或已输入未提交 → 保留
+    else if((kind == SOP_SCALP && g_ScPriceTxt != "") || (kind == SOP_TREND && g_TrPriceTxt != ""))
+        editVal = (kind == SOP_SCALP) ? g_ScPriceTxt : g_TrPriceTxt;  // 已提交缓存
+    // else 不填充默认值，保持空白，让用户主动输入
+
     CreateEdit("Edt_" + tag + "_Price", editX, contentY, editW, rowH, editVal);
 
     int lbtnW  = 78;
     int lbuyX  = cardX + CardW - RightPad - lbtnW;   // 限价多在右
     int lsellX = lbuyX - lbtnW - 8;                   // 限价空在左
-    CreateButton("Btn_" + tag + "_LSell", lsellX, contentY, lbtnW, rowH, Lang("限价空", "LIMIT SELL"), sellBg, sellBd, sellTx, 8, true);
-    CreateButton("Btn_" + tag + "_LBuy",  lbuyX,  contentY, lbtnW, rowH, Lang("限价多", "LIMIT BUY"),  buyBg,  buyBd,  buyTx,  8, true);
+    CreateButton("Btn_" + tag + "_LSell", lsellX, contentY, lbtnW, rowH, Lang("限价空", "LIMIT SELL"), sellBg, sellBd, sellTx, 9, true);
+    CreateButton("Btn_" + tag + "_LBuy",  lbuyX,  contentY, lbtnW, rowH, Lang("限价多", "LIMIT BUY"),  buyBg,  buyBd,  buyTx,  9, true);
     contentY += 38;   // 与上两排按钮等距
 
     // 现价偏移快捷挂单:+2空 +3空 +5空 -2多 -3多 -5多(6 小按钮,整组右对齐卡片右侧)
@@ -2357,13 +2448,13 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     int obGroupW = 6 * obW + 5 * obGap;
     int obX  = cardX + CardW - RightPad - obGroupW;  // 右边界与上方按钮右侧对齐
     // 三个"加价挂空"(现价+N)
-    CreateButton("Btn_" + tag + "_S2", obX,                  contentY, obW, obH, "+2" + Lang("空","S"), sellBg, sellBd, sellTx, 8, true);
-    CreateButton("Btn_" + tag + "_S3", obX + (obW+obGap),    contentY, obW, obH, "+3" + Lang("空","S"), sellBg, sellBd, sellTx, 8, true);
-    CreateButton("Btn_" + tag + "_S5", obX + 2*(obW+obGap),  contentY, obW, obH, "+5" + Lang("空","S"), sellBg, sellBd, sellTx, 8, true);
+    CreateButton("Btn_" + tag + "_S2", obX,                  contentY, obW, obH, "+2" + Lang("空","S"), sellBg, sellBd, sellTx, 9, true);
+    CreateButton("Btn_" + tag + "_S3", obX + (obW+obGap),    contentY, obW, obH, "+3" + Lang("空","S"), sellBg, sellBd, sellTx, 9, true);
+    CreateButton("Btn_" + tag + "_S5", obX + 2*(obW+obGap),  contentY, obW, obH, "+5" + Lang("空","S"), sellBg, sellBd, sellTx, 9, true);
     // 三个"减价挂多"(现价-N)
-    CreateButton("Btn_" + tag + "_B2", obX + 3*(obW+obGap),  contentY, obW, obH, "-2" + Lang("多","L"), buyBg,  buyBd,  buyTx,  8, true);
-    CreateButton("Btn_" + tag + "_B3", obX + 4*(obW+obGap),  contentY, obW, obH, "-3" + Lang("多","L"), buyBg,  buyBd,  buyTx,  8, true);
-    CreateButton("Btn_" + tag + "_B5", obX + 5*(obW+obGap),  contentY, obW, obH, "-5" + Lang("多","L"), buyBg,  buyBd,  buyTx,  8, true);
+    CreateButton("Btn_" + tag + "_B2", obX + 3*(obW+obGap),  contentY, obW, obH, "-2" + Lang("多","L"), buyBg,  buyBd,  buyTx,  9, true);
+    CreateButton("Btn_" + tag + "_B3", obX + 4*(obW+obGap),  contentY, obW, obH, "-3" + Lang("多","L"), buyBg,  buyBd,  buyTx,  9, true);
+    CreateButton("Btn_" + tag + "_B5", obX + 5*(obW+obGap),  contentY, obW, obH, "-5" + Lang("多","L"), buyBg,  buyBd,  buyTx,  9, true);
 }
 
 //+------------------------------------------------------------------+
@@ -2586,12 +2677,12 @@ void RenderChangelogPanel()
 //+------------------------------------------------------------------+
 void RenderPerfectUI()
 {
-    // 重绘前:抓取输入框当前内容存入缓存(含正在输入未提交的),再整体删除重建
+    // 重绘前:抓取输入框当前内容存入缓存(含正在输入未提交的),再删除所有UI对象(但保留输入框)
     if(ObjectFind(0, Prefix + "Edt_Sc_Price") >= 0)
         g_ScPriceTxt = ObjectGetString(0, Prefix + "Edt_Sc_Price", OBJPROP_TEXT);
     if(ObjectFind(0, Prefix + "Edt_Tr_Price") >= 0)
         g_TrPriceTxt = ObjectGetString(0, Prefix + "Edt_Tr_Price", OBJPROP_TEXT);
-    ObjectsDeleteAll(0, Prefix);
+    DeleteUIKeepEdits();  // 关键修复：保留输入框，避免用户输入丢失
 
     // 底层背景
     CreatePanel("AppBg", StartX, StartY, PanelWidth, PanelHeight, COLOR_APP_BG, COLOR_GOLD);
@@ -2603,9 +2694,51 @@ void RenderPerfectUI()
     CreateLabel("Title", StartX + 18, currentY, "TradeEZ-SOP", COLOR_TEXT_HEADER, 13, true);
     // 版本号可点击：普通蓝色文字（移除按钮框和图标）
     CreateLabel("Version", StartX + 142, currentY + 3, "v1.03", COLOR_SIGNAL_PROFIT, 9, true);
+
     // 重置按钮(标题栏,V1.02 右侧;可参数隐藏)
+    int syncX = StartX + 198; // 同步状态显示位置
     if(Inp_ShowResetBtn)
+    {
         CreateButton("Btn_Reset_All", StartX + 198, currentY - 2, 70, 22, Lang("重置", "RESET"), COLOR_BTN_SYS_BG, COLOR_BTN_SYS_BORDER, COLOR_SIGNAL_WARNING, 8, true);
+        syncX = StartX + 274; // 重置按钮右侧
+    }
+
+    // 数据同步状态指示器（在重置按钮和时钟之间）
+    if(Inp_EnableSync)
+    {
+        string syncText = "";
+        color syncColor = COLOR_TEXT_MUTED;
+
+        if(g_SyncInProgress)
+        {
+            // 同步进行中
+            syncText = Lang("同步中", "SYNC");
+            syncColor = COLOR_SIGNAL_WARNING;
+        }
+        else
+        {
+            // 检查最后同步时间，超过10分钟未同步显示异常
+            int elapsedMin = (TimeCurrent() > g_LastSyncTime) ? (int)((TimeCurrent() - g_LastSyncTime) / 60) : 0;
+            if(g_LastSyncTime == 0)
+            {
+                syncText = Lang("未同步", "NO SYNC");
+                syncColor = COLOR_TEXT_MUTED;
+            }
+            else if(elapsedMin > 10)
+            {
+                syncText = Lang("同步异常", "SYNC ERR");
+                syncColor = COLOR_SIGNAL_LOSS;
+            }
+            else
+            {
+                syncText = Lang("已同步", "SYNCED");
+                syncColor = COLOR_SIGNAL_PROFIT;
+            }
+        }
+
+        CreateLabel("SyncStatus", syncX, currentY + 3, syncText, syncColor, 8, true);
+    }
+
     // 标题栏中间:北京时间(精确到秒,与收线时间同字号/高度)
     int clockCx = StartX + PanelWidth / 2;
     CreateLabelAnchor("Clock", clockCx, currentY + 10, TimeToString(BeijingNow(), TIME_MINUTES | TIME_SECONDS), COLOR_TEXT_HEADER, 16, true, ANCHOR_CENTER);
@@ -3763,6 +3896,9 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
 
     // 剥头皮快速移损:取消止盈+移保本+转趋势逻辑
     if(sparam == Prefix + "Btn_Sc_QuickBE") { ResetBtn(sparam); if(IsScalpAllowed()) ConvertScalpToTrend(); RenderPerfectUI(); return; }
+
+    // 剥头皮撤止盈:清除已进入峰值追踪的持仓的止盈
+    if(sparam == Prefix + "Btn_Sc_ClearTP") { ResetBtn(sparam); if(IsScalpAllowed()) ClearScalpTP(); RenderPerfectUI(); return; }
 
     // 取消某剥头皮单的超时平仓倒计时(按钮名带 ticket)
     if(StringFind(sparam, Prefix + "Btn_SCDCancel_") == 0)
