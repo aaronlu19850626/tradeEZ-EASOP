@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  ???????2026-09-18 00:06??????       |
+//|                  最后修改时间：2026-09-18 00:55（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -2421,10 +2421,10 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     }
     contentY += Scale(38);
 
-    // ?????:?? + ?????? + ??????
+    // 限价挂单行：标签 + 银灰白输入槽 + 两个限价按钮
     int rowH  = Scale(30);
     int lbtnW = Scale(78);
-    CreateLabel(tag + "_Limit_Lbl", cardX + LeftPad, contentY + Scale(9), Lang("???", "PX"), COLOR_TEXT_MUTED, 8);
+    CreateLabel(tag + "_Limit_Lbl", cardX + LeftPad, contentY + Scale(9), Lang("挂单价", "PX"), COLOR_TEXT_MUTED, 8);
     int editX = cardX + LeftPad + Scale(46);
     int editW = lbtnW;  // 与后面的限价空/限价多按钮同宽
 
