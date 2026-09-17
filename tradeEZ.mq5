@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  最后修改时间：2026-09-17 21:15（北京时间）       |
+//|                  最后修改时间：2026-09-18 00:01（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -35,7 +35,7 @@
 #define COLOR_BTN_SYS_BORDER    C'58,68,85'
 #define COLOR_BTN_DISABLED_BG   C'26,30,38'
 #define COLOR_BTN_DISABLED_TXT  C'80,90,104'
-#define COLOR_INPUT_BG          C'15,19,27'       // 输入框底色(略深于卡片,凹陷质感)
+#define COLOR_INPUT_BG          C'29,34,44'       // 输入框底色:与系统按钮一致的深蓝灰
 #define COLOR_INPUT_BORDER      C'54,64,82'       // 输入框边框(冷灰,克制不刺眼)
 #define COLOR_GOLD              C'212,175,55'     // 金色外边框
 
@@ -2038,7 +2038,7 @@ void CreateButton(string name, int x, int y, int w, int h, string text, color bg
     ObjectSetInteger(0, objName, OBJPROP_STATE, false);
 }
 
-// 删除本EA所有对象。输入框内容已先缓存,随后按“卡片→白框→输入框”顺序完整重建。
+// 删除本EA所有对象。输入框内容已先缓存,随后按“卡片→输入槽边框→输入框”顺序完整重建。
 void DeleteUIKeepEdits()
 {
     for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
@@ -2368,7 +2368,7 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     }
     contentY += 38;
 
-    // 限价挂单行:标签 + 透明白框 + 透明输入框(浮在白框上) + 两个限价按钮
+    // 限价挂单行:标签 + 深蓝灰输入槽 + 两个限价按钮
     int rowH = 30;
     int lbtnW = 78;
     CreateLabel(tag + "_Limit_Lbl", cardX + LeftPad, contentY + 9, Lang("挂单价", "PX"), COLOR_TEXT_MUTED, 8);
@@ -2389,21 +2389,21 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
         editVal = (kind == SOP_SCALP) ? g_ScPriceTxt : g_TrPriceTxt;
 
     // 冷灰描边 + 内嵌编辑框的"数值输入槽"风格
-    // 用OBJ_RECTANGLE_LABEL画外框,OBJ_EDIT完全嵌在里面,黑底作为"显示屏"
+    // 外层绘制冷灰细边,内层编辑框显式设置同色背景,避免默认黑底白框
     string bgName = Prefix + "Edt_" + tag + "_PriceBg";
     ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
     ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, editX);
     ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, contentY);
     ObjectSetInteger(0, bgName, OBJPROP_XSIZE, editW);
     ObjectSetInteger(0, bgName, OBJPROP_YSIZE, rowH);
-    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, COLOR_CARD_BG);      // 背景与卡片同色,完全融合
+    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, COLOR_INPUT_BG);     // 与编辑控件同色,无双层色差
     ObjectSetInteger(0, bgName, OBJPROP_BORDER_COLOR, COLOR_INPUT_BORDER); // 冷灰细边
     ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
     ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
     ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE, false);
     ObjectSetInteger(0, bgName, OBJPROP_ZORDER, 99);
 
-    // 编辑控件内缩到边框内,MT5自带的黑底变成"显示屏"
+    // 编辑控件内缩一像素,内边框与底色一致,仅保留外层细描边
     ObjectCreate(0, editName, OBJ_EDIT, 0, 0, 0);
     ObjectSetInteger(0, editName, OBJPROP_XDISTANCE, editX + 1);
     ObjectSetInteger(0, editName, OBJPROP_YDISTANCE, contentY + 1);
@@ -2414,6 +2414,8 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     ObjectSetInteger(0, editName, OBJPROP_FONTSIZE, 12);
     ObjectSetInteger(0, editName, OBJPROP_ALIGN, ALIGN_CENTER);
     ObjectSetInteger(0, editName, OBJPROP_COLOR, COLOR_TEXT_HEADER);
+    ObjectSetInteger(0, editName, OBJPROP_BGCOLOR, COLOR_INPUT_BG);
+    ObjectSetInteger(0, editName, OBJPROP_BORDER_COLOR, COLOR_INPUT_BG);
     ObjectSetInteger(0, editName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
     ObjectSetInteger(0, editName, OBJPROP_SELECTABLE, false);
     ObjectSetInteger(0, editName, OBJPROP_READONLY, false);
