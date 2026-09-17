@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  最后修改时间：2026-09-18 00:01（北京时间）       |
+//|                  最后修改时间：2026-09-18 00:03（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -36,7 +36,7 @@
 #define COLOR_BTN_DISABLED_BG   C'26,30,38'
 #define COLOR_BTN_DISABLED_TXT  C'80,90,104'
 #define COLOR_INPUT_BG          C'29,34,44'       // 输入框底色:与系统按钮一致的深蓝灰
-#define COLOR_INPUT_BORDER      C'54,64,82'       // 输入框边框(冷灰,克制不刺眼)
+#define COLOR_INPUT_BORDER      C'176,186,201'    // 输入框边框:清晰的灰白色,呼应面板正文
 #define COLOR_GOLD              C'212,175,55'     // 金色外边框
 
 #define PANEL_FONT              "Segoe UI"
@@ -2388,8 +2388,8 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     else if((kind == SOP_SCALP && g_ScPriceTxt != "") || (kind == SOP_TREND && g_TrPriceTxt != ""))
         editVal = (kind == SOP_SCALP) ? g_ScPriceTxt : g_TrPriceTxt;
 
-    // 冷灰描边 + 内嵌编辑框的"数值输入槽"风格
-    // 外层绘制冷灰细边,内层编辑框显式设置同色背景,避免默认黑底白框
+    // 灰白描边 + 内嵌编辑框的"数值输入槽"风格
+    // 外层绘制灰白细边,内层编辑框显式设置同色背景,避免默认黑底白框
     string bgName = Prefix + "Edt_" + tag + "_PriceBg";
     ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
     ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, editX);
@@ -2397,7 +2397,9 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     ObjectSetInteger(0, bgName, OBJPROP_XSIZE, editW);
     ObjectSetInteger(0, bgName, OBJPROP_YSIZE, rowH);
     ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, COLOR_INPUT_BG);     // 与编辑控件同色,无双层色差
-    ObjectSetInteger(0, bgName, OBJPROP_BORDER_COLOR, COLOR_INPUT_BORDER); // 冷灰细边
+    ObjectSetInteger(0, bgName, OBJPROP_COLOR, COLOR_INPUT_BORDER); // 矩形标签的平面边框颜色
+    ObjectSetInteger(0, bgName, OBJPROP_WIDTH, 1);
+    ObjectSetInteger(0, bgName, OBJPROP_STYLE, STYLE_SOLID);
     ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
     ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
     ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE, false);
