@@ -1,7 +1,7 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  最后修改时间：2026-09-17 19:30（北京时间）       |
+//|                  最后修改时间：2026-09-17 21:15（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -35,6 +35,8 @@
 #define COLOR_BTN_SYS_BORDER    C'58,68,85'
 #define COLOR_BTN_DISABLED_BG   C'26,30,38'
 #define COLOR_BTN_DISABLED_TXT  C'80,90,104'
+#define COLOR_INPUT_BG          C'15,19,27'       // 输入框底色(略深于卡片,凹陷质感)
+#define COLOR_INPUT_BORDER      C'54,64,82'       // 输入框边框(冷灰,克制不刺眼)
 #define COLOR_GOLD              C'212,175,55'     // 金色外边框
 
 #define PANEL_FONT              "Segoe UI"
@@ -394,7 +396,11 @@ ENUM_SOP_ORDER GetOrderType(double lots)
 // 服务器时间相对 GMT 的偏移(秒),四舍五入到整小时避免抖动
 int ServerGmtOffset()
 {
-    int off = (int)(TimeCurrent() - TimeGMT());
+    // TimeCurrent 在休市时停在最后一个 tick；TimeTradeServer 会继续前进，
+    // 因而用它计算 UTC 偏移可避免周末/盘间得到异常偏移。
+    datetime serverNow = TimeTradeServer();
+    if(serverNow <= 0) serverNow = TimeCurrent();
+    int off = (int)(serverNow - TimeGMT());
     return (int)(MathRound(off / 3600.0) * 3600);
 }
 
@@ -2382,38 +2388,36 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     else if((kind == SOP_SCALP && g_ScPriceTxt != "") || (kind == SOP_TREND && g_TrPriceTxt != ""))
         editVal = (kind == SOP_SCALP) ? g_ScPriceTxt : g_TrPriceTxt;
 
-    // 创建无填充的白色边框矩形(底层)
+    // 冷灰描边 + 内嵌编辑框的"数值输入槽"风格
+    // 用OBJ_RECTANGLE_LABEL画外框,OBJ_EDIT完全嵌在里面,黑底作为"显示屏"
     string bgName = Prefix + "Edt_" + tag + "_PriceBg";
     ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
     ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, editX);
     ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, contentY);
     ObjectSetInteger(0, bgName, OBJPROP_XSIZE, editW);
     ObjectSetInteger(0, bgName, OBJPROP_YSIZE, rowH);
-    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, clrNONE);
-    ObjectSetInteger(0, bgName, OBJPROP_BORDER_COLOR, COLOR_TEXT_HEADER);  // 白色边框
+    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, COLOR_CARD_BG);      // 背景与卡片同色,完全融合
+    ObjectSetInteger(0, bgName, OBJPROP_BORDER_COLOR, COLOR_INPUT_BORDER); // 冷灰细边
     ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
     ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
     ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE, false);
     ObjectSetInteger(0, bgName, OBJPROP_ZORDER, 99);
 
-    // 创建透明输入框(上层,浮在矩形上,内缩2px)
+    // 编辑控件内缩到边框内,MT5自带的黑底变成"显示屏"
     ObjectCreate(0, editName, OBJ_EDIT, 0, 0, 0);
-    ObjectSetInteger(0, editName, OBJPROP_XDISTANCE, editX + 2);
-    ObjectSetInteger(0, editName, OBJPROP_YDISTANCE, contentY + 2);
-    ObjectSetInteger(0, editName, OBJPROP_XSIZE, editW - 4);
-    ObjectSetInteger(0, editName, OBJPROP_YSIZE, rowH - 4);
+    ObjectSetInteger(0, editName, OBJPROP_XDISTANCE, editX + 1);
+    ObjectSetInteger(0, editName, OBJPROP_YDISTANCE, contentY + 1);
+    ObjectSetInteger(0, editName, OBJPROP_XSIZE, editW - 2);
+    ObjectSetInteger(0, editName, OBJPROP_YSIZE, rowH - 2);
     ObjectSetString(0, editName, OBJPROP_TEXT, editVal);
     ObjectSetString(0, editName, OBJPROP_FONT, PANEL_FONT);
     ObjectSetInteger(0, editName, OBJPROP_FONTSIZE, 12);
     ObjectSetInteger(0, editName, OBJPROP_ALIGN, ALIGN_CENTER);
-    ObjectSetInteger(0, editName, OBJPROP_BGCOLOR, clrNONE);           // 无背景色
-    ObjectSetInteger(0, editName, OBJPROP_BORDER_COLOR, clrNONE);      // 无边框
     ObjectSetInteger(0, editName, OBJPROP_COLOR, COLOR_TEXT_HEADER);
     ObjectSetInteger(0, editName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
     ObjectSetInteger(0, editName, OBJPROP_SELECTABLE, false);
     ObjectSetInteger(0, editName, OBJPROP_READONLY, false);
     ObjectSetInteger(0, editName, OBJPROP_ZORDER, 100);
-
     int lbuyX  = cardX + CardW - RightPad - lbtnW;   // 限价多在右
     int lsellX = lbuyX - lbtnW - 8;                   // 限价空在左
     CreateButton("Btn_" + tag + "_LSell", lsellX, contentY, lbtnW, rowH, Lang("限价空", "LIMIT SELL"), sellBg, sellBd, sellTx, 9, true);
@@ -3239,46 +3243,85 @@ void LoadArrays()
 //+------------------------------------------------------------------+
 //| 数据同步模块 (TradeSync-Web) - 增量同步版本                       |
 //+------------------------------------------------------------------+
-// 全局变量：服务器端最后同步时间（从服务器获取，缓存在本地）
+// 全局变量：服务器端最后同步游标（最近平仓成交时间，Unix UTC 秒）
 datetime g_ServerLastSyncTime = 0;
 bool     g_LastSyncQueryOK = false;  // 区分“服务器返回0”与“请求失败”
 
-// 获取服务器端的最后同步时间
+// MT5 历史时间使用交易服务器时区；同步协议统一传 Unix UTC 秒。
+datetime ServerTimeToUtc(datetime serverTime) { return serverTime - ServerGmtOffset(); }
+datetime UtcToServerTime(datetime utcTime)     { return utcTime + ServerGmtOffset(); }
+
+// 标准 HMAC-SHA256：key=服务器生成的完整密钥，message=body+UTC timestamp。
+string ComputeHMAC(string secretKey, string body, long timestamp)
+{
+    uchar key[], message[], empty[], keyHash[];
+    StringToCharArray(secretKey, key, 0, WHOLE_ARRAY, CP_UTF8);
+    if(ArraySize(key) > 0) ArrayResize(key, ArraySize(key) - 1);
+    StringToCharArray(body + IntegerToString(timestamp), message, 0, WHOLE_ARRAY, CP_UTF8);
+    if(ArraySize(message) > 0) ArrayResize(message, ArraySize(message) - 1);
+
+    if(ArraySize(key) > 64)
+    {
+        if(CryptEncode(CRYPT_HASH_SHA256, key, empty, keyHash) <= 0) return "";
+        ArrayCopy(key, keyHash);
+        ArrayResize(key, ArraySize(keyHash));
+    }
+
+    uchar innerPad[], outerPad[];
+    ArrayResize(innerPad, 64);
+    ArrayResize(outerPad, 64);
+    for(int i = 0; i < 64; i++)
+    {
+        uchar b = (i < ArraySize(key)) ? key[i] : 0;
+        innerPad[i] = b ^ 0x36;
+        outerPad[i] = b ^ 0x5c;
+    }
+
+    uchar innerData[], innerHash[], outerData[], result[];
+    ArrayResize(innerData, 64 + ArraySize(message));
+    ArrayCopy(innerData, innerPad, 0, 0, 64);
+    ArrayCopy(innerData, message, 64, 0, ArraySize(message));
+    if(CryptEncode(CRYPT_HASH_SHA256, innerData, empty, innerHash) <= 0) return "";
+
+    ArrayResize(outerData, 64 + ArraySize(innerHash));
+    ArrayCopy(outerData, outerPad, 0, 0, 64);
+    ArrayCopy(outerData, innerHash, 64, 0, ArraySize(innerHash));
+    if(CryptEncode(CRYPT_HASH_SHA256, outerData, empty, result) <= 0) return "";
+
+    string hex = "";
+    for(int i = 0; i < ArraySize(result); i++) hex += StringFormat("%02x", result[i]);
+    return hex;
+}
+
+string SyncHeaders(string body, long timestamp)
+{
+    string signature = ComputeHMAC(Inp_SecretKey, body, timestamp);
+    return "Content-Type: application/json\r\n" +
+           "Authorization: Bearer " + Inp_SecretKey + "\r\n" +
+           "X-Timestamp: " + IntegerToString(timestamp) + "\r\n" +
+           "X-Signature: " + signature + "\r\n";
+}
+
+string JsonEscape(string value)
+{
+    StringReplace(value, "\\", "\\\\");
+    StringReplace(value, "\"", "\\\"");
+    StringReplace(value, "\r", "\\r");
+    StringReplace(value, "\n", "\\n");
+    StringReplace(value, "\t", "\\t");
+    return value;
+}
+
+// 获取服务器保存的同步游标。该值定义为“最近一笔已提交订单的开仓 UTC 时间”。
 datetime GetServerLastSyncTime()
 {
     g_LastSyncQueryOK = false;
-    if(!Inp_EnableSync)
-    {
-        if(Inp_DebugSync) Print("[Sync Cursor] 跳过:订单同步未启用");
-        return 0;
-    }
-    if(Inp_SecretKey == "")
-    {
-        if(Inp_DebugSync) Print("[Sync Cursor] 失败:账户密钥为空");
-        return 0;
-    }
-
-    // 分割Key: prefix.secret
-    string parts[];
-    int split = StringSplit(Inp_SecretKey, '.', parts);
-    if(split != 2)
-    {
-        if(Inp_DebugSync) Print("[Sync Cursor] 失败:密钥格式无效,期望 prefix.secret");
-        return 0;
-    }
-    string secret = parts[1];
+    if(!Inp_EnableSync || Inp_SecretKey == "") return 0;
 
     long login = AccountInfoInteger(ACCOUNT_LOGIN);
     string body = StringFormat("{\"mt5_login\":%I64d}", login);
-
     long timestamp = TimeGMT();
-    string signature = ComputeHMAC(secret, body);
-
-    string headers =
-        "Content-Type: application/json\r\n" +
-        "Authorization: Bearer " + Inp_SecretKey + "\r\n" +
-        "X-Timestamp: " + IntegerToString(timestamp) + "\r\n" +
-        "X-Signature: " + signature + "\r\n";
+    string headers = SyncHeaders(body, timestamp);
 
     char post[], result[];
     StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
@@ -3286,107 +3329,142 @@ datetime GetServerLastSyncTime()
 
     string url = Inp_ApiBaseURL + "/api/v1/sync/last_sync_time";
     string responseHeaders = "";
-    if(Inp_DebugSync)
-        Print("[Sync Cursor] POST ", url, " | 账户=", login, " | 请求字节=", ArraySize(post));
-
     ResetLastError();
     int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
     int webError = GetLastError();
     string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
 
     if(Inp_DebugSync)
-        Print("[Sync Cursor] HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
+        Print("[Sync Cursor] POST ", url, " | HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
 
-    if(res == 200)
+    if(res >= 200 && res < 300)
     {
-        // 解析JSON响应: {"last_sync_time": 1234567890}
-        // 简化版JSON解析
         int pos = StringFind(response, "\"last_sync_time\"");
-        if(pos >= 0)
+        int colonPos = (pos >= 0) ? StringFind(response, ":", pos) : -1;
+        if(colonPos >= 0)
         {
-            int colonPos = StringFind(response, ":", pos);
-            if(colonPos >= 0)
-            {
-                string numStr = StringSubstr(response, colonPos + 1);
-                // 移除非数字字符
-                StringReplace(numStr, "}", "");
-                StringReplace(numStr, " ", "");
-                StringReplace(numStr, ",", "");
-                StringReplace(numStr, "\"", "");
-                StringTrimLeft(numStr);
-                StringTrimRight(numStr);
-                datetime lastTime = (datetime)StringToInteger(numStr);
-                g_LastSyncQueryOK = true;
-                if(Inp_DebugSync)
-                    Print("[Sync Cursor] 解析成功:服务器最后同步时间=", lastTime == 0 ? "0" : TimeToString(lastTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS));
-                return lastTime;
-            }
+            string numStr = StringSubstr(response, colonPos + 1);
+            int commaPos = StringFind(numStr, ",");
+            int bracePos = StringFind(numStr, "}");
+            int endPos = -1;
+            if(commaPos >= 0) endPos = commaPos;
+            if(bracePos >= 0 && (endPos < 0 || bracePos < endPos)) endPos = bracePos;
+            if(endPos >= 0) numStr = StringSubstr(numStr, 0, endPos);
+            StringReplace(numStr, "\"", "");
+            StringTrimLeft(numStr);
+            StringTrimRight(numStr);
+            datetime lastTimeUtc = (datetime)StringToInteger(numStr);
+            g_LastSyncQueryOK = true;
+            if(Inp_DebugSync)
+                Print("[Sync Cursor] 服务器平仓时间游标(UTC)=", (long)lastTimeUtc);
+            return lastTimeUtc;
         }
-
-        if(Inp_DebugSync)
-            Print("[Sync Cursor] 失败:HTTP成功但响应缺少 last_sync_time");
+        if(Inp_DebugSync) Print("[Sync Cursor] 失败:响应缺少 last_sync_time");
     }
-    else
-    {
-        if(Inp_DebugSync)
-            Print("[Sync Cursor] 请求失败;若HTTP=-1,请检查WebRequest白名单和专家日志中的MT5错误码");
-    }
+    else if(Inp_DebugSync)
+        Print("[Sync Cursor] 请求失败;HTTP=-1时请检查WebRequest白名单");
 
-    return 0; // 返回0表示从头开始同步
+    return 0;
 }
 
-// HMAC-SHA256 签名(MQL5没有内置HMAC,用简化方式:SHA256(secret+body))
-string ComputeHMAC(string secret, string body)
-{
-    uchar key[], data[], result[];
-    StringToCharArray(secret + body, data, 0, WHOLE_ARRAY, CP_UTF8);
-    if(CryptEncode(CRYPT_HASH_SHA256, data, key, result))
-    {
-        string hex = "";
-        for(int i = 0; i < ArraySize(result); i++)
-            hex += StringFormat("%02x", result[i]);
-        return hex;
-    }
-    return "";
-}
-
-// 收集指定时间范围内的成交记录
-int CollectDealsAfterTime(datetime afterTime, string &dealsJson[], bool &collectionOK)
+// 收集平仓成交时间 >= 游标的订单所对应的全部成交。
+// 游标基准 = 最后一笔已同步的平仓成交时间(UTC),确保只上传已了结的完整交易,避免持仓中订单的脏数据。
+// 边界采用包含式,游标同秒的成交会安全重传,由服务器按 ticket 幂等去重。
+int CollectDealsAfterCloseTime(datetime cursorUtc, string &dealsJson[],
+                              datetime &latestCloseTimeUtc, bool &collectionOK)
 {
     ArrayResize(dealsJson, 0);
+    latestCloseTimeUtc = 0;
     collectionOK = false;
 
-    // 选择历史范围：从 afterTime 到现在（加1秒避免边界重复）
-    datetime fromTime = afterTime + 1; // 避免重复上传边界时间的订单
-    datetime toTime = TimeCurrent();
-
-    if(fromTime >= toTime)
+    datetime fromServer = UtcToServerTime(cursorUtc);
+    datetime toServer = TimeCurrent() + 1;
+    if(fromServer > toServer)
     {
-        collectionOK = true;
-        if(Inp_DebugSync)
-            Print("[Sync] No new deals after ", TimeToString(afterTime, TIME_DATE|TIME_MINUTES));
+        if(Inp_DebugSync) Print("[Sync Collect] 失败:服务器游标晚于当前时间, cursor_utc=", (long)cursorUtc);
         return 0;
     }
-
-    if(!HistorySelect(fromTime, toTime))
+    if(!HistorySelect(fromServer, toServer))
     {
-        if(Inp_DebugSync)
-            Print("[Sync] HistorySelect failed for range ", TimeToString(fromTime), " to ", TimeToString(toTime));
+        if(Inp_DebugSync) Print("[Sync Collect] HistorySelect失败, cursor_utc=", (long)cursorUtc);
         return 0;
     }
 
     int total = HistoryDealsTotal();
-    if(Inp_DebugSync)
-        Print("[Sync] Found ", total, " deals after ", TimeToString(afterTime, TIME_DATE|TIME_MINUTES));
+    long positionIds[];     // 已平仓订单的 position_id 列表
+    datetime closeTimesUtc[]; // 对应每笔订单的平仓成交时间(UTC),用于推进游标
+    datetime openTimesUtc[];  // 对应每笔订单的开仓时间(UTC),传给服务器
+
+    // 第一遍:找出所有平仓成交在游标之后的订单,收集 position_id
+    for(int i = 0; i < total; i++)
+    {
+        ulong ticket = HistoryDealGetTicket(i);
+        if(ticket == 0) continue;
+        long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+        if(entry != DEAL_ENTRY_OUT) continue;  // 只看平仓成交
+        long posId = HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
+        if(posId == 0) continue;
+
+        datetime closeUtc = ServerTimeToUtc((datetime)HistoryDealGetInteger(ticket, DEAL_TIME));
+        if(closeUtc < cursorUtc) continue;  // 平仓时间在游标之前 → 已同步过,跳过
+
+        // 计算开仓时间(用于传给服务器)
+        datetime openUtc = closeUtc;  // 兜底
+        for(int j = 0; j < total; j++)
+        {
+            ulong dj = HistoryDealGetTicket(j);
+            if(dj == 0) continue;
+            if(HistoryDealGetInteger(dj, DEAL_POSITION_ID) != posId) continue;
+            long e = HistoryDealGetInteger(dj, DEAL_ENTRY);
+            if(e != DEAL_ENTRY_IN && e != DEAL_ENTRY_INOUT) continue;
+            datetime t = ServerTimeToUtc((datetime)HistoryDealGetInteger(dj, DEAL_TIME));
+            if(t < openUtc) openUtc = t;  // 取最早的开仓时间
+        }
+
+        // 检查是否已存在(一个position可能有多次平仓如减仓,取最晚的平仓时间)
+        int idx = -1;
+        for(int j = 0; j < ArraySize(positionIds); j++)
+            if(positionIds[j] == posId) { idx = j; break; }
+        if(idx < 0)
+        {
+            int n = ArraySize(positionIds);
+            ArrayResize(positionIds, n + 1);
+            ArrayResize(closeTimesUtc, n + 1);
+            ArrayResize(openTimesUtc, n + 1);
+            positionIds[n] = posId;
+            closeTimesUtc[n] = closeUtc;
+            openTimesUtc[n] = openUtc;
+        }
+        else if(closeUtc > closeTimesUtc[idx])
+        {
+            closeTimesUtc[idx] = closeUtc;  // 更新为最晚的平仓时间
+        }
+    }
+
+    // 第二遍:为每个已平仓订单序列化其全部成交(开仓/减仓/平仓等),时间字段全部UTC
+    // HistorySelect范围就是游标到现在,所以在范围内的成交都能找到;
+    // 但开仓成交可能早于游标(跨游标区间的订单),需要扩大范围才能拿到开仓成交。
+    // 稳妥做法:扩大 HistorySelect 到 30 天前,确保开仓成交也在范围内。
+    datetime wideFrom = fromServer - 30 * 86400;
+    if(HistorySelect(wideFrom, toServer)) total = HistoryDealsTotal();
 
     for(int i = 0; i < total; i++)
     {
         ulong dealTicket = HistoryDealGetTicket(i);
         if(dealTicket == 0) continue;
-
         long posId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+        int posIndex = -1;
+        for(int j = 0; j < ArraySize(positionIds); j++)
+            if(positionIds[j] == posId) { posIndex = j; break; }
+        if(posIndex < 0) continue;  // 不是目标订单
+
+        datetime openTimeUtc = openTimesUtc[posIndex];
+        datetime closeTimeUtc = closeTimesUtc[posIndex];
+        datetime dealTimeUtc = ServerTimeToUtc((datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME));
+        if(closeTimeUtc > latestCloseTimeUtc) latestCloseTimeUtc = closeTimeUtc;
+
         long orderId = HistoryDealGetInteger(dealTicket, DEAL_ORDER);
-        string symbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+        string symbol = JsonEscape(HistoryDealGetString(dealTicket, DEAL_SYMBOL));
         long entry = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
         long type = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
         double volume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
@@ -3397,18 +3475,20 @@ int CollectDealsAfterTime(datetime afterTime, string &dealsJson[], bool &collect
         double swap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
         double commission = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
         long magic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
-        string comment = HistoryDealGetString(dealTicket, DEAL_COMMENT);
-        datetime dealTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+        string comment = JsonEscape(HistoryDealGetString(dealTicket, DEAL_COMMENT));
 
-        // 构造JSON(简化版,生产环境需严格转义)
         string json = StringFormat(
-            "{\"ticket\":%I64d,\"position_id\":%I64d,\"order_id\":%I64d,\"symbol\":\"%s\",\"entry\":%d,\"type\":%d," +
+            "{" +
+            "\"ticket\":%I64d,\"position_id\":%I64d,\"order_id\":%I64d," +
+            "\"symbol\":\"%s\",\"entry\":%d,\"type\":%d," +
             "\"volume\":%.2f,\"price\":%.5f,\"sl_price\":%.5f,\"tp_price\":%.5f," +
-            "\"profit\":%.2f,\"swap\":%.2f,\"commission\":%.2f,\"magic\":%I64d,\"comment\":\"%s\",\"deal_time\":%d}",
+            "\"profit\":%.2f,\"swap\":%.2f,\"commission\":%.2f," +
+            "\"magic\":%I64d,\"comment\":\"%s\"," +
+            "\"open_time\":%I64d,\"deal_time\":%I64d" +
+            "}",
             dealTicket, posId, orderId, symbol, entry, type,
-            volume, price, sl, tp,
-            profit, swap, commission, magic, comment, dealTime
-        );
+            volume, price, sl, tp, profit, swap, commission, magic, comment,
+            (long)openTimeUtc, (long)dealTimeUtc);
 
         int n = ArraySize(dealsJson);
         ArrayResize(dealsJson, n + 1);
@@ -3418,43 +3498,66 @@ int CollectDealsAfterTime(datetime afterTime, string &dealsJson[], bool &collect
     collectionOK = true;
     return ArraySize(dealsJson);
 }
+// 成交全部被服务器接受后，再用单独请求推进“最后开仓时间”游标。
 
-// 获取数组中最后一笔成交的时间
-datetime GetLatestDealTime(const string &dealsJson[])
+// 分批上传成交到服务器
+bool UploadDealsBatch(const string &dealsJson[], int startIndex, int batchCount, int batchNumber)
 {
-    datetime latestTime = 0;
-
-    for(int i = 0; i < ArraySize(dealsJson); i++)
+    string bodyDeals = "";
+    for(int i = 0; i < batchCount; i++)
     {
-        // 从JSON中提取 deal_time 字段
-        string json = dealsJson[i];
-        int pos = StringFind(json, "\"deal_time\":");
-        if(pos >= 0)
-        {
-            string timeStr = StringSubstr(json, pos + 12); // 跳过 "deal_time":
-            StringReplace(timeStr, "}", "");
-            StringTrimLeft(timeStr);
-            StringTrimRight(timeStr);
-            datetime dealTime = (datetime)StringToInteger(timeStr);
-            if(dealTime > latestTime)
-                latestTime = dealTime;
-        }
+        if(i > 0) bodyDeals += ",";
+        bodyDeals += dealsJson[startIndex + i];
     }
 
-    return latestTime;
+    long login = AccountInfoInteger(ACCOUNT_LOGIN);
+    string body = StringFormat("{\"mt5_login\":%I64d,\"deals\":[%s]}", login, bodyDeals);
+    long timestamp = TimeGMT();
+    string headers = SyncHeaders(body, timestamp);
+
+    char post[], result[];
+    StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
+    ArrayResize(post, ArraySize(post) - 1);
+    string url = Inp_ApiBaseURL + "/api/v1/ingest/deals";
+    string responseHeaders = "";
+    ResetLastError();
+    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
+    int webError = GetLastError();
+    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+    if(Inp_DebugSync)
+        Print("[Sync Deals] 批次", batchNumber, " | 数量=", batchCount,
+              " | HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
+    return (res >= 200 && res < 300);
 }
 
-// 上传成交批次到服务器（增量同步版本）
+bool UpdateServerLastSyncTime(datetime latestCloseTimeUtc)
+{
+    long login = AccountInfoInteger(ACCOUNT_LOGIN);
+    string body = StringFormat("{\"mt5_login\":%I64d,\"last_sync_time\":%I64d}", login, (long)latestCloseTimeUtc);
+    long timestamp = TimeGMT();
+    string headers = SyncHeaders(body, timestamp);
+
+    char post[], result[];
+    StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
+    ArrayResize(post, ArraySize(post) - 1);
+    string url = Inp_ApiBaseURL + "/api/v1/sync/update_last_sync_time";
+    string responseHeaders = "";
+    ResetLastError();
+    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
+    int webError = GetLastError();
+    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+    if(Inp_DebugSync)
+        Print("[Sync Cursor] 更新平仓时间游标(UTC)=", (long)latestCloseTimeUtc,
+              " | HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
+    return (res >= 200 && res < 300);
+}
+
+// 上传成交批次；所有批次成功后才提交平仓时间游标。
 bool SyncDeals()
 {
-    if(!Inp_EnableSync)
+    if(!Inp_EnableSync || Inp_SecretKey == "")
     {
-        if(Inp_DebugSync) Print("[Sync Deals] 跳过:订单同步未启用");
-        return false;
-    }
-    if(Inp_SecretKey == "")
-    {
-        if(Inp_DebugSync) Print("[Sync Deals] 失败:账户密钥为空");
+        if(Inp_DebugSync) Print("[Sync Deals] 跳过:同步未启用或服务器密钥为空");
         return false;
     }
     if(g_SyncInProgress)
@@ -3462,166 +3565,72 @@ bool SyncDeals()
         if(Inp_DebugSync) Print("[Sync Deals] 跳过:已有同步任务执行中");
         return false;
     }
-
     g_SyncInProgress = true;
+    if(Inp_DebugSync) Print("[Sync Deals] ========== 开始同步成交(UTC/平仓游标) ==========");
 
-    if(Inp_DebugSync)
-        Print("[Sync Deals] ========== 开始同步成交 ==========");
-
-    // 1. 获取服务器端最后同步时间
-    if(Inp_DebugSync)
-        Print("[Sync Deals] 步骤1: 获取服务器最后同步时间...");
-    datetime serverLastTime = GetServerLastSyncTime();
-
-    // 如果获取失败且有缓存值，使用缓存
-    if(serverLastTime == 0 && g_ServerLastSyncTime > 0)
+    datetime cursorUtc = GetServerLastSyncTime();
+    bool cursorQueryOK = g_LastSyncQueryOK;
+    if(!cursorQueryOK || cursorUtc == 0)
     {
-        serverLastTime = g_ServerLastSyncTime;
+        cursorUtc = TimeGMT() - 7 * 86400;
         if(Inp_DebugSync)
-            Print("[Sync Deals] 服务器返回0,使用缓存值: ", TimeToString(serverLastTime, TIME_DATE|TIME_MINUTES));
+            Print("[Sync Deals] ", cursorQueryOK ? "首次同步" : "游标获取失败",
+                  ",按近7日回溯,起点UTC=", (long)cursorUtc);
     }
 
-    // 如果还是0，从7天前开始（首次同步）
-    if(serverLastTime == 0)
-    {
-        serverLastTime = TimeCurrent() - 7 * 86400;
-        if(Inp_DebugSync)
-            Print("[Sync Deals] 首次同步,从7天前开始: ", TimeToString(serverLastTime, TIME_DATE|TIME_MINUTES));
-    }
-
-    // 更新缓存
-    g_ServerLastSyncTime = serverLastTime;
-
-    // 2. 收集 serverLastTime 之后的所有成交
-    if(Inp_DebugSync)
-        Print("[Sync Deals] 步骤2: 收集成交记录 (从 ", TimeToString(serverLastTime, TIME_DATE|TIME_MINUTES), " 到现在)...");
     string deals[];
+    datetime latestCloseTimeUtc = 0;
     bool collectionOK = false;
-    int count = CollectDealsAfterTime(serverLastTime, deals, collectionOK);
-
-    if(Inp_DebugSync)
-        Print("[Sync Deals] 收集到 ", count, " 笔成交");
-
+    int count = CollectDealsAfterCloseTime(cursorUtc, deals, latestCloseTimeUtc, collectionOK);
     if(!collectionOK)
     {
         g_SyncInProgress = false;
-        if(Inp_DebugSync)
-            Print("[Sync Deals] 失败:MT5历史成交读取失败,不更新面板同步状态");
+        if(Inp_DebugSync) Print("[Sync Deals] 失败:MT5历史成交读取失败");
         return false;
     }
 
     if(count == 0)
     {
         g_SyncInProgress = false;
-        if(!g_LastSyncQueryOK)
+        if(!cursorQueryOK)
         {
-            if(Inp_DebugSync)
-                Print("[Sync Deals] 失败:服务器游标查询失败且没有可上传成交,不更新面板同步状态");
+            if(Inp_DebugSync) Print("[Sync Deals] 失败:游标查询失败且近7日无可提交订单");
             return false;
         }
-
-        // 已成功查询服务器，只是没有新增成交，也属于一次成功同步。
         g_LastSyncTime = TimeCurrent();
-        if(Inp_DebugSync)
-            Print("[Sync Deals] 完成:没有新成交,服务器状态已核对,面板更新为已同步");
+        if(Inp_DebugSync) Print("[Sync Deals] 完成:没有新订单,服务器游标已核对");
         return true;
     }
 
-    // 3. 获取最后一笔成交的时间（用于更新服务器端同步时间）
-    datetime latestDealTime = GetLatestDealTime(deals);
-    if(Inp_DebugSync)
-        Print("[Sync Deals] 最后一笔成交时间: ", TimeToString(latestDealTime, TIME_DATE|TIME_MINUTES));
-
-    // 分割Key: prefix.secret
-    string parts[];
-    int split = StringSplit(Inp_SecretKey, '.', parts);
-    if(split != 2)
+    int batchLimit = Inp_MaxBatchSize;
+    if(batchLimit < 1) batchLimit = 1;
+    if(batchLimit > 1000) batchLimit = 1000;
+    int batchNumber = 0;
+    for(int start = 0; start < count; start += batchLimit)
     {
-        if(Inp_DebugSync)
-            Print("[Sync Deals] 错误: 密钥格式无效,期望 prefix.secret");
-        g_SyncInProgress = false;
-        return false;
-    }
-    string secret = parts[1];
-
-    // 4. 构造请求体（包含 last_deal_time）
-    long login = AccountInfoInteger(ACCOUNT_LOGIN);
-    int gmtOffset = ServerGmtOffset();
-
-    if(Inp_DebugSync)
-        Print("[Sync Deals] 步骤3: 构造请求体 (MT5账户: ", login, ", GMT偏移: ", gmtOffset, "秒)...");
-
-    string bodyDeals = "";
-    for(int i = 0; i < ArraySize(deals); i++)
-    {
-        if(i > 0) bodyDeals += ",";
-        bodyDeals += deals[i];
+        batchNumber++;
+        int batchCount = MathMin(batchLimit, count - start);
+        if(!UploadDealsBatch(deals, start, batchCount, batchNumber))
+        {
+            g_SyncInProgress = false;
+            if(Inp_DebugSync) Print("[Sync Deals] 失败:批次上传未全部完成,不推进游标");
+            return false;
+        }
     }
 
-    // 关键：添加 last_deal_time 字段，服务器会用它更新最后同步时间
-    string body = StringFormat(
-        "{\"mt5_login\":%I64d,\"server_gmt_off\":%d,\"last_deal_time\":%d,\"deals\":[%s]}",
-        login, gmtOffset, latestDealTime, bodyDeals
-    );
-
-    // 计算签名
-    long timestamp = TimeGMT();
-    string signature = ComputeHMAC(secret, body);
-
-    if(Inp_DebugSync)
-        Print("[Sync Deals] 步骤4: 计算请求签名... 结果=", signature == "" ? "失败" : "成功");
-
-    if(signature == "")
+    if(latestCloseTimeUtc <= 0 || !UpdateServerLastSyncTime(latestCloseTimeUtc))
     {
         g_SyncInProgress = false;
-        if(Inp_DebugSync) Print("[Sync Deals] 失败:请求签名生成失败");
+        if(Inp_DebugSync) Print("[Sync Deals] 失败:成交已上传但游标更新失败,下次将幂等重传");
         return false;
     }
 
-    // 准备请求头
-    string headers =
-        "Content-Type: application/json\r\n" +
-        "Authorization: Bearer " + Inp_SecretKey + "\r\n" +
-        "X-Timestamp: " + IntegerToString(timestamp) + "\r\n" +
-        "X-Signature: " + signature + "\r\n";
-
-    // 发送请求
-    char post[], result[];
-    StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
-    ArrayResize(post, ArraySize(post) - 1);
-
-    string url = Inp_ApiBaseURL + "/api/v1/ingest/deals";
-    if(Inp_DebugSync)
-        Print("[Sync Deals] 步骤5: POST ", url, " | 成交数=", count, " | 请求字节=", ArraySize(post));
-
-    string responseHeaders = "";
-    ResetLastError();
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
-    int webError = GetLastError();
-    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
-
-    if(Inp_DebugSync)
-        Print("[Sync Deals] 步骤6: HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
-
+    g_ServerLastSyncTime = latestCloseTimeUtc;
+    g_LastSyncTime = TimeCurrent();
     g_SyncInProgress = false;
-
-    if(res == 200)
-    {
-        // 成功，更新本地缓存的最后同步时间
-        g_ServerLastSyncTime = latestDealTime;
-        g_LastSyncTime = TimeCurrent();
-
-        if(Inp_DebugSync)
-            Print("[Sync Deals] 完成:已上传 ", count, " 笔成交. 最新成交时间: ",
-                  TimeToString(latestDealTime, TIME_DATE|TIME_MINUTES));
-        return true;
-    }
-    else
-    {
-        if(Inp_DebugSync)
-            Print("[Sync Deals] 失败:HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
-        return false;
-    }
+    if(Inp_DebugSync)
+        Print("[Sync Deals] 完成:上传", count, "笔成交,最后平仓时间游标UTC=", (long)latestCloseTimeUtc);
+    return true;
 }
 
 // 上传品种规格
@@ -3639,15 +3648,6 @@ bool SyncSymbols()
         return false;
     }
 
-    string parts[];
-    int split = StringSplit(Inp_SecretKey, '.', parts);
-    if(split != 2)
-    {
-        if(Inp_DebugSync) Print("[Sync Symbols] 失败:密钥格式无效,期望 prefix.secret");
-        return false;
-    }
-    string secret = parts[1];
-
     long login = AccountInfoInteger(ACCOUNT_LOGIN);
     double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
     double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
@@ -3661,13 +3661,7 @@ bool SyncSymbols()
     );
 
     long timestamp = TimeGMT();
-    string signature = ComputeHMAC(secret, body);
-
-    string headers =
-        "Content-Type: application/json\r\n" +
-        "Authorization: Bearer " + Inp_SecretKey + "\r\n" +
-        "X-Timestamp: " + IntegerToString(timestamp) + "\r\n" +
-        "X-Signature: " + signature + "\r\n";
+    string headers = SyncHeaders(body, timestamp);
 
     char post[], result[];
     StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
@@ -3712,36 +3706,21 @@ bool SyncSnapshot()
         return false;
     }
 
-    string parts[];
-    int split = StringSplit(Inp_SecretKey, '.', parts);
-    if(split != 2)
-    {
-        if(Inp_DebugSync) Print("[Sync Snapshot] 失败:密钥格式无效,期望 prefix.secret");
-        return false;
-    }
-    string secret = parts[1];
-
     long login = AccountInfoInteger(ACCOUNT_LOGIN);
     double balance = AccountInfoDouble(ACCOUNT_BALANCE);
     double equity = AccountInfoDouble(ACCOUNT_EQUITY);
     double margin = AccountInfoDouble(ACCOUNT_MARGIN);
     double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
-    datetime timestamp = TimeCurrent();
+    datetime timestamp = TimeGMT();
 
     string body = StringFormat(
         "{\"mt5_login\":%I64d,\"snapshots\":[{\"balance\":%.2f,\"equity\":%.2f," +
-        "\"margin\":%.2f,\"free_margin\":%.2f,\"snapshot_time\":%d}]}",
-        login, balance, equity, margin, freeMargin, timestamp
+        "\"margin\":%.2f,\"free_margin\":%.2f,\"snapshot_time\":%I64d}]}",
+        login, balance, equity, margin, freeMargin, (long)timestamp
     );
 
     long ts = TimeGMT();
-    string signature = ComputeHMAC(secret, body);
-
-    string headers =
-        "Content-Type: application/json\r\n" +
-        "Authorization: Bearer " + Inp_SecretKey + "\r\n" +
-        "X-Timestamp: " + IntegerToString(ts) + "\r\n" +
-        "X-Signature: " + signature + "\r\n";
+    string headers = SyncHeaders(body, ts);
 
     char post[], result[];
     StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
@@ -3766,6 +3745,133 @@ bool SyncSnapshot()
     return ok;
 }
 
+// 上传EA配置参数快照
+bool SyncSettings()
+{
+    if(Inp_DebugSync) Print("[Sync Settings] ========== 开始上传EA参数配置 ==========");
+    if(!Inp_EnableSync)
+    {
+        if(Inp_DebugSync) Print("[Sync Settings] 跳过:订单同步未启用");
+        return false;
+    }
+    if(Inp_SecretKey == "")
+    {
+        if(Inp_DebugSync) Print("[Sync Settings] 失败:账户密钥为空");
+        return false;
+    }
+
+    long login = AccountInfoInteger(ACCOUNT_LOGIN);
+
+    // 构造 settings JSON 对象(所有关键输入参数),按分类组织
+    string settings = StringFormat(
+        "{" +
+        "\"basic\":{" +
+            "\"magic\":%I64d,\"magic_scalp\":%I64d,\"magic_trend\":%I64d," +
+            "\"comment_scalp\":\"%s\",\"comment_trend\":\"%s\"," +
+            \"slippage\":%d,\"refresh_seconds\":%d," +
+            \"ui_scale\":%.2f," +
+            \"use_session\":%s,\"session_start\":%d,\"session_end\":%d," +
+            \"reset_hour\":%d,\"reset_minute\":%d," +
+            \"export_on_reset\":%s" +
+        "}," +
+        "\"risk\":{" +
+            \"daily_max_drawdown\":%.2f,\"daily_profit_target\":%.2f," +
+            \"scalp_drawdown_ratio\":%.2f,\"trend_drawdown_ratio\":%.2f," +
+            \"weekly_profit_target\":%.2f," +
+            \"consec_loss_limit\":%d,\"cooldown_minutes\":%d," +
+            \"enable_circuit_breaker\":%s,\"alert_on_breaker\":%s" +
+        "}," +
+        "\"scalp\":{" +
+            \"lots\":%.2f,\"max_positions\":%d," +
+            \"sl_points\":%d,\"tp_points\":%d," +
+            \"be_trigger\":%d,\"trail_step\":%d," +
+            \"time_limit_on\":%s,\"max_hold_secs\":%d" +
+        "}," +
+        \"trend\":{" +
+            \"lots\":%.2f,\"max_positions\":%d," +
+            \"sl_points\":%d," +
+            \"be1_trigger\":%d,\"be2_trigger\":%d,\"be2_lock\":%d," +
+            \"be3_trigger\":%d,\"be3_lock\":%d," +
+            \"reduce_percent\":%.2f," +
+            \"trail_trigger\":%d,\"trail_step\":%d" +
+        "}," +
+        "\"moat\":{" +
+            \"enable\":%s," +
+            \"p1_trigger\":%.2f,\"p1_percent\":%.2f," +
+            \"p2_trigger\":%.2f,\"p2_amount\":%.2f," +
+            \"liquidation\":%.2f,\"shutdown\":%.2f" +
+        "}," +
+        "\"sync\":{" +
+            \"enable\":%s,\"api_base_url\":\"%s\"," +
+            \"sync_interval_min\":%d,\"request_timeout_ms\":%d," +
+            \"max_batch_size\":%d,\"debug\":%s" +
+        "}" +
+        "}",
+        // basic
+        Inp_Magic, Inp_MagicScalp, Inp_MagicTrend,
+        JsonEscape(Inp_CommentScalp), JsonEscape(Inp_CommentTrend),
+        Inp_Slippage, Inp_RefreshSeconds,
+        Inp_UIScale,
+        (Inp_UseSession ? "true" : "false"), Inp_SessionStartHour, Inp_SessionEndHour,
+        Inp_ResetHour, Inp_ResetMinute,
+        (Inp_ExportOnReset ? "true" : "false"),
+        // risk
+        Inp_DailyMaxDrawdown, Inp_DailyProfitTarget,
+        Inp_ScalpDrawdownRatio, Inp_TrendDrawdownRatio,
+        Inp_WeeklyProfitTarget,
+        Inp_ConsecLossLimit, Inp_CooldownMinutes,
+        (Inp_EnableCircuitBreaker ? "true" : "false"), (Inp_AlertOnBreaker ? "true" : "false"),
+        // scalp
+        Inp_ScalpLots, Inp_ScalpMaxPositions,
+        Inp_ScalpSL_Points, Inp_ScalpTP_Points,
+        Inp_ScalpBETrigger, Inp_ScalpTrailStep,
+        (Inp_ScalpTimeLimitOn ? "true" : "false"), Inp_ScalpMaxHoldSecs,
+        // trend
+        Inp_TrendLots, Inp_TrendMaxPositions,
+        Inp_TrendSL_Points,
+        Inp_TrendBE1_Trigger, Inp_TrendBE2_Trigger, Inp_TrendBE2_Lock,
+        Inp_TrendBE3_Trigger, Inp_TrendBE3_Lock,
+        Inp_TrendReducePercent,
+        Inp_TrendTrailTrigger, Inp_TrendTrailStep,
+        // moat
+        (Inp_EnableProfitProtect ? "true" : "false"),
+        Inp_ProfitProtect1_Trigger, Inp_ProfitProtect1_Percent,
+        Inp_ProfitProtect2_Trigger, Inp_ProfitProtect2_Amount,
+        Inp_ProfitLiquidation, Inp_ProfitShutdown,
+        // sync
+        (Inp_EnableSync ? "true" : "false"), JsonEscape(Inp_ApiBaseURL),
+        Inp_SyncIntervalMin, Inp_RequestTimeoutMS,
+        Inp_MaxBatchSize, (Inp_DebugSync ? "true" : "false")
+    );
+
+    long timestamp = TimeGMT();
+    string body = StringFormat("{\"mt5_login\":%I64d,\"snapshot_time\":%I64d,\"settings\":%s}",
+                              login, timestamp, settings);
+
+    string headers = SyncHeaders(body, timestamp);
+
+    char post[], result[];
+    StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
+    ArrayResize(post, ArraySize(post) - 1);
+
+    string url = Inp_ApiBaseURL + "/api/v1/ingest/settings";
+    if(Inp_DebugSync)
+        Print("[Sync Settings] POST ", url, " | 请求字节=", ArraySize(post));
+
+    string responseHeaders = "";
+    ResetLastError();
+    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
+    int webError = GetLastError();
+    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+    bool ok = (res >= 200 && res < 300);
+
+    if(Inp_DebugSync)
+        Print("[Sync Settings] ", ok ? "完成" : "失败", ":HTTP=", res,
+              " | MT5错误=", webError, " | 响应=", response);
+
+    return ok;
+}
+
 // 发送心跳
 bool SyncHeartbeat()
 {
@@ -3781,26 +3887,11 @@ bool SyncHeartbeat()
         return false;
     }
 
-    string parts[];
-    int split = StringSplit(Inp_SecretKey, '.', parts);
-    if(split != 2)
-    {
-        if(Inp_DebugSync) Print("[Sync Heartbeat] 失败:密钥格式无效,期望 prefix.secret");
-        return false;
-    }
-    string secret = parts[1];
-
     long login = AccountInfoInteger(ACCOUNT_LOGIN);
     string body = StringFormat("{\"mt5_login\":%I64d}", login);
 
     long timestamp = TimeGMT();
-    string signature = ComputeHMAC(secret, body);
-
-    string headers =
-        "Content-Type: application/json\r\n" +
-        "Authorization: Bearer " + Inp_SecretKey + "\r\n" +
-        "X-Timestamp: " + IntegerToString(timestamp) + "\r\n" +
-        "X-Signature: " + signature + "\r\n";
+    string headers = SyncHeaders(body, timestamp);
 
     char post[], result[];
     StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
@@ -3891,6 +3982,8 @@ int OnInit()
 
             if(Inp_DebugSync) Print("[Sync Init] 步骤2/2:立即同步成交");
             bool dealsOk = SyncDeals();
+            if(Inp_DebugSync) Print("[Sync Init] 步骤3/3:上传EA参数配置");
+            bool settingsOk = SyncSettings();
 
             if(Inp_DebugSync)
                 Print("[Sync Init] 初始化完成 | 品种规格=", symbolOk ? "成功" : "失败",
@@ -3961,6 +4054,15 @@ void OnTimer()
         {
             heartbeatCounter = 0;
             SyncHeartbeat();
+        }
+
+        // 每小时上传一次EA参数配置
+        static int settingsCounter = 0;
+        settingsCounter += timerStep;
+        if(settingsCounter >= 3600)
+        {
+            settingsCounter = 0;
+            SyncSettings();
         }
     }
 }
