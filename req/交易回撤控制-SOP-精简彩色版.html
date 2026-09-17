@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>交易回撤控制 SOP (精简彩色版)</title>
+<style>
+    /* 强制打印背景颜色和精确 A4 尺寸 */
+    @page {
+        size: A4;
+        margin: 8mm; /* 缩小页边距防止超页 */
+    }
+    * {
+        box-sizing: border-box;
+        -webkit-print-color-adjust: exact !important;
+        print-color-adjust: exact !important;
+    }
+    body {
+        margin: 0;
+        background: #e5e7eb;
+        display: flex;
+        justify-content: center;
+        font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+        color: #111827;
+    }
+    .page {
+        width: 210mm;
+        height: 297mm;
+        background: #fff;
+        margin: 5mm;
+        padding: 10mm;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between; /* 上下贴紧 */
+    }
+    @media print {
+        body { background: #fff; }
+        .page { margin: 0; padding: 0; box-shadow: none; width: 100%; height: 100%; page-break-after: avoid; }
+    }
+
+    /* 头部 */
+    .header {
+        text-align: center;
+        border-bottom: 4px solid #1e3a8a;
+        padding-bottom: 3mm;
+        margin-bottom: 4mm;
+    }
+    .header h1 {
+        margin: 0 0 2mm 0;
+        font-size: 24pt;
+        color: #1e3a8a;
+        letter-spacing: 2px;
+    }
+    .header .quote {
+        font-size: 13pt;
+        font-weight: bold;
+        background: #dc2626; /* 警示红 */
+        color: #fff;
+        padding: 1.5mm 6mm;
+        border-radius: 4px;
+        display: inline-block;
+    }
+
+    /* 网格布局 (左右两列，间距缩小) */
+    .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 5mm;
+        flex: 1;
+    }
+
+    /* 模块样式 */
+    .box {
+        border: 2px solid #1e3a8a;
+        border-radius: 6px;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        margin-bottom: 4mm;
+    }
+    .box-title {
+        background: #1e3a8a;
+        color: #fff;
+        font-size: 13pt;
+        font-weight: bold;
+        padding: 1.5mm;
+        text-align: center;
+        margin: 0;
+    }
+    .box-content {
+        padding: 3mm;
+    }
+
+    /* 表格 */
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 2mm;
+        font-size: 11pt;
+    }
+    th, td {
+        border: 1px solid #cbd5e1;
+        padding: 2.5mm 1.5mm;
+        text-align: center;
+    }
+    th {
+        background: #f1f5f9;
+        color: #334155;
+        font-weight: bold;
+    }
+    .strong { font-weight: bold; font-size: 12pt; }
+    .text-green { color: #059669; }
+    .text-red { color: #dc2626; }
+    .bg-green { background: #d1fae5; }
+    .bg-red { background: #fee2e2; color: #b91c1c; font-weight: bold; }
+    .bg-dark { background: #111827; color: #fff; font-weight: bold; }
+
+    /* 列表雷区 */
+    ul {
+        margin: 0;
+        padding-left: 5mm;
+    }
+    li {
+        margin-bottom: 2.5mm;
+        font-size: 11pt;
+        line-height: 1.4;
+    }
+    .alert-tag {
+        background: #fef3c7;
+        color: #b45309;
+        font-weight: bold;
+        padding: 0.5mm 1.5mm;
+        border-radius: 3px;
+        margin-right: 1mm;
+    }
+
+    /* 底部三大铁律 */
+    .footer {
+        border: 3px solid #dc2626;
+        background: #fff5f5;
+        border-radius: 6px;
+        padding: 3mm;
+        margin-top: 2mm;
+    }
+    .footer-title {
+        text-align: center;
+        font-size: 15pt;
+        font-weight: bold;
+        color: #dc2626;
+        margin-bottom: 2mm;
+    }
+    .footer-rules {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 2mm;
+        text-align: center;
+    }
+    .rule-item {
+        background: #fff;
+        border: 1px dashed #dc2626;
+        padding: 2mm;
+        font-weight: bold;
+        border-radius: 4px;
+        font-size: 12pt;
+    }
+    .rule-desc {
+        display: block;
+        font-size: 10pt;
+        font-weight: normal;
+        color: #475569;
+        margin-top: 1mm;
+    }
+</style>
+</head>
+<body>
+
+<div class="page">
+    
+    <!-- 头部 -->
+    <div class="header">
+        <h1>交易回撤控制 SOP</h1>
+        <div class="quote">保住利润比赚更多更重要 —— 锁住的盈利才是钱！</div>
+    </div>
+
+    <!-- 核心区域 -->
+    <div class="grid">
+        
+        <!-- 左侧：资金控制 -->
+        <div class="col">
+            <div class="box">
+                <div class="box-title">一、日内锁利 (触线强制执行)</div>
+                <div class="box-content">
+                    <table>
+                        <tr>
+                            <th>日盈利</th>
+                            <th>底线要求</th>
+                            <th>执行动作</th>
+                        </tr>
+                        <tr>
+                            <td class="strong text-green">+$300</td>
+                            <td class="bg-green">保住 $150</td>
+                            <td>最多回撤 50%</td>
+                        </tr>
+                        <tr>
+                            <td class="strong text-green">+$500</td>
+                            <td class="bg-green">保住 $300</td>
+                            <td>最多回撤 $200</td>
+                        </tr>
+                        <tr>
+                            <td class="strong text-green">+$800</td>
+                            <td class="bg-green">保住 $600</td>
+                            <td>最多回撤 25%</td>
+                        </tr>
+                        <tr>
+                            <td class="strong text-green">+$1000</td>
+                            <td colspan="2" class="bg-dark">拔网线！强制收工！</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+
+            <div class="box">
+                <div class="box-title">二、周度利润保护 (降频降仓)</div>
+                <div class="box-content">
+                    <table>
+                        <tr>
+                            <th>本周盈利</th>
+                            <th>策略调整</th>
+                        </tr>
+                        <tr>
+                            <td class="strong text-green">+$1000</td>
+                            <td>日止损缩降为 <b>$300</b></td>
+                        </tr>
+                        <tr>
+                            <td class="strong text-green">+$1500</td>
+                            <td>日止损缩降为 <b>$200</b></td>
+                        </tr>
+                        <tr>
+                            <td class="strong text-green">+$2000</td>
+                            <td>禁单日亏损，只允许极轻仓</td>
+                        </tr>
+                        <tr>
+                            <td class="strong text-green">+$2500</td>
+                            <td class="bg-dark">本周收工，周五禁交易！</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- 右侧：单笔及雷区 -->
+        <div class="col">
+            <div class="box">
+                <div class="box-title">三、单笔浮盈防守 (移动止损)</div>
+                <div class="box-content">
+                    <p style="margin:0 0 2mm 0; font-weight:bold; color:#1e3a8a;">🟢 剥头皮单 (目标 2 点)</p>
+                    <table>
+                        <tr><th>浮盈</th><th>强制止损位</th></tr>
+                        <tr><td>+ 1 点</td><td class="strong">移至成本价 (保本)</td></tr>
+                        <tr><td>+ 1.5 点</td><td class="strong">移至 + 0.5 点 (锁利)</td></tr>
+                        <tr><td>+ 2 点</td><td class="strong bg-green">无脑止盈离场</td></tr>
+                    </table>
+
+                    <p style="margin:4mm 0 2mm 0; font-weight:bold; color:#1e3a8a;">🔵 趋势波段单 (目标 8-15 点)</p>
+                    <table>
+                        <tr><th>浮盈</th><th>强制止损位</th></tr>
+                        <tr><td>+ 3 点</td><td class="strong">移至成本价 (保本)</td></tr>
+                        <tr><td>+ 5 点</td><td class="strong">移至 + 2 点 (锁利)</td></tr>
+                        <tr><td>+ 8 点</td><td class="strong">移至 + 5 点 / 平一半</td></tr>
+                        <tr><td>+ 10点以上</td><td class="strong bg-red">最高点回撤 3 点无脑出局</td></tr>
+                    </table>
+                </div>
+            </div>
+
+            <div class="box">
+                <div class="box-title">四、心态雷区 (红线纪律)</div>
+                <div class="box-content" style="padding-top: 3mm;">
+                    <ul>
+                        <li><span class="alert-tag">10分钟冷却</span>日盈 > $500 后，每开一单前<b>强制闭眼等待 10 分钟</b>。</li>
+                        <li><span class="alert-tag">禁凑整陷阱</span>盈 $480 或 $950 时，<b>严禁为了凑整数开单</b>。</li>
+                        <li><span class="alert-tag">连亏熔断</span>触及回撤底线被打损，<b>必须关闭软件</b>，禁报复交易。</li>
+                        <li><span class="alert-tag">尾盘空仓</span>离计划收盘不足 30 分钟且处于盈利，<b>绝对禁止开新仓</b>。</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 底部总结 -->
+    <div class="footer">
+        <div class="footer-title">⚡ 交易终极三大铁律 ⚡</div>
+        <div class="footer-rules">
+            <div class="rule-item">1. 设保护线<span class="rule-desc">日盈$500后，最多只准回撤$200！</span></div>
+            <div class="rule-item">2. 移止损<span class="rule-desc">单笔浮盈一旦达标，立刻移至保本位！</span></div>
+            <div class="rule-item" style="border-color:#dc2626; color:#dc2626;">3. 会收工<span class="rule-desc">达标或破底线，立刻拔网线走人！</span></div>
+        </div>
+    </div>
+
+</div>
+
+</body>
+</html>

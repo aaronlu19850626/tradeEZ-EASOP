@@ -1,0 +1,25 @@
+# 编译产物
+*.ex5
+
+# 临时文件
+*.tmp
+*.bak
+*.log
+
+# 状态文件
+GSOP_state_*.csv
+
+# 旧文件（已重命名为 tradeEZ.mq5）
+Gold_SOP_EA.mq5
+
+# IDE 配置
+.vscode/
+.idea/
+
+# 系统文件
+Thumbs.db
+.DS_Store
+Desktop.ini
+
+# Git 相关
+.git/

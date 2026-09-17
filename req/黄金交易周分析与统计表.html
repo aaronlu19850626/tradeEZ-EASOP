@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>黄金交易周分析与统计表</title>
+<style>
+    @page { size: A4 portrait; margin: 8mm 10mm; }
+    :root { --ink: #111827; --muted: #6b7280; --line: #1f2937; --soft-line: #9ca3af; --bg: #f3f4f6; --bg-light: #f9fafb; --navy: #1e3a8a; --navy-light: #eff6ff; --red: #991b1b; --red-light: #fef2f2; --green: #065f46; --green-light: #ecfdf5; --gold: #92400e; --gold-light: #fffbeb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 0; color: var(--ink); font-family: "PingFang SC", "Microsoft YaHei", Arial, sans-serif; font-size: 8pt; line-height: 1.22; background: #ffffff; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .page { width: 100%; max-width: 190mm; margin: 0 auto; page-break-inside: avoid; break-inside: avoid; }
+    .page-1 { page-break-after: always; break-after: page; }
+    .header { display: grid; grid-template-columns: 1fr auto 1fr; align-items: end; border-bottom: 2px solid var(--navy); padding-bottom: 5px; margin-bottom: 5px; }
+    .header h1 { grid-column: 2; margin: 0; text-align: center; font-size: 16pt; letter-spacing: 1.2px; font-weight: 800; color: var(--navy); white-space: nowrap; }
+    .header .tag { grid-column: 3; justify-self: end; font-size: 7pt; color: var(--muted); border: 1px solid var(--soft-line); border-radius: 999px; padding: 2px 6px; white-space: nowrap; }
+    .discipline-banner { border: 1.5px solid var(--red); background: var(--red-light); color: var(--red); padding: 5px 7px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; border-radius: 4px; font-weight: 800; white-space: nowrap; overflow: hidden; }
+    .discipline-banner .main { font-family: "KaiTi", "STKaiti", "SimSun", serif; font-size: 9.3pt; white-space: nowrap; }
+    .discipline-banner .rules { font-size: 6.8pt; color: #7f1d1d; font-weight: 700; white-space: nowrap; overflow: hidden; }
+    .line-input { display: inline-block; border-bottom: 1px solid var(--line); min-width: 34px; height: 11px; margin: 0 1px; vertical-align: baseline; }
+    .line-input.xs { min-width: 13px; } .line-input.sm { min-width: 24px; } .line-input.md { min-width: 38px; }
+    .week-info { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 5px; margin-bottom: 5px; font-size: 7.8pt; font-weight: 700; }
+    .week-info.row-2 { grid-template-columns: repeat(4, 1fr); }
+    .info-box { border: 1px solid var(--line); padding: 3px 5px; min-height: 21px; display: flex; align-items: center; gap: 3px; background: var(--bg-light); white-space: nowrap; overflow: hidden; }
+    .section-title { margin-top: 5px; border: 1px solid var(--line); border-left: 5px solid var(--navy); background: linear-gradient(90deg, var(--navy-light), #ffffff); padding: 4px 7px; min-height: 22px; display: flex; justify-content: space-between; align-items: center; font-weight: 800; font-size: 8.4pt; white-space: nowrap; overflow: hidden; }
+    .section-title .left { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+    .section-no { display: inline-block; min-width: 16px; height: 16px; line-height: 15px; text-align: center; border-radius: 50%; background: var(--navy); color: #ffffff; font-size: 7pt; font-weight: 800; }
+    .section-title .rule { font-size: 6.8pt; color: var(--muted); font-weight: 700; white-space: nowrap; overflow: hidden; }
+    .box { border: 1px solid var(--line); border-top: none; padding: 5px 6px; }
+    .box.with-border { border-top: 1px solid var(--line); }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    th, td { border: 1px solid var(--line); text-align: center; vertical-align: middle; padding: 1px 3px; white-space: nowrap; overflow: hidden; text-overflow: clip; }
+    th { background: var(--bg); font-size: 6.8pt; height: 18px; font-weight: 800; }
+    td { font-size: 7.3pt; height: 20px; }
+    .num-cell { background: var(--bg-light); color: var(--muted); font-weight: 700; }
+    .text-left { text-align: left; }
+    .money-cell { text-align: right !important; padding-right: 7px !important; color: var(--ink); font-weight: 700; }
+    .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+    .summary-card { border: 1px solid var(--line); background: var(--bg-light); padding: 4px 5px; min-height: 34px; overflow: hidden; }
+    .summary-card .label { font-size: 6.8pt; color: var(--muted); font-weight: 700; margin-bottom: 2px; white-space: nowrap; }
+    .summary-card .value { font-size: 8.3pt; font-weight: 800; white-space: nowrap; }
+    .summary-card.important { background: var(--gold-light); border-color: #b45309; }
+    .summary-card.good { background: var(--green-light); border-color: #34d399; }
+    .summary-card.danger { background: var(--red-light); border-color: #f87171; }
+    .formula { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 5px; }
+    .formula-item { border: 1px dashed var(--soft-line); background: #fff; padding: 3px 5px; font-size: 6.8pt; color: var(--muted); white-space: nowrap; overflow: hidden; }
+    .daily-table .col-day { width: 9%; } .daily-table .col-date { width: 11%; } .daily-table .col-market { width: 14%; } .daily-table .col-trades { width: 8%; } .daily-table .col-winrate { width: 9%; } .daily-table .col-pnl { width: 11%; } .daily-table .col-score { width: 9%; } .daily-table .col-problem { width: 29%; }
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 5px; }
+    .mini-title { font-weight: 800; font-size: 8pt; margin-bottom: 3px; color: var(--navy); white-space: nowrap; }
+    .conclusion-line { display: flex; align-items: center; width: 100%; height: 18px; white-space: nowrap; overflow: hidden; }
+    .conclusion-line .label { flex: 0 0 auto; font-weight: 700; }
+    .conclusion-line .fill-line { flex: 1 1 auto; border-bottom: 1px solid var(--line); height: 12px; margin-left: 4px; }
+    .plan-note { font-size: 6.8pt; color: var(--muted); font-weight: 700; margin: 3px 0 4px 0; white-space: nowrap; overflow: hidden; }
+    .plan-fill { text-align: left; color: var(--muted); font-size: 7pt; }
+    .review-grid { display: grid; grid-template-columns: 1fr; gap: 5px; margin-top: 5px; }
+    .review-card { border: 1px solid var(--line); background: var(--bg-light); padding: 5px 6px; min-height: 67px; overflow: hidden; }
+    .review-card .title { font-weight: 800; font-size: 8.1pt; margin-bottom: 3px; white-space: nowrap; }
+    .review-card.good .title { color: var(--green); }
+    .review-card.bad .title { color: var(--red); }
+    .writing-line { border-bottom: 1px dashed #777; height: 15px; width: 100%; }
+    .footer { margin-top: 5px; display: flex; justify-content: space-between; align-items: center; font-size: 7pt; color: var(--muted); white-space: nowrap; overflow: hidden; }
+    .footer .motto { color: var(--navy); font-weight: 800; font-family: "KaiTi", "STKaiti", "SimSun", serif; font-size: 8.5pt; white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<div class="page page-1">
+    <div class="header">
+        <h1>黄金交易周分析与统计表</h1>
+        <div class="tag">第 1 页 · 周度统计</div>
+    </div>
+
+    <div class="discipline-banner">
+        <div class="main">周复盘重点：先统计行为，再评价结果</div>
+        <div class="rules">20:15~23:15(夏)｜看胜率｜看盈亏比｜看纪律｜看时间段</div>
+    </div>
+
+    <div class="week-info">
+        <div class="info-box"><span class="info-label">周期：</span><span>202<span class="line-input xs"></span>年<span class="line-input xs"></span>月<span class="line-input xs"></span>日~<span class="line-input xs"></span>月<span class="line-input xs"></span>日</span></div>
+        <div class="info-box"><span class="info-label">周初净值：</span><span>$<span class="line-input md"></span></span></div>
+        <div class="info-box"><span class="info-label">周末净值：</span><span>$<span class="line-input md"></span></span></div>
+    </div>
+
+    <div class="week-info row-2">
+        <div class="info-box"><span class="info-label">本周盈亏：</span><span>$<span class="line-input md"></span></span></div>
+        <div class="info-box"><span class="info-label">收益率：</span><span><span class="line-input sm"></span>%</span></div>
+        <div class="info-box"><span class="info-label">交易天数：</span><span><span class="line-input xs"></span> 天</span></div>
+        <div class="info-box"><span class="info-label">纪律评分：</span><span><span class="line-input xs"></span>/10</span></div>
+    </div>
+
+    <div class="section-title"><div class="left"><span class="section-no">1</span><span>本周核心统计概览</span></div><div class="rule">判断交易质量，不只看赚亏</div></div>
+    <div class="box">
+        <div class="summary-grid">
+            <div class="summary-card important"><div class="label">总交易次数</div><div class="value"><span class="line-input sm"></span> 笔</div></div>
+            <div class="summary-card good"><div class="label">盈利笔数</div><div class="value"><span class="line-input sm"></span> 笔</div></div>
+            <div class="summary-card danger"><div class="label">亏损笔数</div><div class="value"><span class="line-input sm"></span> 笔</div></div>
+            <div class="summary-card"><div class="label">总胜率</div><div class="value"><span class="line-input sm"></span>%</div></div>
+            <div class="summary-card"><div class="label">平均盈利</div><div class="value">$<span class="line-input sm"></span></div></div>
+            <div class="summary-card"><div class="label">平均亏损</div><div class="value">$<span class="line-input sm"></span></div></div>
+            <div class="summary-card important"><div class="label">盈亏比</div><div class="value"><span class="line-input sm"></span>:1</div></div>
+            <div class="summary-card danger"><div class="label">最大回撤</div><div class="value">$<span class="line-input sm"></span></div></div>
+        </div>
+        <div class="formula">
+            <div class="formula-item">胜率 = 盈利笔数 ÷ 总交易次数</div>
+            <div class="formula-item">盈亏比 = 平均盈利 ÷ 平均亏损</div>
+            <div class="formula-item">收益率 = 本周盈亏 ÷ 周初净值</div>
+            <div class="formula-item">质量目标：减少低质量交易</div>
+        </div>
+    </div>
+
+    <div class="section-title"><div class="left"><span class="section-no">2</span><span>每日交易结果统计</span></div><div class="rule">从每日记录表汇总</div></div>
+    <table class="daily-table">
+        <thead><tr><th class="col-day">星期</th><th class="col-date">日期</th><th class="col-market">行情</th><th class="col-trades">笔数</th><th class="col-winrate">胜率</th><th class="col-pnl">盈亏</th><th class="col-score">纪律</th><th class="col-problem">最大问题 / 关键经验</th></tr></thead>
+        <tbody>
+            <tr><td class="num-cell">周一</td><td></td><td></td><td></td><td>%</td><td class="money-cell">$</td><td>/10</td><td></td></tr>
+            <tr><td class="num-cell">周二</td><td></td><td></td><td></td><td>%</td><td class="money-cell">$</td><td>/10</td><td></td></tr>
+            <tr><td class="num-cell">周三</td><td></td><td></td><td></td><td>%</td><td class="money-cell">$</td><td>/10</td><td></td></tr>
+            <tr><td class="num-cell">周四</td><td></td><td></td><td></td><td>%</td><td class="money-cell">$</td><td>/10</td><td></td></tr>
+            <tr><td class="num-cell">周五</td><td></td><td></td><td></td><td>%</td><td class="money-cell">$</td><td>/10</td><td></td></tr>
+            <tr><td class="num-cell">合计</td><td>-</td><td>-</td><td></td><td>%</td><td class="money-cell">$</td><td>/10</td><td class="text-left">本周核心结论：</td></tr>
+        </tbody>
+    </table>
+
+    <div class="section-title"><div class="left"><span class="section-no">3</span><span>策略表现统计</span></div><div class="rule">剥头皮和趋势单分开看</div></div>
+    <table>
+        <thead><tr><th style="width:18%;">策略</th><th style="width:12%;">笔数</th><th style="width:12%;">盈利</th><th style="width:12%;">亏损</th><th style="width:12%;">胜率</th><th style="width:14%;">净盈亏</th><th style="width:20%;">评价</th></tr></thead>
+        <tbody>
+            <tr><td class="num-cell">剥头皮</td><td></td><td></td><td></td><td>%</td><td class="money-cell">$</td><td></td></tr>
+            <tr><td class="num-cell">趋势单</td><td></td><td></td><td></td><td>%</td><td class="money-cell">$</td><td></td></tr>
+            <tr><td class="num-cell">合计</td><td></td><td></td><td></td><td>%</td><td class="money-cell">$</td><td></td></tr>
+        </tbody>
+    </table>
+
+    <div class="two-col">
+        <div>
+            <div class="section-title"><div class="left"><span class="section-no">4</span><span>时间段统计</span></div><div class="rule">找出有效交易窗口</div></div>
+            <table>
+                <thead><tr><th style="width:35%;">时间段</th><th style="width:15%;">笔数</th><th style="width:15%;">胜率</th><th style="width:18%;">盈亏</th><th style="width:17%;">保留</th></tr></thead>
+                <tbody>
+                    <tr><td class="num-cell">20:15~21:30</td><td></td><td>%</td><td class="money-cell">$</td><td></td></tr>
+                    <tr><td class="num-cell">21:30~22:30</td><td></td><td>%</td><td class="money-cell">$</td><td></td></tr>
+                    <tr><td class="num-cell">22:30~23:15</td><td></td><td>%</td><td class="money-cell">$</td><td></td></tr>
+                    <tr><td class="num-cell">合计</td><td></td><td>%</td><td class="money-cell">$</td><td></td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div>
+            <div class="section-title"><div class="left"><span class="section-no">5</span><span>纪律统计</span></div><div class="rule">纪律问题优先处理</div></div>
+            <table>
+                <thead><tr><th style="width:26%;">纪律项</th><th style="width:16%;">次数</th><th style="width:20%;">亏损</th><th style="width:18%;">严重度</th><th style="width:20%;">下周要求</th></tr></thead>
+                <tbody>
+                    <tr><td class="num-cell">扛单</td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+                    <tr><td class="num-cell">扩损</td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+                    <tr><td class="num-cell">追单</td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+                    <tr><td class="num-cell">过度</td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+                    <tr><td class="num-cell">情绪</td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <div class="footer">
+        <div class="motto">“先统计，再判断；先控制错误，再追求盈利。”</div>
+        <div class="print-tip">第 1 页｜A4 竖向｜100%｜开启背景图形</div>
+    </div>
+</div>
+
+<div class="page page-2">
+    <div class="header">
+        <h1>黄金交易周复盘与下周计划</h1>
+        <div class="tag">第 2 页 · 复盘计划</div>
+    </div>
+
+    <div class="discipline-banner">
+        <div class="main">下周只重点改一个核心问题</div>
+        <div class="rules">减少无效交易｜保留有效时间段｜强化止损纪律｜避免重复错误</div>
+    </div>
+
+    <div class="section-title"><div class="left"><span class="section-no">6</span><span>行情类型与适配度分析</span></div><div class="rule">看自己是否做对了行情</div></div>
+    <table>
+        <thead><tr><th style="width:18%;">行情类型</th><th style="width:12%;">天数</th><th style="width:20%;">主要策略</th><th style="width:15%;">净盈亏</th><th style="width:15%;">适配度</th><th style="width:20%;">下周处理</th></tr></thead>
+        <tbody>
+            <tr><td class="num-cell">趋势突破</td><td></td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+            <tr><td class="num-cell">区间震荡</td><td></td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+            <tr><td class="num-cell">假突破</td><td></td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+            <tr><td class="num-cell">数据驱动</td><td></td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+            <tr><td class="num-cell">无方向</td><td></td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+        </tbody>
+    </table>
+
+    <div class="box with-border">
+        <div class="mini-title">行情适配结论</div>
+        <div class="conclusion-line"><span class="label">我最适合的行情：</span><span class="fill-line"></span></div>
+        <div class="conclusion-line"><span class="label">我最容易亏损的行情：</span><span class="fill-line"></span></div>
+        <div class="conclusion-line"><span class="label">下周遇到该行情时的处理规则：</span><span class="fill-line"></span></div>
+    </div>
+
+    <div class="section-title"><div class="left"><span class="section-no">7</span><span>高频错误与亏损来源</span></div><div class="rule">亏损来源必须具体化</div></div>
+    <table>
+        <thead><tr><th style="width:18%;">错误类型</th><th style="width:12%;">次数</th><th style="width:15%;">亏损</th><th style="width:27%;">根本原因</th><th style="width:28%;">下周限制规则</th></tr></thead>
+        <tbody>
+            <tr><td class="num-cell">位置差</td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+            <tr><td class="num-cell">方向错</td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+            <tr><td class="num-cell">止损差</td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+            <tr><td class="num-cell">早平仓</td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+            <tr><td class="num-cell">频率高</td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+        </tbody>
+    </table>
+
+    <div class="section-title"><div class="left"><span class="section-no">8</span><span>关键交易样本复盘</span></div><div class="rule">只复盘最有价值的交易</div></div>
+    <table>
+        <thead><tr><th style="width:13%;">样本</th><th style="width:12%;">日期</th><th style="width:12%;">时间</th><th style="width:13%;">策略</th><th style="width:13%;">结果</th><th style="width:20%;">问题</th><th style="width:17%;">改进</th></tr></thead>
+        <tbody>
+            <tr><td class="num-cell">最佳单</td><td></td><td></td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+            <tr><td class="num-cell">最差单</td><td></td><td></td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+            <tr><td class="num-cell">典型错</td><td></td><td></td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+            <tr><td class="num-cell">可复制</td><td></td><td></td><td></td><td class="money-cell">$</td><td></td><td></td></tr>
+        </tbody>
+    </table>
+
+    <div class="section-title"><div class="left"><span class="section-no">9</span><span>下周交易计划</span></div><div class="rule">每一行都写成自己能执行的动作</div></div>
+    <div class="plan-note">填写方法：不要写“看情况”，要写具体条件。例如：只做 20:15~23:15；只在关键位附近做；连续亏损 2 笔暂停。</div>
+    <table>
+        <thead><tr><th style="width:15%;">计划项目</th><th style="width:28%;">我要怎么做</th><th style="width:27%;">只有什么情况才做</th><th style="width:18%;">不能做什么</th><th style="width:12%;">收盘检查</th></tr></thead>
+        <tbody>
+            <tr><td class="num-cell">交易时间</td><td class="plan-fill"></td><td class="plan-fill"></td><td class="plan-fill"></td><td>做到 / 否</td></tr>
+            <tr><td class="num-cell">剥头皮</td><td class="plan-fill"></td><td class="plan-fill"></td><td class="plan-fill"></td><td>做到 / 否</td></tr>
+            <tr><td class="num-cell">趋势单</td><td class="plan-fill"></td><td class="plan-fill"></td><td class="plan-fill"></td><td>做到 / 否</td></tr>
+            <tr><td class="num-cell">止损风控</td><td class="plan-fill"></td><td class="plan-fill"></td><td class="plan-fill"></td><td>做到 / 否</td></tr>
+            <tr><td class="num-cell">日内停止</td><td class="plan-fill"></td><td class="plan-fill"></td><td class="plan-fill"></td><td>做到 / 否</td></tr>
+            <tr><td class="num-cell">本周重点</td><td class="plan-fill"></td><td class="plan-fill"></td><td class="plan-fill"></td><td>做到 / 否</td></tr>
+        </tbody>
+    </table>
+
+    <div class="section-title"><div class="left"><span class="section-no">10</span><span>周总结与下周唯一改进目标</span></div><div class="rule">不要列太多目标，只重点解决一个问题</div></div>
+    <div class="review-grid">
+        <div class="review-card good">
+            <div class="title">本周做得最好的三件事</div>
+            <div class="writing-line"></div><div class="writing-line"></div><div class="writing-line"></div>
+        </div>
+        <div class="review-card bad">
+            <div class="title">本周最严重的一个错误</div>
+            <div class="writing-line"></div><div class="writing-line"></div><div class="writing-line"></div>
+        </div>
+        <div class="review-card">
+            <div class="title">下周唯一核心改进目标</div>
+            <div class="writing-line"></div><div class="writing-line"></div><div class="writing-line"></div>
+        </div>
+    </div>
+
+    <div class="footer">
+        <div class="motto">“周复盘不是证明自己对，而是发现哪些行为正在伤害账户。”</div>
+        <div class="print-tip">第 2 页｜A4 竖向｜100%｜开启背景图形</div>
+    </div>
+</div>
+
+</body>
+</html>

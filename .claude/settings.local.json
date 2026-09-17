@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(& \"C:\\\\Program Files\\\\MetaTrader 5\\\\metaeditor64.exe\" /compile:\"$env:APPDATA\\\\MetaQuotes\\\\Terminal\\\\D0E8209F77C8CF37AD8BF550E51FF075\\\\MQL5\\\\Experts\\\\Gold SOP\\\\Gold_SOP_EA.mq5\" /log)",
+      "PowerShell($lines = Get-Content \"Gold_SOP_EA.mq5\" -TotalCount 3500; $inSync = $false; $result = @\\(\\); for\\($i=0; $i -lt $lines.Length; $i++\\) { if\\($lines[$i] -match \"同步|Sync\" -and $lines[$i] -notmatch \"^input\"\\) { $result += \"$\\($i+1\\): $\\($lines[$i]\\)\"; if\\($result.Count -ge 50\\) { break } } }; $result)",
+      "PowerShell($content = Get-Content \"Gold_SOP_EA.mq5\"; $content.Count)",
+      "PowerShell(Select-String -Path \"Gold_SOP_EA.mq5\" -Pattern \"^//\\\\+--\" | Select-Object -Last 20 | ForEach-Object { \"$\\($_.LineNumber\\): $\\($_.Line\\)\" })",
+      "PowerShell($metaEditorPath = \"C:\\\\Program Files\\\\MetaTrader 5\\\\metaeditor64.exe\"; if\\(Test-Path $metaEditorPath\\) { & $metaEditorPath /compile:\"$PWD\\\\Gold_SOP_EA.mq5\" /log 2>&1 | Select-Object -Last 50 } else { Write-Output \"MetaEditor not found at expected path\" })",
+      "PowerShell($pwd.Path)",
+      "PowerShell($file = \"Gold_SOP_EA.mq5\"; if\\(Test-Path $file\\) { $lines = Get-Content $file; Write-Output \"File has $\\($lines.Count\\) lines\"; $lines | Select-String -Pattern \"void OnTimer|void OnTradeTransaction|AppendDealToQueue|SyncDeals\" | Select-Object -First 10 LineNumber, Line } else { Write-Output \"File not found\" })",
+      "PowerShell($file = \"Gold_SOP_EA.mq5\"; $lines = Get-Content $file; Write-Output \"Total lines: $\\($lines.Count\\)\"; Write-Output \"`nSync module section:\"; $lines | Select-String -Pattern \"数据同步|Data Sync|Sync\" -Context 0,0 | Select-Object -First 15 LineNumber, Line | Format-Table -AutoSize)",
+      "PowerShell($file = \"Gold_SOP_EA.mq5\"; $lines = Get-Content $file; Write-Output \"Total lines: $\\($lines.Count\\)\"; Write-Output \"`nKey incremental sync functions:\"; $lines | Select-String -Pattern \"GetServerLastSyncTime|CollectDealsAfterTime|GetLatestDealTime|g_ServerLastSyncTime\" | Select-Object -First 10 LineNumber, Line | Format-Table -Wrap)"
+    ]
+  }
+}

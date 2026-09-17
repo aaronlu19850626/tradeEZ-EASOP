@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>交易快速参考卡 (极限一页版)</title>
+<style>
+    @page { size: A4 portrait; margin: 5mm; }
+    * { box-sizing: border-box; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+    body { margin: 0; background: #cbd5e1; display: flex; justify-content: center; font-family: "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif; color: #0f172a; }
+    .page { width: 210mm; height: 297mm; background: #fff; margin: 2mm; padding: 8mm; box-shadow: 0 10px 25px rgba(0,0,0,0.2); display: flex; flex-direction: column; justify-content: space-between; overflow: hidden; }
+    @media print { body { background: #fff; } .page { margin: 0; padding: 6mm 8mm; box-shadow: none; width: 100%; height: 100%; page-break-after: avoid; } }
+
+    .header { display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 4px solid #0f172a; padding-bottom: 2mm; margin-bottom: 3mm; }
+    .header-left h1 { margin: 0; font-size: 24pt; font-weight: 900; letter-spacing: 1px; color: #0f172a; }
+    .header-left .subtitle { font-size: 11pt; color: #64748b; margin-top: 1px; font-weight: bold; }
+    .header-right { background: #0f172a; color: #fff; padding: 1.5mm 4mm; font-size: 12pt; font-weight: bold; border-radius: 4px; }
+
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4mm; }
+
+    .card { border: 2px solid #0f172a; border-radius: 6px; overflow: hidden; display: flex; flex-direction: column; background: #fff; margin-bottom: 3.5mm; }
+    .card-title { color: #fff; font-size: 13pt; font-weight: bold; padding: 1.5mm 3mm; margin: 0; }
+    .card-body { padding: 2mm; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 11.5pt; table-layout: auto; }
+    th, td { border: 1px solid #cbd5e1; padding: 2mm 1.5mm; text-align: center; white-space: nowrap; }
+    th { background: #f8fafc; color: #475569; font-weight: bold; }
+    tr:nth-child(even) td { background: #fcfcfc; }
+
+    .theme-blue { border-color: #1e3a8a; } .theme-blue .card-title { background: #1e3a8a; }
+    .theme-red { border-color: #dc2626; } .theme-red .card-title { background: #dc2626; }
+    .theme-green { border-color: #059669; } .theme-green .card-title { background: #059669; }
+    .theme-orange { border-color: #ea580c; } .theme-orange .card-title { background: #ea580c; }
+    .theme-purple { border-color: #6d28d9; } .theme-purple .card-title { background: #6d28d9; }
+
+    .t-strong { font-weight: bold; } .t-red { color: #dc2626; font-weight: bold; } .t-green { color: #059669; font-weight: bold; }
+    .bg-red-alert { background: #dc2626; color: #fff; font-weight: bold; } .bg-green-alert { background: #059669; color: #fff; font-weight: bold; } .bg-yellow { background: #fef08a; color: #854d0e; font-weight: bold; }
+
+    .checklist { display: flex; flex-direction: column; gap: 2mm; margin-bottom: 2mm; }
+    .check-item { display: flex; align-items: center; background: #f0fdf4; border: 1px solid #bbf7d0; padding: 2mm 3mm; border-radius: 4px; font-size: 12pt; font-weight: bold; color: #166534; white-space: nowrap; }
+    .check-box { min-width: 5mm; height: 5mm; border: 2px solid #166534; border-radius: 2px; margin-right: 2.5mm; background: #fff; }
+    .check-footer { background: #111827; color: #fff; text-align: center; padding: 2mm; font-size: 12.5pt; font-weight: bold; border-radius: 4px; white-space: nowrap; }
+    .check-footer span { color: #4ade80; } .check-footer i { color: #f87171; font-style: normal; }
+
+    .timeline { padding-left: 1mm; }
+    .time-row { display: flex; align-items: center; margin-bottom: 2.5mm; white-space: nowrap; }
+    .time-badge { background: #6d28d9; color: #fff; padding: 1mm 2mm; border-radius: 3px; font-weight: bold; font-size: 11pt; width: 15mm; text-align: center; margin-right: 3mm; flex-shrink: 0; }
+    .time-desc { font-size: 12pt; font-weight: bold; color: #334155; }
+
+    .bottom-banner { background: #0f172a; color: #fff; text-align: center; padding: 4mm; border-radius: 6px; font-size: 22pt; font-weight: 900; letter-spacing: 6px; box-shadow: inset 0 0 0 2px #fff, 0 0 0 4px #0f172a; white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<div class="page">
+    <div class="header">
+        <div class="header-left">
+            <h1>交易快速参考卡</h1>
+            <div class="subtitle">TRADING QUICK REFERENCE SOP</div>
+        </div>
+        <div class="header-right">严格执行版</div>
+    </div>
+
+    <div class="grid">
+        <div class="col">
+            <div class="card theme-blue">
+                <div class="card-title">🎯 核心参数速查</div>
+                <div class="card-body">
+                    <table>
+                        <tr><th>类型</th><th>手数</th><th>止盈</th><th>止损</th><th>上限</th></tr>
+                        <tr><td class="t-strong">剥头皮</td><td class="t-strong">0.5</td><td class="t-green">2点/$100</td><td class="t-red">2点/$100</td><td>10单/3损</td></tr>
+                        <tr><td class="t-strong">趋势单</td><td class="t-strong">0.3</td><td class="t-green">8-15点</td><td class="t-red">5点/$150</td><td>3单/2损</td></tr>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card theme-red">
+                <div class="card-title">⛔ 绝对熔断底线 (触线必停)</div>
+                <div class="card-body">
+                    <table>
+                        <tr><th>触发条件</th><th>强制动作</th></tr>
+                        <tr><td class="t-strong">连亏 2 单</td><td class="bg-yellow">离屏停 15 分钟</td></tr>
+                        <tr><td class="t-strong">剥头皮亏 $300</td><td class="t-red">停做剥头皮</td></tr>
+                        <tr><td class="t-strong">趋势单亏 $200</td><td class="t-red">停做趋势单</td></tr>
+                        <tr><td class="t-strong t-red" style="font-size:12.5pt;">总亏损达 $500</td><td class="bg-red-alert">强退软件！</td></tr>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card theme-green">
+                <div class="card-title">💰 盈利回撤保护</div>
+                <div class="card-body">
+                    <table>
+                        <tr><th>日盈利</th><th>最大回撤</th><th>执行建议</th></tr>
+                        <tr><td class="t-strong t-green">+$300</td><td class="t-strong">回撤 $150</td><td>按信号继续</td></tr>
+                        <tr><td class="t-strong t-green">+$500</td><td class="t-strong">回撤 $200</td><td class="bg-yellow">挑剔入场</td></tr>
+                        <tr><td class="t-strong t-green">+$800</td><td class="t-strong">-</td><td class="bg-red-alert" style="background:#ea580c;">准备收工</td></tr>
+                        <tr><td class="t-strong t-green">+$1000</td><td class="t-strong">-</td><td class="bg-green-alert">必须收工！</td></tr>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="col">
+            <div class="card theme-orange" style="border-width: 3px;">
+                <div class="card-title">✅ 开仓 5 问检查单</div>
+                <div class="card-body">
+                    <div class="checklist">
+                        <div class="check-item"><div class="check-box"></div>1. 策略类型极其明确？</div>
+                        <div class="check-item"><div class="check-box"></div>2. 今日该策略额度够吗？</div>
+                        <div class="check-item"><div class="check-box"></div>3. 止损位已经算好了吗？</div>
+                        <div class="check-item"><div class="check-box"></div>4. 至少满足3个共振条件？</div>
+                        <div class="check-item"><div class="check-box"></div>5. 当前处于安全时段吗？</div>
+                    </div>
+                    <div class="check-footer">全勾 <span>→ 果断开仓</span> | 有否 <i>→ 绝不开</i></div>
+                </div>
+            </div>
+
+            <div class="card theme-blue">
+                <div class="card-title">📊 趋势单移动止损法</div>
+                <div class="card-body">
+                    <table>
+                        <tr><th>当前浮盈</th><th>止损移至</th><th>锁定利润</th></tr>
+                        <tr><td>+ 3 点</td><td class="t-strong">成本价</td><td>保本无忧</td></tr>
+                        <tr><td>+ 5 点</td><td class="t-strong">+ 2 点</td><td class="t-green">锁 $60</td></tr>
+                        <tr><td>+ 8 点</td><td class="t-strong">+ 5 点</td><td class="t-green">锁 $150</td></tr>
+                        <tr><td>+ 10点上</td><td class="t-strong">+ 7 点</td><td class="t-green">锁 $210+</td></tr>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card theme-purple">
+                <div class="card-title">⏰ 时段策略与闹钟</div>
+                <div class="card-body">
+                    <div class="timeline">
+                        <div class="time-row"><div class="time-badge">20:15</div><div class="time-desc">盘前准备，定今日计划</div></div>
+                        <div class="time-row"><div class="time-badge">20:30</div><div class="time-desc">美股初段，观察分析为主</div></div>
+                        <div class="time-row"><div class="time-badge" style="background:#dc2626;">21:25</div><div class="time-desc t-red">⚠️ 波动剧烈，严禁开新仓</div></div>
+                        <div class="time-row"><div class="time-badge" style="background:#059669;">21:35</div><div class="time-desc t-green">✅ 主交易时段，果断执行</div></div>
+                        <div class="time-row"><div class="time-badge" style="background:#ea580c;">22:45</div><div class="time-desc">尾盘收尾，原则上不建新仓</div></div>
+                        <div class="time-row"><div class="time-badge" style="font-size:10pt;">23:15</div><div class="time-desc">收盘总结(冬令时顺延)</div></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="bottom-banner">执行纪律 = 长期盈利</div>
+</div>
+
+</body>
+</html>

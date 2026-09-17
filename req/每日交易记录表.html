@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>每日交易记录表</title>
+
+<style>
+    @page {
+        size: A4 portrait;
+        margin: 8mm 10mm;
+    }
+
+    :root {
+        --ink: #111827;
+        --muted: #6b7280;
+        --line: #1f2937;
+        --soft-line: #9ca3af;
+        --bg: #f3f4f6;
+        --bg-light: #f9fafb;
+        --navy: #1e3a8a;
+        --navy-light: #eff6ff;
+        --red: #991b1b;
+        --red-light: #fef2f2;
+        --green: #065f46;
+        --green-light: #ecfdf5;
+        --gold: #92400e;
+        --gold-light: #fffbeb;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+        margin: 0; padding: 0; color: var(--ink);
+        font-family: "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+        font-size: 9pt; line-height: 1.28; background: #ffffff;
+        -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }
+
+    .page { width: 100%; max-width: 190mm; margin: 0 auto; page-break-inside: avoid; }
+
+    .header {
+        display: grid; grid-template-columns: 1fr auto 1fr; align-items: end;
+        border-bottom: 2px solid var(--navy); padding-bottom: 5px; margin-bottom: 5px;
+    }
+    .header h1 {
+        grid-column: 2; margin: 0; text-align: center; font-size: 18pt;
+        letter-spacing: 2px; font-weight: 800; color: var(--navy);
+    }
+    .header .tag {
+        grid-column: 3; justify-self: end; font-size: 8pt; color: var(--muted);
+        border: 1px solid var(--soft-line); border-radius: 999px; padding: 2px 7px;
+    }
+
+    .discipline-banner {
+        border: 1.5px solid var(--red); background: var(--red-light); color: var(--red);
+        padding: 5px 8px; margin-bottom: 6px; display: flex; justify-content: space-between;
+        align-items: center; border-radius: 4px; font-weight: 800;
+    }
+    .discipline-banner .main { font-family: "KaiTi", "STKaiti", "SimSun", serif; font-size: 10.5pt; }
+    .discipline-banner .rules { font-size: 8.2pt; color: #7f1d1d; font-weight: 700; }
+
+    .top-info {
+        display: grid; grid-template-columns: 1.35fr 0.55fr 1fr 1fr 1fr; gap: 5px;
+        margin-bottom: 6px; font-size: 8.6pt; font-weight: 700; align-items: center;
+    }
+    .info-box {
+        border: 1px solid var(--line); padding: 3px 5px; min-height: 22px;
+        display: flex; align-items: center; gap: 3px; background: var(--bg-light); white-space: nowrap;
+    }
+    .info-label { white-space: nowrap; flex: 0 0 auto; }
+    .line-input {
+        display: inline-block; border-bottom: 1px solid var(--line);
+        min-width: 42px; height: 12px; margin: 0 1px; flex: 0 0 auto;
+    }
+    .line-input.xs { min-width: 16px; }
+    .line-input.sm { min-width: 24px; }
+    .line-input.md { min-width: 42px; }
+    .line-input.lg { min-width: 110px; }
+    
+    .checkbox {
+        display: inline-block; width: 10px; height: 10px; border: 1.2px solid var(--line);
+        margin-right: 3px; position: relative; top: 1px; background: #fff;
+    }
+
+    .section-title {
+        margin-top: 5px; border: 1px solid var(--line); border-left: 5px solid var(--navy);
+        background: linear-gradient(90deg, var(--navy-light), #ffffff); padding: 4px 7px;
+        min-height: 23px; display: flex; justify-content: space-between; align-items: center;
+        font-weight: 800; font-size: 9.6pt;
+    }
+    .section-title .left { display: flex; align-items: center; gap: 6px; }
+    .section-no {
+        display: inline-block; min-width: 18px; height: 18px; line-height: 17px;
+        text-align: center; border-radius: 50%; background: var(--navy); color: #ffffff; font-size: 8pt;
+    }
+    .section-title .rule { font-size: 8.2pt; color: var(--muted); font-weight: 700; }
+    .section-title .rule strong { color: var(--red); }
+
+    .pre-market { border: 1px solid var(--line); border-top: none; padding: 6px 7px; }
+    .pre-grid { display: grid; grid-template-columns: 1.8fr 0.75fr 0.9fr 0.9fr; gap: 6px; margin-bottom: 5px; }
+    .pre-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 5px; }
+    .pre-item { border-bottom: 1px dashed var(--soft-line); padding-bottom: 3px; white-space: nowrap; }
+
+    /* 改进后的判研区样式 */
+    .judge-box {
+        border: 1px solid var(--soft-line); background: var(--gold-light);
+        padding: 6px; display: flex; flex-direction: column; gap: 6px; font-size: 8.5pt;
+    }
+    .judge-top { display: flex; align-items: center; gap: 10px; }
+    .judge-top strong { color: var(--gold); white-space: nowrap; }
+    .judge-options { display: flex; gap: 12px; }
+    .judge-bottom { display: flex; align-items: flex-end; width: 100%; }
+    .judge-bottom strong { color: var(--gold); white-space: nowrap; }
+    .judge-line { flex: 1; border-bottom: 1px dashed var(--gold); height: 14px; margin-left: 5px; }
+
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    th, td { border: 1px solid var(--line); text-align: center; vertical-align: middle; padding: 1px 3px; }
+    th { background: var(--bg); font-size: 8pt; height: 20px; font-weight: 800; color: #111827; }
+    td { font-size: 8.6pt; }
+    .table-scalp td { height: 22px; }
+    .table-trend td { height: 24px; }
+    .num-cell { background: var(--bg-light); color: var(--muted); font-weight: 700; }
+    
+    .col-id { width: 5%; } .col-time { width: 10%; } .col-dir { width: 8%; }
+    .col-entry { width: 11%; } .col-sl { width: 11%; } .col-exit { width: 11%; }
+    .col-pnl { width: 12%; } .col-reason { width: 32%; }
+    .table-note { color: var(--muted); font-weight: 600; }
+
+    .review-box { border: 1px solid var(--line); border-top: none; padding: 6px 7px; }
+    .discipline-check {
+        display: grid; grid-template-columns: 1.1fr 1.1fr 0.8fr; gap: 6px;
+        border-bottom: 1px dashed var(--soft-line); padding-bottom: 5px; margin-bottom: 5px;
+    }
+    .check-card { border: 1px solid var(--soft-line); background: var(--bg-light); padding: 5px 6px; min-height: 42px; }
+    .check-card strong { display: block; margin-bottom: 2px; font-size: 8.7pt; }
+    .check-card.danger { background: var(--red-light); border-color: #fca5a5; }
+    .check-card.danger strong { color: var(--red); }
+    .check-card.good { background: var(--green-light); border-color: #86efac; }
+    .check-card.good strong { color: var(--green); }
+    .check-line { margin-top: 1px; font-size: 8.1pt; white-space: nowrap; }
+
+    .writing-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .writing-item { min-height: 84px; }
+    .writing-title { font-weight: 800; font-size: 8.8pt; margin-bottom: 3px; }
+    .writing-title.good { color: var(--green); }
+    .writing-title.bad { color: var(--red); }
+    .writing-line { border-bottom: 1px dashed #777; height: 18px; width: 100%; }
+
+    .footer { margin-top: 5px; display: flex; justify-content: space-between; align-items: center; font-size: 8.2pt; color: var(--muted); }
+    .footer .motto { color: var(--navy); font-weight: 800; font-family: "KaiTi", "STKaiti", "SimSun", serif; font-size: 9.8pt; }
+</style>
+</head>
+
+<body>
+<div class="page">
+    <div class="header">
+        <h1>黄金每日交易记录与复盘表</h1>
+        <div class="tag">A4 单页 · 纪律记录版</div>
+    </div>
+
+    <div class="discipline-banner">
+        <div class="main">纪律优先：先控制风险，再追求盈利</div>
+        <div class="rules">碰止损即走｜不扛单｜不摊平｜不情绪化交易｜看不懂就空仓</div>
+    </div>
+
+    <div class="top-info">
+        <div class="info-box"><span class="info-label">日期：</span><span>202<span class="line-input xs"></span>年<span class="line-input xs"></span>月<span class="line-input xs"></span>日</span></div>
+        <div class="info-box"><span class="info-label">星期：</span><span class="line-input sm"></span></div>
+        <div class="info-box"><span class="info-label">初始净值：</span><span>$<span class="line-input md"></span></span></div>
+        <div class="info-box"><span class="info-label">最终净值：</span><span>$<span class="line-input md"></span></span></div>
+        <div class="info-box"><span class="info-label">今日盈亏：</span><span>$<span class="line-input md"></span></span></div>
+    </div>
+
+    <div class="section-title">
+        <div class="left"><span class="section-no">1</span><span>盘前准备</span></div>
+        <div class="rule">夏令时 20:15~23:15 (冬令时顺延)｜先定计划，再做交易</div>
+    </div>
+
+    <div class="pre-market">
+        <div class="pre-grid">
+            <div class="pre-item"><strong>重要数据/事件：</strong><span class="line-input lg"></span></div>
+            <div class="pre-item"><strong>数据时间：</strong><span class="line-input md"></span></div>
+            <div class="pre-item"><strong>今日最大风险：</strong><span class="line-input md"></span></div>
+            <div class="pre-item"><strong>允许最大亏损：</strong>$<span class="line-input md"></span></div>
+        </div>
+        <div class="pre-row">
+            <div class="pre-item"><strong>亚欧盘高点：</strong><span class="line-input md"></span></div>
+            <div class="pre-item"><strong>亚欧盘低点：</strong><span class="line-input md"></span></div>
+            <div class="pre-item"><strong>关键阻力：</strong><span class="line-input md"></span></div>
+            <div class="pre-item"><strong>关键支撑：</strong><span class="line-input md"></span></div>
+        </div>
+        <div class="judge-box">
+            <div class="judge-top">
+                <strong>20:15 后方向研判：</strong>
+                <div class="judge-options">
+                    <span><span class="checkbox"></span>趋势突破，主做趋势单</span>
+                    <span><span class="checkbox"></span>区间震荡，主做剥头皮</span>
+                    <span><span class="checkbox"></span>走势胶着，降低频率或观望</span>
+                </div>
+            </div>
+            <div class="judge-bottom">
+                <strong>研判描述：</strong>
+                <div class="judge-line"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="section-title">
+        <div class="left"><span class="section-no">2</span><span>剥头皮操作区</span></div>
+        <div class="rule">固定 <strong>0.5 手</strong>｜止损 <strong>2 点</strong>｜目标 <strong>2 点</strong>｜只做清晰位置</div>
+    </div>
+    <table class="table-scalp">
+        <thead>
+            <tr>
+                <th class="col-id">序号</th><th class="col-time">开仓<br>时间</th><th class="col-dir">方向<br>多/空</th>
+                <th class="col-entry">入场<br>价位</th><th class="col-sl">止损<br>价位</th><th class="col-exit">平仓<br>价位</th>
+                <th class="col-pnl">盈亏<br>点/$</th><th class="col-reason">核心开仓理由 <span class="table-note">整数关口/极值/短线失衡</span></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td class="num-cell">1</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num-cell">2</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num-cell">3</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num-cell">4</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num-cell">5</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num-cell">6</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num-cell">7</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num-cell">8</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num-cell">9</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num-cell">10</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+        </tbody>
+    </table>
+
+    <div class="section-title">
+        <div class="left"><span class="section-no">3</span><span>趋势单操作区</span></div>
+        <div class="rule">固定 <strong>0.3 手</strong>｜止损 <strong>5 点</strong>｜目标 <strong>8-15 点</strong>｜顺势持仓</div>
+    </div>
+    <table class="table-trend">
+        <thead>
+            <tr>
+                <th class="col-id">序号</th><th class="col-time">开仓<br>时间</th><th class="col-dir">方向<br>多/空</th>
+                <th class="col-entry">入场<br>价位</th><th class="col-sl">止损<br>价位</th><th class="col-exit">平仓<br>价位</th>
+                <th class="col-pnl">盈亏<br>点/$</th><th class="col-reason">核心开仓理由 <span class="table-note">突破回踩/数据顺势/趋势延续</span></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td class="num-cell">1</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num-cell">2</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num-cell">3</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+        </tbody>
+    </table>
+
+    <div class="section-title">
+        <div class="left"><span class="section-no">4</span><span>收盘纪律检查与总结</span></div>
+        <div class="rule">23:15 后完成｜重点复盘纪律，而不是只看盈亏</div>
+    </div>
+    <div class="review-box">
+        <div class="discipline-check">
+            <div class="check-card danger">
+                <strong>1. 止损纪律</strong>
+                <div class="check-line"><span class="checkbox"></span>严格遵守：未扛单，碰线即走</div>
+                <div class="check-line"><span class="checkbox"></span>违反纪律：扛单 / 扩大止损 / 侥幸</div>
+            </div>
+            <div class="check-card good">
+                <strong>2. 策略匹配</strong>
+                <div class="check-line"><span class="checkbox"></span>匹配：震荡剥头皮，趋势拿得住</div>
+                <div class="check-line"><span class="checkbox"></span>错配：震荡做趋势 / 趋势频繁剥</div>
+            </div>
+            <div class="check-card">
+                <strong>3. 情绪状态</strong>
+                <div class="check-line">心态评分：<span class="line-input sm"></span> / 10</div>
+                <div class="check-line">失控原因：<span class="line-input md"></span></div>
+            </div>
+        </div>
+        <div class="writing-grid">
+            <div class="writing-item">
+                <div class="writing-title good">今日做对了什么？需要继续保持：</div>
+                <div class="writing-line"></div>
+                <div class="writing-line"></div>
+                <div class="writing-line"></div>
+                <div class="writing-line"></div>
+            </div>
+            <div class="writing-item">
+                <div class="writing-title bad">今日做错了什么？明天如何避免：</div>
+                <div class="writing-line"></div>
+                <div class="writing-line"></div>
+                <div class="writing-line"></div>
+                <div class="writing-line"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="footer">
+        <div class="motto">“稳定盈利的核心不是预测，而是纪律、风控和重复执行。”</div>
+        <div class="print-tip">建议：A4｜纵向｜100%｜开启背景图形</div>
+    </div>
+</div>
+</body>
+</html>
