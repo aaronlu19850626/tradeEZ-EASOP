@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  最后修改时间：2026-09-18 00:55（北京时间）       |
+//|                  最后修改时间：2026-09-19 00:05（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -10,6 +10,21 @@
 #property description "TradeEZ-SOP 分控 EA - 手数识别 / 分策略移动止损 / 分控熔断 / 利润护城河 / 彭博终端级面板"
 
 #include <Trade/Trade.mqh>
+#resource "website-design\\logo\\ea-logo.bmp"
+
+// Windows x64：使用系统默认浏览器打开固定官网地址。
+#import "shell32.dll"
+long ShellExecuteW(long hwnd, string operation, string file, string parameters, string directory, int showCmd);
+#import
+#import "user32.dll"
+long LoadCursorW(long instance, long cursorId);
+long SetCursor(long cursor);
+uint GetWindowThreadProcessId(long hwnd, uint &processId);
+int AttachThreadInput(uint fromThread, uint toThread, int attach);
+#import
+#import "kernel32.dll"
+uint GetCurrentThreadId();
+#import
 
 //+------------------------------------------------------------------+
 //|                      彭博终端级暗黑配色规范                        |
@@ -35,8 +50,8 @@
 #define COLOR_BTN_SYS_BORDER    C'58,68,85'
 #define COLOR_BTN_DISABLED_BG   C'26,30,38'
 #define COLOR_BTN_DISABLED_TXT  C'80,90,104'
-#define COLOR_INPUT_BG          C'29,34,44'       // 输入框底色:与系统按钮一致的深蓝灰
-#define COLOR_INPUT_BORDER      C'176,186,201'    // 输入框边框:清晰的灰白色,呼应面板正文
+#define COLOR_INPUT_BG          COLOR_BTN_SYS_BG       // 与 LANG 按钮共用底色
+#define COLOR_INPUT_BORDER      COLOR_BTN_SYS_BORDER   // 与 LANG 按钮共用边框
 #define COLOR_GOLD              C'212,175,55'     // 金色外边框
 
 #define PANEL_FONT              "Segoe UI"
@@ -168,16 +183,6 @@ input double   Inp_ProfitProtect2_Amount  = 500.0;  // 第2档最多回撤$
 input double   Inp_ProfitLiquidation      = 1000.0; // 清盘触发($)
 input double   Inp_ProfitShutdown         = 2000.0; // 强制停止($)
 
-input group "===== 数据同步 Data Sync ====="
-input bool   Inp_EnableSync        = false;                        // 启用订单同步
-input string Inp_ApiBaseURL        = "https://api.tradeez.cn"; // API基础地址
-input string Inp_SecretKey         = "";                           // 账户密钥(从服务器获取)
-input int    Inp_SyncIntervalMin   = 5;                            // 常规同步频率(分钟)
-input int    Inp_AlignIntervalHours= 6;                            // 哈希校准频率(小时)
-input int    Inp_RequestTimeoutMS  = 10000;                        // HTTP请求超时(毫秒)
-input int    Inp_MaxBatchSize      = 100;                          // 单批次最大订单数
-input bool   Inp_DebugSync         = true;                         // 调试模式(逐步输出专家日志)
-
 //+------------------------------------------------------------------+
 //| 枚举                                                              |
 //+------------------------------------------------------------------+
@@ -193,18 +198,10 @@ enum ENUM_SOP_ORDER
 //+------------------------------------------------------------------+
 CTrade         g_trade;
 
-// 全局变量 - 数据同步状态
-int      g_SyncTimerCounter = 0;        // 同步定时器计数器(秒)
-int      g_AlignTimerCounter = 0;       // 校准定时器计数器(秒)
-datetime g_LastSyncTime = 0;            // 上次同步时间戳
-datetime g_LastAlignTime = 0;           // 上次校准时间戳
-bool     g_SyncInProgress = false;      // 同步进行中标志
-
 bool           g_Language_ZH  = true;   // 语言
 bool           g_ShowDetails  = false;  // 明细舱开关
 bool           g_ShowStats    = false;  // 日统计舱开关
 bool           g_ShowChangelog = false; // 更新日志舱开关
-string         g_ChangelogVer  = "v1.03"; // 当前选中的版本号
 bool           g_Collapsed    = false;  // 面板折叠
 ENUM_SOP_ORDER g_DetailSide   = SOP_SCALP; // 明细舱当前展示策略
 bool           g_DetailAll    = false;  // 明细舱"全部"模式:显示今日所有平仓单(含手动),忽略 g_DetailSide
@@ -1680,23 +1677,75 @@ bool ValidateOpenConditions(ENUM_SOP_ORDER kind)
 //+------------------------------------------------------------------+
 //| 一键平仓:平掉本品种所有持仓 + 删除本品种所有挂单                   |
 //+------------------------------------------------------------------+
+// 异步提交一组平仓请求。MT5 没有“单请求平多个持仓”的协议，
+// OrderSendAsync 可把全部请求连续交给交易服务器，不逐单等待服务器响应。
+int ClosePositionsAsync(const ulong &tickets[])
+{
+    int submitted = 0;
+    for(int i = 0; i < ArraySize(tickets); i++)
+    {
+        ulong ticket = tickets[i];
+        if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+
+        string symbol = PositionGetString(POSITION_SYMBOL);
+        ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+        MqlTradeRequest request = {};
+        MqlTradeResult  result  = {};
+        request.action       = TRADE_ACTION_DEAL;
+        request.position     = ticket;
+        request.symbol       = symbol;
+        request.volume       = PositionGetDouble(POSITION_VOLUME);
+        request.magic        = (ulong)PositionGetInteger(POSITION_MAGIC);
+        request.deviation    = (ulong)Inp_Slippage;
+        request.type         = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+        request.price        = SymbolInfoDouble(symbol, request.type == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID);
+        long fillingMode = SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+        if((fillingMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+            request.type_filling = ORDER_FILLING_FOK;
+        else if((fillingMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+            request.type_filling = ORDER_FILLING_IOC;
+        else
+            request.type_filling = ORDER_FILLING_RETURN;
+        request.comment      = "TradeEZ batch close";
+
+        if(OrderSendAsync(request, result)) submitted++;
+        else PrintFormat("[批量平仓] 异步提交失败 ticket=%I64u error=%d", ticket, GetLastError());
+    }
+    return submitted;
+}
+
+bool DeleteOrderAsync(ulong ticket)
+{
+    MqlTradeRequest request = {};
+    MqlTradeResult  result  = {};
+    request.action = TRADE_ACTION_REMOVE;
+    request.order  = ticket;
+    if(OrderSendAsync(request, result)) return true;
+    PrintFormat("[批量撤单] 异步提交失败 ticket=%I64u error=%d", ticket, GetLastError());
+    return false;
+}
+
 void CloseAllOrders()
 {
-    // 平所有持仓
+    ulong tickets[];
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
         ulong tk = PositionGetTicket(i);
         if(tk == 0) continue;
         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-        g_trade.PositionClose(tk);
+        int n = ArraySize(tickets);
+        ArrayResize(tickets, n + 1);
+        tickets[n] = tk;
     }
-    // 删所有挂单
+    ClosePositionsAsync(tickets);
+
     for(int i = OrdersTotal() - 1; i >= 0; i--)
     {
         ulong tk = OrderGetTicket(i);
         if(tk == 0) continue;
         if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
-        g_trade.OrderDelete(tk);
+        DeleteOrderAsync(tk);
     }
 }
 
@@ -1728,27 +1777,36 @@ void EnforceMoatLiquidation()
 // 平掉指定策略的所有持仓(剥头皮/趋势)
 void CloseByKind(ENUM_SOP_ORDER kind)
 {
+    ulong tickets[];
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
         ulong tk = PositionGetTicket(i);
         if(tk == 0) continue;
         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
         if(PosType() != kind) continue;
-        g_trade.PositionClose(tk);
+        int n = ArraySize(tickets);
+        ArrayResize(tickets, n + 1);
+        tickets[n] = tk;
     }
+    ClosePositionsAsync(tickets);
 }
 
 // 只平当前浮盈>0 的持仓(锁定利润单)
 void CloseProfitable()
 {
+    ulong tickets[];
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
         ulong tk = PositionGetTicket(i);
         if(tk == 0) continue;
         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
         double pl = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
-        if(pl > 0.0) g_trade.PositionClose(tk);
+        if(pl <= 0.0) continue;
+        int n = ArraySize(tickets);
+        ArrayResize(tickets, n + 1);
+        tickets[n] = tk;
     }
+    ClosePositionsAsync(tickets);
 }
 
 //+------------------------------------------------------------------+
@@ -1895,7 +1953,7 @@ double ReadEditPrice(string editName, string fallbackTxt)
 void CreatePanel(string name, int x, int y, int w, int h, color bg_color, color border_color)
 {
     string objName = Prefix + name;
-    ObjectCreate(0, objName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    EnsureUIObject(0, objName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
     ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, x);
     ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, y);
     ObjectSetInteger(0, objName, OBJPROP_XSIZE, w);
@@ -1911,7 +1969,7 @@ void CreatePanel(string name, int x, int y, int w, int h, color bg_color, color 
 void ColorBar(string name, int x, int y, int w, int h, color c, int z)
 {
     string objName = Prefix + name;
-    ObjectCreate(0, objName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    EnsureUIObject(0, objName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
     ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, x);
     ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, y);
     ObjectSetInteger(0, objName, OBJPROP_XSIZE, w);
@@ -1943,7 +2001,7 @@ void CreateCard(string name, int x, int y, int w, int h, color accent_color)
     string bgName  = Prefix + name + "_Bg";
     string barName = Prefix + name + "_Bar";
 
-    ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    EnsureUIObject(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
     ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, x);
     ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, y);
     ObjectSetInteger(0, bgName, OBJPROP_XSIZE, w);
@@ -1954,7 +2012,7 @@ void CreateCard(string name, int x, int y, int w, int h, color accent_color)
     ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
     ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE, false);
 
-    ObjectCreate(0, barName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    EnsureUIObject(0, barName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
     ObjectSetInteger(0, barName, OBJPROP_XDISTANCE, x + 2);
     ObjectSetInteger(0, barName, OBJPROP_YDISTANCE, y + 2);
     ObjectSetInteger(0, barName, OBJPROP_XSIZE, 3);
@@ -1969,7 +2027,7 @@ void CreateCard(string name, int x, int y, int w, int h, color accent_color)
 void CreateLabel(string name, int x, int y, string text, color clr, double fontSize = 9, bool isBold = false)
 {
     string objName = Prefix + name;
-    ObjectCreate(0, objName, OBJ_LABEL, 0, 0, 0);
+    EnsureUIObject(0, objName, OBJ_LABEL, 0, 0, 0);
     ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, x);
     ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, y);
     ObjectSetString(0, objName, OBJPROP_TEXT, text);
@@ -1984,7 +2042,7 @@ void CreateLabel(string name, int x, int y, string text, color clr, double fontS
 void CreateLabelMid(string name, int x, int y, string text, color clr, double fontSize = 9, bool isBold = false)
 {
     string objName = Prefix + name;
-    ObjectCreate(0, objName, OBJ_LABEL, 0, 0, 0);
+    EnsureUIObject(0, objName, OBJ_LABEL, 0, 0, 0);
     ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, x);
     ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, y);
     ObjectSetString(0, objName, OBJPROP_TEXT, text);
@@ -2000,7 +2058,7 @@ void CreateLabelMid(string name, int x, int y, string text, color clr, double fo
 void CreateLabelAnchor(string name, int x, int y, string text, color clr, double fontSize, bool isBold, int anchor)
 {
     string objName = Prefix + name;
-    ObjectCreate(0, objName, OBJ_LABEL, 0, 0, 0);
+    EnsureUIObject(0, objName, OBJ_LABEL, 0, 0, 0);
     ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, x);
     ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, y);
     ObjectSetString(0, objName, OBJPROP_TEXT, text);
@@ -2016,7 +2074,7 @@ void CreateLabelAnchor(string name, int x, int y, string text, color clr, double
 void CreateLabelRightAt(string name, int rightX, int y, string text, color clr, double fontSize = 9, bool isBold = false)
 {
     string objName = Prefix + name;
-    ObjectCreate(0, objName, OBJ_LABEL, 0, 0, 0);
+    EnsureUIObject(0, objName, OBJ_LABEL, 0, 0, 0);
     ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, rightX);
     ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, y);
     ObjectSetString(0, objName, OBJPROP_TEXT, text);
@@ -2037,8 +2095,29 @@ void CreateRowLR(string name, int cardX, int y, string leftText, string rightTex
 
 void CreateButton(string name, int x, int y, int w, int h, string text, color bg_color, color border_color, color text_clr, double fontSize = 9, bool isBold = false)
 {
+    // 系统与持仓管理按钮统一采用语言按钮样式，完整/缩小布局共用。
+    bool closeAction = name == "Btn_Close_All" || name == "Btn_Close_Scalp" ||
+                       name == "Btn_Close_Trend" || name == "Btn_Close_Profit";
+    bool systemAction = closeAction || name == "Btn_Stat_Open" ||
+                        name == "Btn_Reset_All" || name == "Btn_Sc_QuickBE" ||
+                        name == "Btn_Sc_ClearTP";
+    if(systemAction && text_clr != COLOR_BTN_DISABLED_TXT)
+    {
+        bg_color = COLOR_BTN_SYS_BG;
+        border_color = COLOR_BTN_SYS_BORDER;
+        text_clr = COLOR_TEXT_HEADER;
+    }
+    bool importantAction = name == "Btn_Reset_All" ||
+                           name == "Btn_Close_Profit";
+    if(importantAction && text_clr != COLOR_BTN_DISABLED_TXT)
+    {
+        bg_color = COLOR_BTN_SYS_BG;
+        border_color = COLOR_SIGNAL_WARNING;
+        text_clr = COLOR_SIGNAL_WARNING;
+    }
+    if(closeAction) h = Scale(30); // 与市价做空/做多按钮等高
     string objName = Prefix + name;
-    ObjectCreate(0, objName, OBJ_BUTTON, 0, 0, 0);
+    EnsureUIObject(0, objName, OBJ_BUTTON, 0, 0, 0);
     ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, x);
     ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, y);
     ObjectSetInteger(0, objName, OBJPROP_XSIZE, w);
@@ -2055,13 +2134,87 @@ void CreateButton(string name, int x, int y, int w, int h, string text, color bg
 }
 
 // 删除本EA所有对象。输入框内容已先缓存,随后按“卡片→输入槽边框→输入框”顺序完整重建。
-void DeleteUIKeepEdits()
+bool g_UIRenderPass = false;
+string g_UITouched[];
+
+// 常规刷新复用现有图表对象，避免销毁悬停目标导致系统光标回退。
+bool EnsureUIObject(long chart, string name, ENUM_OBJECT type, int subwindow, datetime time, double price)
 {
+    if(g_UIRenderPass)
+    {
+        int n = ArraySize(g_UITouched);
+        ArrayResize(g_UITouched, n + 1);
+        g_UITouched[n] = name;
+    }
+    if(ObjectFind(chart, name) >= 0) return true;
+    return ObjectCreate(chart, name, type, subwindow, time, price);
+}
+
+// 内嵌现有品牌素材；仅首次/缩放变化时重采样，常规刷新复用位图。
+void RenderBrandLogo(int x, int y, int size)
+{
+    static int cachedSize = 0;
+    string resource = "TradeEZHeaderLogo";
+    if(cachedSize != size)
+    {
+        uint source[], width, height;
+        if(!ResourceReadImage("::website-design\\logo\\ea-logo.bmp", source, width, height)) return;
+        uint pixels[];
+        ArrayResize(pixels, size * size);
+        for(int dy = 0; dy < size; dy++)
+        for(int dx = 0; dx < size; dx++)
+        {
+            int x0 = dx * (int)width / size;
+            int x1 = MathMax(x0 + 1, (dx + 1) * (int)width / size);
+            int y0 = dy * (int)height / size;
+            int y1 = MathMax(y0 + 1, (dy + 1) * (int)height / size);
+            uint r = 0, g = 0, b = 0, count = 0;
+            for(int sy = y0; sy < y1; sy++)
+            for(int sx = x0; sx < x1; sx++)
+            {
+                uint pixel = source[sy * (int)width + sx];
+                r += (pixel >> 16) & 255;
+                g += (pixel >> 8) & 255;
+                b += pixel & 255;
+                count++;
+            }
+            pixels[dy * size + dx] = 0xFF000000 | ((r/count) << 16) | ((g/count) << 8) | (b/count);
+        }
+        if(!ResourceCreate(resource, pixels, size, size, 0, 0, size, COLOR_FORMAT_ARGB_NORMALIZE)) return;
+        cachedSize = size;
+    }
+    string name = Prefix + "BrandLogo";
+    EnsureUIObject(0, name, OBJ_BITMAP_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+    ObjectSetString(0, name, OBJPROP_BMPFILE, 0, "::" + resource);
+    ObjectSetString(0, name, OBJPROP_BMPFILE, 1, "::" + resource);
+    ObjectSetInteger(0, name, OBJPROP_XSIZE, size);
+    ObjectSetInteger(0, name, OBJPROP_YSIZE, size);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+    ObjectSetString(0, name, OBJPROP_TOOLTIP, Lang("查看更新日志", "View release notes"));
+}
+
+void BeginUIRefresh()
+{
+    ArrayResize(g_UITouched, 0);
+    g_UIRenderPass = true;
+}
+
+void EndUIRefresh()
+{
+    g_UIRenderPass = false;
     for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
     {
         string nm = ObjectName(0, i);
         if(StringFind(nm, Prefix) != 0) continue;
-        ObjectDelete(0, nm);
+        bool used = false;
+        for(int j = 0; j < ArraySize(g_UITouched); j++)
+        {
+            if(g_UITouched[j] == nm) { used = true; break; }
+        }
+        if(!used) ObjectDelete(0, nm);
     }
 }
 
@@ -2072,10 +2225,10 @@ void GetQuoteBarGeometry(int &x, int &y, int &h, int &halfW, int &rightX, int &m
 {
     x = Col1X;
     y = StartY + Scale(16) + Scale(36);  // 与 RenderPerfectUI 的顶栏高度保持同步
-    h = Scale(52);
+    h = Scale(44);
 
-    int fullW  = Col2X + CardW - x;
-    int gapMid = Scale(30);
+    int fullW  = g_Collapsed ? CardW : Col2X + CardW - x;
+    int gapMid = Scale(40); // 一体报价条中央的点差数值区
     halfW  = (fullW - gapMid) / 2;
     rightX = x + halfW + gapMid;
     midY   = y + h / 2;
@@ -2098,8 +2251,9 @@ void GetSplitPriceGeometry(int leftX, int blockW, int midY, int intLen, int decL
     else          startX = leftX + edgePad;
 
     decX = startX + intPx + gap;
-    intY = midY + intOffY;
-    decY = midY;
+    // 字体框中线与可见数字中线有偏差，整体上移3px补偿，保留大小字基线关系。
+    intY = midY + intOffY - Scale(3);
+    decY = midY - Scale(3);
 }
 
 // 画一个价格:整数常规 + 末两位放大,垂直居中(midY 为中线)。
@@ -2119,21 +2273,81 @@ void DrawSplitPrice(string name, int leftX, int blockW, int midY, double price, 
     CreateLabelAnchor(name + "_Dec", decX,   decY, decPart, txtColor, 26, true, ANCHOR_LEFT);
 }
 
+// 左右两侧各缓存红/蓝渐变；仅外侧圆角，中间平直衔接点差区。
+void RenderQuoteBackground(string tag, int x, int y, int w, int h, bool rising)
+{
+    static int cachedW = 0, cachedH = 0;
+    if(cachedW != w || cachedH != h)
+    {
+        uint pixels[];
+        ArrayResize(pixels, w*h);
+        double radius = MathMin(Scale(4), MathMin(w, h)/2.0);
+        for(int variant = 0; variant < 4; variant++)
+        {
+            int theme = variant % 2;
+            bool leftSide = variant < 2;
+            for(int row = 0; row < h; row++)
+            {
+                double t = (double)row / MathMax(1, h-1);
+                int r = theme == 0 ? (int)(65*(1-t)) : (int)(255-65*t);
+                int g = theme == 0 ? (int)(65*(1-t)) : (int)(65*(1-t));
+                int b = theme == 0 ? (int)(255-75*t) : (int)(65*(1-t));
+                uint argb = 0xFF000000 | ((uint)r << 16) | ((uint)g << 8) | (uint)b;
+                for(int col = 0; col < w; col++)
+                {
+                    // 4px 轻圆角，边缘一像素抗锯齿；仅生成缓存时计算。
+                    double px = col + 0.5, py = row + 0.5;
+                    double dx = MathMax(leftSide ? radius-px : px-(w-radius), 0.0);
+                    double dy = MathMax(MathMax(radius-py, py-(h-radius)), 0.0);
+                    double coverage = MathMax(0.0, MathMin(1.0, radius + 0.5 - MathSqrt(dx*dx + dy*dy)));
+                    uint alpha = (uint)MathRound(255.0 * coverage);
+                    pixels[row*w+col] = (alpha << 24) | (argb & 0x00FFFFFF);
+                }
+            }
+            string resourceName = (leftSide ? "QuoteLeft" : "QuoteRight") + (theme == 0 ? "Blue" : "Red");
+            if(!ResourceCreate(resourceName,
+                               pixels, w, h, 0, 0, w, COLOR_FORMAT_ARGB_NORMALIZE))
+                return;
+        }
+        cachedW = w;
+        cachedH = h;
+    }
+    string name = Prefix + tag;
+    EnsureUIObject(0, name, OBJ_BITMAP_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, name, OBJPROP_XSIZE, w);
+    ObjectSetInteger(0, name, OBJPROP_YSIZE, h);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+    string resource = (tag == "PxSell_Bg" ? "::QuoteLeft" : "::QuoteRight") + (rising ? "Blue" : "Red");
+    ObjectSetString(0, name, OBJPROP_BMPFILE, 0, resource);
+    ObjectSetString(0, name, OBJPROP_BMPFILE, 1, resource);
+}
+
 void RenderQuoteBar(double bid, double ask)
 {
     int x, y, h, halfW, rightX, cy;
     GetQuoteBarGeometry(x, y, h, halfW, rightX, cy);
 
-    CreatePanel("PxSell_Bg", x,      y, halfW, h, COLOR_BTN_SYS_BG, COLOR_BTN_SYS_BG);
-    CreatePanel("PxBuy_Bg",  rightX, y, halfW, h, COLOR_BTN_SYS_BG, COLOR_BTN_SYS_BG);
+    RenderQuoteBackground("PxSell_Bg", x, y, halfW, h, g_BidDir > 0);
+    RenderQuoteBackground("PxBuy_Bg", rightX, y, halfW, h, g_AskDir > 0);
+
+    // 同高深色中段连接左右报价，无空隙；淡色边界区分报价与点差。
+    int middleX = x + halfW;
+    int middleW = rightX - middleX;
+    CreatePanel("PxSpread_Bg", middleX, y, middleW, h, COLOR_BTN_SYS_BG, COLOR_BTN_SYS_BG);
+    CreatePanel("PxSpread_EdgeL", middleX, y, Scale(1), h, COLOR_BTN_SYS_BORDER, COLOR_BTN_SYS_BORDER);
+    CreatePanel("PxSpread_EdgeR", rightX - Scale(1), y, Scale(1), h, COLOR_BTN_SYS_BORDER, COLOR_BTN_SYS_BORDER);
 
     DrawSplitPrice("PxSell", x,      halfW, cy, bid, C'255,255,255', -1);
     DrawSplitPrice("PxBuy",  rightX, halfW, cy, ask, C'255,255,255', +1);
 
     double spread = (ask - bid) / _Point;
     int cx = (x + halfW + rightX) / 2;
-    CreateLabelAnchor("PxSpread_Lbl", cx, cy - Scale(11), Lang("点差", "SPRD"), COLOR_TEXT_MUTED, 7.5, true, ANCHOR_CENTER);
-    CreateLabelAnchor("PxSpread",     cx, cy + Scale(9),  DoubleToString(spread, 0), COLOR_TEXT_HEADER, 13, true, ANCHOR_CENTER);
+    CreateLabelAnchor("PxSpread", cx, cy, DoubleToString(spread, 0), COLOR_TEXT_HEADER, 11, true, ANCHOR_CENTER);
+    ObjectSetString(0, Prefix + "PxSpread", OBJPROP_TOOLTIP,
+                    Lang("买卖价差（报价点）", "Bid/ask spread (points)"));
 }
 
 //+------------------------------------------------------------------+
@@ -2162,6 +2376,11 @@ void UpdateQuoteBar()
 {
     double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    // 仅在报价事件中比较；每秒 UI 重绘不得将同一笔报价再次判为持平。
+    g_BidDir = (g_PrevBid > 0 && bid > g_PrevBid) ? 1 : -1;
+    g_AskDir = (g_PrevAsk > 0 && ask > g_PrevAsk) ? 1 : -1;
+    g_PrevBid = bid;
+    g_PrevAsk = ask;
 
     string bidStr = DoubleToString(bid, _Digits);
     string askStr = DoubleToString(ask, _Digits);
@@ -2172,6 +2391,8 @@ void UpdateQuoteBar()
 
     int x, y, h, halfW, rightX, cy;
     GetQuoteBarGeometry(x, y, h, halfW, rightX, cy);
+    RenderQuoteBackground("PxSell_Bg", x, y, halfW, h, g_BidDir > 0);
+    RenderQuoteBackground("PxBuy_Bg", rightX, y, halfW, h, g_AskDir > 0);
 
     int startX, decX, intY, decY;
     GetSplitPriceGeometry(x, halfW, cy, StringLen(bidInt), StringLen(bidDec), -1,
@@ -2250,7 +2471,7 @@ void RenderHistoryCabin()
 
     // 左侧科技指示线
     string barName = Prefix + "Cab_Bar";
-    ObjectCreate(0, barName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    EnsureUIObject(0, barName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
     ObjectSetInteger(0, barName, OBJPROP_XDISTANCE, cabX + 2);
     ObjectSetInteger(0, barName, OBJPROP_YDISTANCE, cabY + 2);
     ObjectSetInteger(0, barName, OBJPROP_XSIZE, 4);
@@ -2275,7 +2496,7 @@ void RenderHistoryCabin()
     CreateLabel("H_Pnl",  cabX + 435, rowY, Lang("盈/亏金额", "PNL"), COLOR_TEXT_MUTED, 8);
 
     string sepName = Prefix + "Cab_Sep";
-    ObjectCreate(0, sepName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    EnsureUIObject(0, sepName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
     ObjectSetInteger(0, sepName, OBJPROP_XDISTANCE, cabX + 15);
     ObjectSetInteger(0, sepName, OBJPROP_YDISTANCE, rowY + 16);
     ObjectSetInteger(0, sepName, OBJPROP_XSIZE, cabW - 30);
@@ -2395,19 +2616,12 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
         color qbTx = allowed ? COLOR_SIGNAL_WARNING   : COLOR_BTN_DISABLED_TXT;
         color qbBd = allowed ? COLOR_SIGNAL_WARNING   : COLOR_BTN_DISABLED_BG;
         CreateButton("Btn_Sc_QuickBE",       leftX + 2*(bw+marketGap),  contentY, bw, marketH, Lang("改趋势", "TREND"), qbBg, qbBd, qbTx, 9, true);
-        // 撤止盈按钮:始终保持白色字体和淡灰边框,背景仍区分是否可用
-        bool hasTracking = false;
-        for(int i = 0; i < ArraySize(g_ScalpTrackTicket); i++)
-        {
-            if(PositionSelectByTicket(g_ScalpTrackTicket[i]))
-            {
-                hasTracking = true;
-                break;
-            }
-        }
-        color tpBg = (allowed && hasTracking) ? COLOR_BTN_SYS_BG : COLOR_BTN_DISABLED_BG;
-        color tpTx = C'255,255,255';  // 纯白字体
-        color tpBd = C'176,186,201';  // 淡灰边框
+        // 撤止盈按钮样式只跟随策略运行状态；是否存在可撤止盈持仓由点击逻辑检查。
+        // 这样重置解除熔断后会立即恢复正常样式。
+        bool tpEnabled = allowed;
+        color tpBg = tpEnabled ? COLOR_BTN_SYS_BG     : COLOR_BTN_DISABLED_BG;
+        color tpTx = tpEnabled ? C'255,255,255'       : COLOR_BTN_DISABLED_TXT;
+        color tpBd = tpEnabled ? C'176,186,201'       : COLOR_BTN_DISABLED_BG;
         CreateButton("Btn_Sc_ClearTP",       leftX + 3*(bw+marketGap),  contentY, bw, marketH, Lang("撤止盈", "RM TP"), tpBg, tpBd, tpTx, 9, true);
     }
     else
@@ -2419,6 +2633,8 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
         CreateButton("Btn_" + tag + "_Sell", leftX,  contentY, bw, marketH, Lang(title + " 做空", "TREND SELL"), sellBg, sellBd, sellTx, 9, true);
         CreateButton("Btn_" + tag + "_Buy",  rightX, contentY, bw, marketH, Lang(title + " 做多", "TREND BUY"),  buyBg,  buyBd,  buyTx,  9, true);
     }
+    if(!g_Collapsed)
+    {
     contentY += Scale(38);
 
     // 限价挂单行：标签 + 银灰白输入槽 + 两个限价按钮
@@ -2444,7 +2660,7 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     // 灰白描边 + 内嵌编辑框的"数值输入槽"风格
     // 外层绘制灰白细边,内层编辑框显式设置同色背景,避免默认黑底白框
     string bgName = Prefix + "Edt_" + tag + "_PriceBg";
-    ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    EnsureUIObject(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
     ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, editX);
     ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, contentY);
     ObjectSetInteger(0, bgName, OBJPROP_XSIZE, editW);
@@ -2459,7 +2675,7 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     ObjectSetInteger(0, bgName, OBJPROP_ZORDER, 99);
 
     // 编辑控件内缩一像素,内边框与底色一致,仅保留外层细描边
-    ObjectCreate(0, editName, OBJ_EDIT, 0, 0, 0);
+    EnsureUIObject(0, editName, OBJ_EDIT, 0, 0, 0);
     ObjectSetInteger(0, editName, OBJPROP_XDISTANCE, editX + Scale(1));
     ObjectSetInteger(0, editName, OBJPROP_YDISTANCE, contentY + Scale(1));
     ObjectSetInteger(0, editName, OBJPROP_XSIZE, editW - 2 * Scale(1));
@@ -2480,6 +2696,8 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
     CreateButton("Btn_" + tag + "_LSell", lsellX, contentY, lbtnW, rowH, Lang("限价空", "LIMIT SELL"), sellBg, sellBd, sellTx, 9, true);
     CreateButton("Btn_" + tag + "_LBuy",  lbuyX,  contentY, lbtnW, rowH, Lang("限价多", "LIMIT BUY"),  buyBg,  buyBd,  buyTx,  9, true);
     contentY += Scale(38);   // 与上两排按钮等距
+    }
+    else contentY += Scale(38); // 缩小模式保留快捷偏移挂单，不显示价格输入行
 
     // 现价偏移快捷挂单:+2空 +3空 +5空 -2多 -3多 -5多(6 小按钮,整组右对齐卡片右侧)
     int obH   = Scale(22);
@@ -2537,7 +2755,9 @@ void RenderStrategyCard(string tag, int cardX, int currentY, int cardH, color ac
     else if(posCnt >= maxPos)  { stTxt = Lang("满仓", "MAX POSITION"); stClr = COLOR_SIGNAL_WARNING; }
     else if(Inp_UseSession && !InSession()) { stTxt = Lang("休息 (非时段)", "OFF-SESSION"); stClr = COLOR_TEXT_MUTED; }
     else                       { stTxt = Lang("就绪 (可开仓)", "READY"); stClr = COLOR_SIGNAL_PROFIT; }
-    CreateRowLR(tag + "_Status", cardX, contentY, Lang("策略运行状态", "Strategy Status"), stTxt, COLOR_TEXT_MUTED, stClr, true);
+    // 与持仓行共用样式：左侧说明 8.5，右侧状态/数值 9，不额外加粗。
+    CreateRowLR(tag + "_Status", cardX, contentY,
+                Lang("策略运行状态", "Strategy Status"), stTxt, COLOR_TEXT_MUTED, stClr);
     contentY += Scale(22);
 
     CreateRowLR(tag + "_Pos", cardX, contentY, Lang("策略当前持仓", "Active Position"),
@@ -2545,7 +2765,7 @@ void RenderStrategyCard(string tag, int cardX, int currentY, int cardH, color ac
                 COLOR_TEXT_MUTED, COLOR_TEXT_BODY);
     contentY += Scale(22);
 
-    string perf = Lang("盈 ", "W ") + (string)winCnt + Lang(" | 亏 ", " | L ") + (string)lossCnt + Lang(" [点击]", " [Click]");
+    string perf = Lang("盈 ", "W ") + (string)winCnt + Lang(" | 亏 ", " | L ") + (string)lossCnt;
     CreateRowLR(tag + "_Orders", cardX, contentY, Lang("今日胜负平统计 🔍", "Daily Performance 🔍"), perf, COLOR_TEXT_MUTED, COLOR_SIGNAL_PROFIT, true);
     contentY += Scale(22);
 
@@ -2566,150 +2786,98 @@ void RenderStrategyCard(string tag, int cardX, int currentY, int cardH, color ac
 }
 
 //+------------------------------------------------------------------+
-//| 更新日志舱（左右分栏：左侧版本列表，右侧版本详情）                 |
+//| 更新日志舱：首次发布说明与功能卡片                                 |
 //+------------------------------------------------------------------+
+// 新版本按从新到旧加入此数据表；界面自动限制为最近10条。
+struct ReleaseNote
+{
+    string version;
+    string date;
+    string title;
+    string summary;
+    string features[4];
+    string details[4];
+};
+int g_ReleaseSelected = 0;
+const int RELEASE_HISTORY_LIMIT = 10;
+
+void LoadReleaseNotes(ReleaseNote &notes[])
+{
+    ArrayResize(notes, 2);
+    notes[0].version = "02";
+    notes[0].date = "2026-09-18";
+    notes[0].title = Lang("第二版更新说明", "Second release");
+    notes[0].summary = Lang("从交易执行，到系统化复盘。", "From execution to structured review.");
+    notes[0].features[0] = Lang("复盘系统数据同步", "REVIEW SYSTEM SYNC");
+    notes[0].details[0] = Lang("支持将交易数据同步至复盘系统，连接执行与复盘。", "Sync trading data to connect execution and review.");
+    notes[0].features[1] = Lang("账户与成交记录", "ACCOUNT & DEAL DATA");
+    notes[0].details[1] = Lang("同步成交、账户快照与配置，支持后续统计分析。", "Sync deals, account snapshots and settings for analysis.");
+    notes[0].features[2] = Lang("界面布局优化", "REFINED INTERFACE");
+    notes[0].details[2] = Lang("调整顶栏对齐与间距，提供紧凑面板和快捷操作。", "Aligned header, compact panel and quick controls.");
+    notes[0].features[3] = Lang("同步状态提示", "SYNC STATUS");
+    notes[0].details[3] = Lang("请求期间显示红色同步提示，结束后恢复空闲状态。", "Red status during requests; idle status when finished.");
+
+    notes[1].version = "01";
+    notes[1].date = "2026-09-01";
+    notes[1].title = Lang("第一版上线说明", "Initial release");
+    notes[1].summary = Lang("让执行更清晰，让风险有边界。", "Clear execution. Defined risk.");
+    notes[1].features[0] = Lang("双策略执行", "DUAL STRATEGIES");
+    notes[1].details[0] = Lang("剥头皮与趋势独立管理，支持市价及限价下单。", "Separate scalp and trend strategies; market and limit entries.");
+    notes[1].features[1] = Lang("多层风险控制", "RISK CONTROLS");
+    notes[1].details[1] = Lang("连续亏损冷却、分策略熔断与利润护城河保护。", "Loss cooldowns, strategy breakers and profit protection.");
+    notes[1].features[2] = Lang("持仓精细管理", "POSITION MANAGEMENT");
+    notes[1].details[2] = Lang("保本移损、峰值追踪、减仓与分类平仓。", "Break-even, peak trailing, reduction and filtered exits.");
+    notes[1].features[3] = Lang("交易统计与复盘", "STATISTICS & REVIEW");
+    notes[1].details[3] = Lang("查看账户与策略表现，支持成交明细及报告导出。", "Account metrics, strategy results, deal history and exports.");
+}
+
 void RenderChangelogPanel()
 {
-    int cw = 580;
-    int cx = StartX + PanelWidth + 12;
-    int cy = StartY;
-    int ch = 620;
+    ReleaseNote notes[];
+    LoadReleaseNotes(notes);
+    int count = MathMin(ArraySize(notes), RELEASE_HISTORY_LIMIT);
+    if(count == 0) return;
+    g_ReleaseSelected = MathMax(0, MathMin(g_ReleaseSelected, count - 1));
+    int cx = StartX + PanelWidth + Scale(12), cy = StartY;
+    int cw = Scale(640), ch = Scale(510);
+    int x = cx + Scale(24);
+    CreatePanel("CL_Bg", cx, cy, cw, ch, COLOR_APP_BG, COLOR_CARD_BORDER);
+    CreatePanel("CL_Accent", cx, cy, cw, Scale(3), COLOR_GOLD, COLOR_GOLD);
+    CreateLabel("CL_Eyebrow", x, cy + Scale(22), "TRADEEZ-SOP  /  RELEASE NOTES", COLOR_GOLD, 8, true);
+    CreateButton("Btn_CL_Close", cx + cw - Scale(44), cy + Scale(18), Scale(26), Scale(26),
+                 "X", COLOR_BTN_SYS_BG, COLOR_BTN_SYS_BORDER, COLOR_TEXT_MUTED, 9, true);
+    CreateLabel("CL_Heading", x, cy + Scale(52), Lang("版本更新", "Release history"), COLOR_TEXT_HEADER, 18, true);
+    CreateLabel("CL_Hint", x, cy + Scale(86), Lang("持续打磨交易体验 · 展示最近10个版本", "Refining the trading experience · Latest 10 releases"), COLOR_TEXT_MUTED, 8.5);
+    CreatePanel("CL_Divider", x, cy + Scale(114), cw - Scale(48), Scale(1), COLOR_CARD_BORDER, COLOR_CARD_BORDER);
 
-    CreatePanel("CL_Bg", cx, cy, cw, ch, COLOR_CARD_BG, COLOR_CARD_BORDER);
-    DrawGoldBorderNamed("CL", cx, cy, cw, ch, 2, COLOR_GOLD);
-
-    // 标题栏
-    CreateLabel("CL_Title", cx + 20, cy + 14, Lang("TradeEZ-SOP 系统更新日志", "TradeEZ-SOP CHANGELOG"), COLOR_TEXT_HEADER, 11, true);
-    CreateButton("Btn_CL_Close", cx + cw - 36, cy + 12, 26, 22, "X", COLOR_BTN_SYS_BG, COLOR_BTN_SYS_BORDER, COLOR_SIGNAL_LOSS, 9, true);
-
-    int y = cy + 48;
-
-    // === 系统核心功能介绍（顶部，字体统一，手动折行） ===
-    CreateLabel("CL_Intro_Title", cx + 20, y, Lang("核心功能概述", "CORE FEATURES"), COLOR_GOLD, 8.5, true);
-    y += 20;
-
-    // 中文：手动分两行
-    CreateLabel("CL_I1_CN_1", cx + 24, y, "TradeEZ-SOP 是一套机构级黄金日内交易风控系统，集成双策略引擎、", COLOR_TEXT_BODY, 8);
-    y += 16;
-    CreateLabel("CL_I1_CN_2", cx + 24, y, "多维熔断机制与利润护城河技术，为专业交易者提供彭博终端级交易体验。", COLOR_TEXT_BODY, 8);
-    y += 16;
-    // 英文：手动分两行
-    CreateLabel("CL_I1_EN_1", cx + 24, y, "TradeEZ-SOP: Institutional-grade intraday gold risk engine with dual-strategy", COLOR_TEXT_BODY, 8);
-    y += 16;
-    CreateLabel("CL_I1_EN_2", cx + 24, y, "architecture, multi-tier circuit breaker & profit moat for professional traders.", COLOR_TEXT_BODY, 8);
-    y += 18;
-
-    // 分隔线
-    ColorBar("CL_Sep1", cx + 20, y, cw - 40, 1, COLOR_CARD_BORDER, 96);
-    y += 20;
-
-    // === 左右分栏区域 ===
-    int leftW = 120;   // 左侧版本列表宽度
-    int leftX = cx + 20;
-    int rightW = cw - leftW - 60;  // 右侧详情区宽度（增加间距，避免溢出）
-    int rightX = leftX + leftW + 20;
-    int contentY = y;
-
-    // --- 左侧：版本列表标题 ---
-    CreateLabel("CL_Ver_Title", leftX, contentY, Lang("版本历史", "VERSIONS"), COLOR_GOLD, 8.5, true);
-    contentY += 24;
-
-    // 版本按钮列表（可点击切换）
-    string verList[] = {"v1.03", "v1.02", "v1.01", "v1.00"};
-    string dateList[] = {"2025-01-20", "2025-01-20", "2025-01-15", "2025-01-10"};
-    for(int i = 0; i < ArraySize(verList); i++)
+    // 左侧十行固定容量，新增版本不改变面板尺寸。
+    for(int i = 0; i < count; i++)
     {
-        color verClr = (verList[i] == g_ChangelogVer) ? COLOR_SIGNAL_PROFIT : COLOR_TEXT_BODY;
-        color verBg  = (verList[i] == g_ChangelogVer) ? COLOR_BTN_SYS_BG : C'0,0,0,0';  // 选中高亮背景
-
-        // 版本号按钮（可点击）
-        if(verList[i] == g_ChangelogVer)
-            CreatePanel("CL_Ver_Sel_" + (string)i, leftX, contentY - 2, leftW, 36, COLOR_BTN_SYS_BG, COLOR_SIGNAL_PROFIT);
-        CreateButton("Btn_CL_Ver_" + verList[i], leftX + 4, contentY, leftW - 8, 16, verList[i], C'0,0,0,0', C'0,0,0,0', verClr, 9, true);
-        CreateLabel("CL_Ver_Date_" + (string)i, leftX + 4, contentY + 18, dateList[i], COLOR_TEXT_MUTED, 7.5);
-        contentY += 42;
+        bool active = (i == g_ReleaseSelected);
+        CreateButton("Btn_CL_Select_" + (string)i, x, cy + Scale(134 + i * 30), Scale(134), Scale(26),
+                     notes[i].version + "  /  " + notes[i].date,
+                     active ? COLOR_BTN_SYS_BG : COLOR_APP_BG,
+                     active ? COLOR_GOLD : COLOR_CARD_BORDER,
+                     active ? COLOR_GOLD : COLOR_TEXT_MUTED, 8, active);
     }
-
-    // --- 右侧：选中版本的详细内容 ---
-    int detailY = y + 24;
-    CreateLabel("CL_Detail_Title", rightX, y, Lang("更新内容", "RELEASE NOTES"), COLOR_GOLD, 8.5, true);
-
-    // 根据选中版本显示对应内容
-    if(g_ChangelogVer == "v1.03")
+    int dx = x + Scale(156), dw = cw - Scale(204);
+    CreateLabel("CL_Title", dx, cy + Scale(134), notes[g_ReleaseSelected].title, COLOR_TEXT_HEADER, 14, true);
+    CreateLabel("CL_Date", dx, cy + Scale(164), notes[g_ReleaseSelected].date, COLOR_GOLD, 8.5);
+    CreateLabel("CL_Summary", dx, cy + Scale(189), notes[g_ReleaseSelected].summary, COLOR_TEXT_MUTED, 9);
+    for(int j = 0; j < 4; j++)
     {
-        CreateLabel("CL_D1", rightX, detailY, Lang("• 剥头皮止损推进BUG修复", "• Scalp SL trail bug fix"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D1_1", rightX + 8, detailY, Lang("空单峰值追踪止损正确下推", "Short position SL trails down correctly"), COLOR_TEXT_MUTED, 8);
-        detailY += 22;
-        CreateLabel("CL_D2", rightX, detailY, Lang("• 修复止损卡死问题", "• Fixed SL stuck issue"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D2_1", rightX + 8, detailY, Lang("盈利增加时止损跟进推进", "SL advances as profit grows"), COLOR_TEXT_MUTED, 8);
-        detailY += 22;
-        CreateLabel("CL_D3", rightX, detailY, Lang("• 完善空单止损逻辑", "• Enhanced short SL logic"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D3_1", rightX + 8, detailY, Lang("多空止损分离判断更清晰", "Separated long/short logic"), COLOR_TEXT_MUTED, 8);
+        string key = "CL_Feature_" + (string)j;
+        int y = cy + Scale(222 + j * 56);
+        CreatePanel(key, dx, y, dw, Scale(50), COLOR_CARD_BG, COLOR_CARD_BORDER);
+        CreateLabel(key + "_Title", dx + Scale(12), y + Scale(7), notes[g_ReleaseSelected].features[j], COLOR_TEXT_HEADER, 9, true);
+        CreateLabel(key + "_Detail", dx + Scale(12), y + Scale(28), notes[g_ReleaseSelected].details[j], COLOR_TEXT_MUTED, 8);
     }
-    else if(g_ChangelogVer == "v1.02")
-    {
-        CreateLabel("CL_D1", rightX, detailY, Lang("• 系统品牌更名", "• Rebranding"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D1_1", rightX + 8, detailY, Lang("Gold SOP → TradeEZ-SOP", "Gold SOP → TradeEZ-SOP"), COLOR_TEXT_MUTED, 8);
-        detailY += 22;
-        CreateLabel("CL_D2", rightX, detailY, Lang("• 订单备注前缀更新", "• Order prefix update"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D2_1", rightX + 8, detailY, Lang("TradeEZ-SC / TradeEZ-TR", "TradeEZ-SC / TradeEZ-TR"), COLOR_TEXT_MUTED, 8);
-        detailY += 22;
-        CreateLabel("CL_D3", rightX, detailY, Lang("• 导出报告文件名更新", "• Export filename update"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D3_1", rightX + 8, detailY, Lang("TradeEZ_账户_日期.md", "TradeEZ_Acct_Date.md"), COLOR_TEXT_MUTED, 8);
-        detailY += 22;
-        CreateLabel("CL_D4", rightX, detailY, Lang("• 版本号显示优化", "• Version display refined"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D4_1", rightX + 8, detailY, Lang("移除按钮框改为纯文字", "Removed button frame"), COLOR_TEXT_MUTED, 8);
-        detailY += 22;
-        CreateLabel("CL_D5", rightX, detailY, Lang("• 更新日志舱布局重构", "• Changelog layout redesign"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D5_1", rightX + 8, detailY, Lang("左右分栏可切换版本", "Left-right split design"), COLOR_TEXT_MUTED, 8);
-    }
-    else if(g_ChangelogVer == "v1.01")
-    {
-        CreateLabel("CL_D1", rightX, detailY, Lang("• 剥头皮峰值追踪重构", "• Scalp peak trail refactor"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D1_1", rightX + 8, detailY, Lang("有向计算修复亏损单误触发", "Fixed loss trigger bug"), COLOR_TEXT_MUTED, 8);
-        detailY += 22;
-        CreateLabel("CL_D2", rightX, detailY, Lang("• 达80点启动峰值回撤", "• Peak trail @80pt"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D2_1", rightX + 8, detailY, Lang("保留止盈回撤300点平仓", "Keep TP, exit on 300pt pullback"), COLOR_TEXT_MUTED, 8);
-        detailY += 22;
-        CreateLabel("CL_D3", rightX, detailY, Lang("• 改趋势单功能优化", "• To-Trend optimization"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D3_1", rightX + 8, detailY, Lang("必须盈利≥300点(第一目标)", "Require profit ≥300pt"), COLOR_TEXT_MUTED, 8);
-        detailY += 22;
-        CreateLabel("CL_D4", rightX, detailY, Lang("• 删除废弃参数", "• Removed deprecated param"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D4_1", rightX + 8, detailY, Lang("保本锁定点数参数说明更新", "BE lock & param descriptions"), COLOR_TEXT_MUTED, 8);
-    }
-    else if(g_ChangelogVer == "v1.00")
-    {
-        CreateLabel("CL_D1", rightX, detailY, Lang("• 系统架构初始发布", "• Initial release"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D1_1", rightX + 8, detailY, Lang("双策略引擎+多维熔断", "Dual-strategy + Breaker"), COLOR_TEXT_MUTED, 8);
-        detailY += 22;
-        CreateLabel("CL_D2", rightX, detailY, Lang("• 彭博终端级UI", "• Bloomberg-grade UI"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D2_1", rightX + 8, detailY, Lang("暗黑配色+实时看板+双语", "Dark theme + Dashboard"), COLOR_TEXT_MUTED, 8);
-        detailY += 22;
-        CreateLabel("CL_D3", rightX, detailY, Lang("• 风控熔断机制", "• Risk control"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D3_1", rightX + 8, detailY, Lang("连亏+分策略+全局回撤", "Consec loss + DD control"), COLOR_TEXT_MUTED, 8);
-        detailY += 22;
-        CreateLabel("CL_D4", rightX, detailY, Lang("• 数据可视化", "• Data visualization"), COLOR_TEXT_BODY, 8);
-        detailY += 22;
-        CreateLabel("CL_D4_1", rightX + 8, detailY, Lang("明细舱+日统计+Markdown", "Cabin + Stats + Export"), COLOR_TEXT_MUTED, 8);
-    }
-
-    y += (ch - 100);
-    CreateLabel("CL_Footer", cx + 20, cy + ch - 26, Lang("* 所有版本均已通过严格回测验证 | 技术支持: TradeEZ Team", "* All versions validated via rigorous backtest | Support: TradeEZ Team"), COLOR_TEXT_MUTED, 7);
+    CreatePanel("CL_FooterLine", x, cy + Scale(466), cw - Scale(48), Scale(1), COLOR_CARD_BORDER, COLOR_CARD_BORDER);
+    CreateLabel("CL_Footer", x, cy + Scale(482), Lang("TradeEZ 官方网站", "TRADEEZ WEBSITE"), COLOR_TEXT_MUTED, 8);
+    CreateButton("CL_Website", cx + cw - Scale(258), cy + Scale(477), Scale(234), Scale(24),
+                 "https://www.tradeez.cn", COLOR_APP_BG, COLOR_CARD_BORDER, COLOR_GOLD, 9, true);
+    string link = Prefix + "CL_Website";
+    ObjectSetString(0, link, OBJPROP_TOOLTIP, Lang("点击使用默认浏览器打开官网", "Open website in your default browser"));
 }
 
 //+------------------------------------------------------------------+
@@ -2726,100 +2894,96 @@ void RenderPerfectUI()
         g_ScPriceTxt = ObjectGetString(0, Prefix + "Edt_Sc_Price", OBJPROP_TEXT);
     if(ObjectFind(0, Prefix + "Edt_Tr_Price") >= 0)
         g_TrPriceTxt = ObjectGetString(0, Prefix + "Edt_Tr_Price", OBJPROP_TEXT);
-    DeleteUIKeepEdits();
+    BeginUIRefresh();
 
     // 底层背景
-    CreatePanel("AppBg", StartX, StartY, PanelWidth, PanelHeight, COLOR_APP_BG, COLOR_GOLD);
-    DrawGoldBorder(StartX, StartY, PanelWidth, PanelHeight, 3); // 模拟金色粗边框
+    int displayHeight = g_Collapsed ? Scale(404) : PanelHeight;
+    int displayWidth = g_Collapsed ? PanelWidth/2 : PanelWidth;
+    CreatePanel("AppBg", StartX, StartY, displayWidth, displayHeight, COLOR_APP_BG, COLOR_GOLD);
+    DrawGoldBorder(StartX, StartY, displayWidth, displayHeight, 3);
 
     int currentY = StartY + Scale(16);
 
-    // LOGO + 版本号 + 同步状态 + 北京时间 + 收线倒计时 + 语言切换
-    int titleX    = StartX + Scale(18);
+    // LOGO + 版本号 + 北京时间 + 收线倒计时 + 语言切换
+    int logoX     = StartX + Scale(12);
+    int logoSize  = Scale(32); // 原图留白内的标志约19px，与标题可见字高接近。
+    int titleX    = logoX + logoSize + Scale(4);
     int titleW    = Scale(118);
-    int versionX  = titleX + titleW + Scale(8);
+    int versionX  = titleX + titleW + Scale(2);
     int versionW  = Scale(42);
-    int resetW    = Scale(70);
-    int resetH    = Scale(22);
-    int resetX    = versionX + versionW + Scale(8);
-    CreateLabel("Title", titleX, currentY, "TradeEZ-SOP", COLOR_TEXT_HEADER, 13, true);
-    CreateLabel("Version", versionX, currentY + Scale(2), "v1.03", COLOR_SIGNAL_PROFIT, 9, true);
+    int headerMidY = currentY + Scale(10);
+    int titleBottomY = headerMidY + Scale(9);
+    RenderBrandLogo(logoX, headerMidY - logoSize/2, logoSize);
+    // 大字号字体框底部留白更多，下移补偿以对齐可见字形底部。
+    CreateLabelAnchor("Title", titleX, titleBottomY + Scale(2), "TradeEZ-SOP", COLOR_TEXT_HEADER, 13, true, ANCHOR_LEFT_LOWER);
+    CreateLabelAnchor("Version", versionX, titleBottomY, "v1.03", COLOR_SIGNAL_PROFIT, 9, true, ANCHOR_LEFT_LOWER);
 
-    int leftClusterRight = versionX + versionW;
-    if(Inp_ShowResetBtn)
-    {
-        CreateButton("Btn_Reset_All", resetX, currentY - Scale(2), resetW, resetH, Lang("重置", "RESET"), COLOR_BTN_SYS_BG, COLOR_BTN_SYS_BORDER, COLOR_SIGNAL_WARNING, 8, true);
-        leftClusterRight = resetX + resetW;
-    }
-
-    if(Inp_EnableSync)
-    {
-        int syncW = Scale(76);
-        int syncX = leftClusterRight + Scale(8);
-        string syncText = "";
-        color syncColor = COLOR_TEXT_MUTED;
-
-        if(g_SyncInProgress)
-        {
-            syncText = Lang("同步中", "SYNC");
-            syncColor = COLOR_SIGNAL_WARNING;
-        }
-        else
-        {
-            int elapsedMin = (TimeCurrent() > g_LastSyncTime) ? (int)((TimeCurrent() - g_LastSyncTime) / 60) : 0;
-            if(g_LastSyncTime == 0)
-            {
-                syncText = Lang("未同步", "NO SYNC");
-                syncColor = COLOR_TEXT_MUTED;
-            }
-            else if(elapsedMin > 10)
-            {
-                syncText = Lang("同步异常", "SYNC ERR");
-                syncColor = COLOR_SIGNAL_LOSS;
-            }
-            else
-            {
-                syncText = Lang("已同步", "SYNCED");
-                syncColor = COLOR_SIGNAL_PROFIT;
-            }
-        }
-        CreateLabel("SyncStatus", syncX, currentY + Scale(2), syncText, syncColor, 8, true);
-        leftClusterRight = syncX + syncW;
-    }
-
-    int foldSize = Scale(24);
-    int foldX    = Col2X + CardW - foldSize;
+    int foldSize = Scale(44);
+    int foldX    = StartX + displayWidth - Scale(14) - foldSize;
     int langW    = Scale(92);
     int langGap  = Scale(6);
     int langX    = foldX - langGap - langW;
-    CreateButton("Btn_Fold", foldX, currentY - Scale(2), foldSize, foldSize, g_Collapsed ? "+" : "-", COLOR_BTN_SYS_BG, COLOR_BTN_SYS_BORDER, COLOR_TEXT_HEADER, 11, true);
-    CreateButton("Btn_Lang_Toggle", langX, currentY - Scale(2), langW, foldSize, g_Language_ZH ? "LANG: 中文" : "LANG: EN", COLOR_BTN_SYS_BG, COLOR_BTN_SYS_BORDER, COLOR_TEXT_HEADER, 8, true);
+    CreateButton("Btn_Fold", foldX, currentY - Scale(2), foldSize, Scale(24), g_Collapsed ? ">" : "<", COLOR_BTN_SYS_BG, COLOR_BTN_SYS_BORDER, COLOR_TEXT_HEADER, 10, true);
+    if(!g_Collapsed)
+    {
+    CreateButton("Btn_Lang_Toggle", langX, currentY - Scale(2), langW, Scale(24), g_Language_ZH ? "LANG: 中文" : "LANG: EN", COLOR_BTN_SYS_BG, COLOR_BTN_SYS_BORDER, COLOR_TEXT_HEADER, 8, true);
 
     int cdRight      = langX - Scale(12);
-    int cdTimeW      = Scale(108);
-    int cdLabelW     = Scale(44);
-    int cdGap        = Scale(8);
+    int cdTimeW      = Scale(64);
+    int cdGap        = Scale(2);
     int cdLabelRight = cdRight - cdTimeW - cdGap;
-    int rightClusterLeft = cdLabelRight - cdLabelW - Scale(18);
-
-    int clockCx = (leftClusterRight + rightClusterLeft) / 2;
+    // 时钟锚定面板几何中心，不随两侧可选控件变化。
+    int clockCx = StartX + PanelWidth / 2;
     CreateLabelAnchor("Clock", clockCx, currentY + Scale(10), TimeToString(BeijingNow(), TIME_MINUTES | TIME_SECONDS), COLOR_TEXT_HEADER, 16, true, ANCHOR_CENTER);
     if(IsMarketClosed())
-        CreateLabelAnchor("ClockClosed", clockCx + Scale(52), currentY + Scale(13), Lang("休市", "CLOSED"), COLOR_SIGNAL_LOSS, 9, true, ANCHOR_LEFT);
+        CreateLabelAnchor("ClockClosed", clockCx + Scale(52), headerMidY, Lang("休市", "CLOSED"), COLOR_SIGNAL_LOSS, 9, true, ANCHOR_LEFT);
     else
         ObjectDelete(0, Prefix + "ClockClosed");
 
-    int cdMidY = currentY + Scale(10);
-    CreateLabelAnchor("BarCD",     cdRight,      cdMidY,             BarCountdown(), COLOR_SIGNAL_WARNING, 16, true, ANCHOR_RIGHT);
-    CreateLabelAnchor("BarCD_Lbl", cdLabelRight, cdMidY + Scale(3), Lang("收线", "BAR"), COLOR_TEXT_MUTED, 9, true, ANCHOR_RIGHT);
+    int cdBottomY = headerMidY + Scale(12);
+    CreateLabelAnchor("BarCD", cdRight, cdBottomY + Scale(3), BarCountdown(), COLOR_SIGNAL_WARNING, 16, true, ANCHOR_RIGHT_LOWER);
+    CreateLabelAnchor("BarCD_Lbl", cdLabelRight, cdBottomY, Lang("收线", "BAR"), COLOR_TEXT_MUTED, 9, true, ANCHOR_RIGHT_LOWER);
+    }
     currentY += Scale(36);
 
-    // 折叠状态:仅保留顶栏,背景收窄,移除输入框
+    // 紧凑状态保留顶栏、实时报价、策略标题/手数及市价操作。
     if(g_Collapsed)
     {
         ObjectDelete(0, Prefix + "Edt_Sc_Price");
         ObjectDelete(0, Prefix + "Edt_Tr_Price");
-        ObjectSetInteger(0, Prefix + "AppBg", OBJPROP_YSIZE, Scale(46));
+        RenderQuoteBar(SymbolInfoDouble(_Symbol, SYMBOL_BID), SymbolInfoDouble(_Symbol, SYMBOL_ASK));
+        int compactY = currentY + Scale(44) + Scale(14);
+        for(int side = 0; side < 2; side++)
+        {
+            bool scalp = (side == 0);
+            string tag = scalp ? "Sc" : "Tr";
+            int x = Col1X;
+            int strategyY = compactY + side * Scale(120);
+            ENUM_SOP_ORDER kind = scalp ? SOP_SCALP : SOP_TREND;
+            string title = scalp ? Lang("极速剥头皮策略", "SCALPING STRATEGY") : Lang("波段趋势策略", "TREND STRATEGY");
+            double lots = scalp ? Inp_ScalpLots : Inp_TrendLots;
+            CreateCard("Card_" + tag, x, strategyY, CardW, Scale(110), scalp ? COLOR_SIGNAL_PROFIT : COLOR_SIGNAL_LOSS);
+            CreateLabelAnchor(tag + "_Title", x + LeftPad, strategyY + Scale(20), title, COLOR_TEXT_HEADER, 9.5, true, ANCHOR_LEFT);
+            CreateLabelAnchor(tag + "_Lots", x + CardW - RightPad, strategyY + Scale(20), Lang("标准手数: ", "LOTS: ") + DoubleToString(lots, 2), COLOR_TEXT_HEADER, 8.5, true, ANCHOR_RIGHT);
+            RenderStrategyCardButtons(tag, x, strategyY + Scale(40), title, kind, scalp ? IsScalpAllowed() : IsTrendAllowed());
+        }
+        // 独立底栏：全局平仓操作不归属于某个策略。
+        CreatePanel("Compact_ActionDivider", Col1X, compactY + Scale(236),
+                    CardW, Scale(1), C'190,196,204', C'190,196,204');
+        // RECTANGLE_LABEL 的平面边框使用 COLOR；1px 高时边框覆盖整个填充。
+        ObjectSetInteger(0, Prefix + "Compact_ActionDivider", OBJPROP_COLOR, C'190,196,204');
+        ObjectSetInteger(0, Prefix + "Compact_ActionDivider", OBJPROP_STYLE, STYLE_SOLID);
+        ObjectSetInteger(0, Prefix + "Compact_ActionDivider", OBJPROP_WIDTH, 1);
+        int actionY = compactY + Scale(248);
+        int actionW = Scale(100);
+        int actionGap = Scale(12);
+        int actionX = StartX + (displayWidth - actionW*2 - actionGap)/2;
+        CreateButton("Btn_Close_All", actionX, actionY, actionW, Scale(24),
+                     Lang("一键全平", "CLOSE ALL"), COLOR_BTN_SELL_BG, COLOR_BTN_SELL_BORDER, COLOR_SIGNAL_LOSS, 8, true);
+        CreateButton("Btn_Close_Profit", actionX + actionW + actionGap, actionY, actionW, Scale(24),
+                     Lang("平盈利单", "CLOSE PROFIT"), COLOR_BTN_BUY_BG, COLOR_BTN_BUY_BORDER, COLOR_SIGNAL_PROFIT, 8, true);
+        if(g_ShowChangelog) RenderChangelogPanel();
+        EndUIRefresh();
         ChartRedraw();
         return;
     }
@@ -2827,7 +2991,7 @@ void RenderPerfectUI()
     // ===== 买卖价格条(卖左/买右/点差居中,底部对齐) =====
     double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-    int priceH = Scale(52);
+    int priceH = Scale(44);
     RenderQuoteBar(bid, ask);
     currentY += priceH + Scale(14);
 
@@ -2836,7 +3000,7 @@ void RenderPerfectUI()
     int rowA_H = Scale(236);
 
     // --- 账户核心数据(7项)---
-    CreateCard("Card1", Col1X, rowA_Y, CardW, rowA_H, COLOR_SIGNAL_PROFIT);
+    CreateCard("Card1", Col1X, rowA_Y, CardW, rowA_H, clrWhite);
     int cY = rowA_Y + Scale(12);
     CreateLabel("C1_Title", Col1X + LeftPad, cY, Lang("账户核心数据", "ACCOUNT METRICS"), COLOR_TEXT_HEADER, 9.5, true);
     cY += Scale(28);
@@ -2861,7 +3025,7 @@ void RenderPerfectUI()
     cY += Scale(26);
     // 6 系统激活时段
     string sess = StringFormat("%02d:00 ~ %02d:00 ", Inp_SessionStartHour, Inp_SessionEndHour)
-                + (InSession() ? Lang("[已激活]", "[ACTIVE]") : Lang("[休息]", "[OFF]"));
+                + (InSession() ? Lang("(已激活)", "(ACTIVE)") : Lang("(休息)", "(OFF)"));
     CreateRowLR("C1_Time", Col1X, cY, Lang("系统激活时段", "Active Session"), sess, COLOR_TEXT_MUTED, (InSession() ? COLOR_SIGNAL_PROFIT : COLOR_TEXT_MUTED));
     cY += Scale(26);
     // 7 重置倒计时
@@ -2870,11 +3034,20 @@ void RenderPerfectUI()
     if(remain < 0) remain = 0;
     string cd = (string)(remain / 3600) + Lang(" 小时 ", " Hrs ") + (string)((remain % 3600) / 60) + Lang(" 分钟", " Mins");
     CreateRowLR("C1_Reset", Col1X, cY, Lang("重置倒计时", "Reset Countdown"), cd, COLOR_TEXT_MUTED, COLOR_SIGNAL_WARNING, true);
+    if(Inp_ShowResetBtn)
+    {
+        // 固定倒计时文本区，避免位数变化导致按钮跳动。
+        int resetW = Scale(44);
+        int countdownW = Scale(g_Language_ZH ? 100 : 122);
+        int resetX = Col1X + CardW - RightPad - countdownW - Scale(6) - resetW;
+        CreateButton("Btn_Reset_All", resetX, cY - Scale(2), resetW, Scale(19),
+                     Lang("重置", "RESET"), COLOR_BTN_SYS_BG, COLOR_BTN_SYS_BORDER, COLOR_SIGNAL_WARNING, 8.5);
+    }
 
     // --- 全局风控数据(6项 + 4平仓按钮)---
     CreateCard("Card4", Col2X, rowA_Y, CardW, rowA_H, COLOR_SIGNAL_WARNING);
     cY = rowA_Y + Scale(12);
-    CreateLabel("C4_Title", Col2X + LeftPad, cY, Lang("全局风控数据面板", "GLOBAL RISK MONITOR"), COLOR_TEXT_HEADER, 9.5, true);
+    CreateLabel("C4_Title", Col2X + LeftPad, cY, Lang("风控核心数据", "RISK METRICS"), COLOR_TEXT_HEADER, 9.5, true);
     // 日统计入口按钮(标题右侧)
     CreateButton("Btn_Stat_Open", Col2X + CardW - RightPad - 70, cY - 3, 70, 20, Lang("日统计 »", "STATS »"), COLOR_BTN_SYS_BG, COLOR_SIGNAL_PROFIT, COLOR_SIGNAL_PROFIT, 8, true);
     cY += Scale(28);
@@ -2945,6 +3118,7 @@ void RenderPerfectUI()
     // 剥头皮持仓超时平仓倒计时遮罩(主面板正下方)
     if(Inp_ScalpTimeLimitOn) RenderScalpCountdown();
 
+    EndUIRefresh();
     ChartRedraw();
 }
 
@@ -3134,42 +3308,59 @@ void RenderParamFooter(int y)
 {
     int fx = Col1X;
     int fw = Col2X + CardW - Col1X;
-    // 分隔线
-    string sep = Prefix + "Foot_Sep";
-    ObjectCreate(0, sep, OBJ_RECTANGLE_LABEL, 0, 0, 0);
-    ObjectSetInteger(0, sep, OBJPROP_XDISTANCE, fx);
-    ObjectSetInteger(0, sep, OBJPROP_YDISTANCE, y);
-    ObjectSetInteger(0, sep, OBJPROP_XSIZE, fw);
-    ObjectSetInteger(0, sep, OBJPROP_YSIZE, 1);
-    ObjectSetInteger(0, sep, OBJPROP_BGCOLOR, COLOR_GOLD);
-    ObjectSetInteger(0, sep, OBJPROP_BORDER_COLOR, COLOR_GOLD);
-    ObjectSetInteger(0, sep, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-    ObjectSetInteger(0, sep, OBJPROP_SELECTABLE, false);
+    CreatePanel("Foot_Sep", fx, y, fw, Scale(1), COLOR_GOLD, COLOR_GOLD);
+    CreateLabel("Foot_Title", fx, y + Scale(10),
+                Lang("策略执行参数", "STRATEGY EXECUTION"), COLOR_GOLD, 8, true);
+    CreateLabel("Foot_Units", Col2X, y + Scale(10),
+                Lang("单位：标准点（1 点 = 0.01 价格单位）", "Unit: standard point = 0.01 price"),
+                COLOR_TEXT_MUTED, 8);
 
-    int ly = y + 11;
-    CreateLabel("Foot_Title", fx, ly, Lang("策略参数说明", "STRATEGY PARAMETERS"), COLOR_GOLD, 8, true);
-    ly += 21;
+    // 与上方策略卡片保持同列；每行只说明一个执行阶段。
+    int top = y + Scale(34);
+    int row = Scale(20);
+    CreateLabel("Foot_ScTitle", fx, top, Lang("剥头皮策略", "SCALPING"), COLOR_TEXT_BODY, 9, true);
+    CreateLabel("Foot_TrTitle", Col2X, top, Lang("趋势策略", "TREND"), COLOR_TEXT_BODY, 9, true);
+    string scSL = Inp_ScalpSL_Points > 0 ? (string)Inp_ScalpSL_Points : Lang("未设置", "Off");
+    string scTP = Inp_ScalpTP_Points > 0 ? (string)Inp_ScalpTP_Points : Lang("未设置", "Off");
+    string trSL = Inp_TrendSL_Points > 0 ? (string)Inp_TrendSL_Points : Lang("未设置", "Off");
 
-    // 剥头皮:入场止损/止盈 + 峰值追踪 + 超时
-    string sc = Lang("剥头皮 · ", "Scalp · ")
-              + Lang("止损 ", "SL ") + (string)Inp_ScalpSL_Points + Lang("点 / 止盈 ", "pt / TP ") + (string)Inp_ScalpTP_Points + Lang("点", "pt")
-              + Lang(";浮盈≥", "; trail @+") + (string)Inp_ScalpBETrigger + Lang("点启动峰值追踪,回撤 ", "pt peak trail, exit on ") + (string)Inp_ScalpTrailStep + Lang("点离场", "pt pullback")
-              + (Inp_ScalpTimeLimitOn ? (Lang(";持仓超 ", "; time-stop ") + (string)Inp_ScalpMaxHoldSecs + Lang("秒强平", "s")) : "");
-    CreateLabel("Foot_Sc", fx, ly, sc, COLOR_TEXT_BODY, 8);
-    ly += 21;
+    CreateLabel("Foot_ScInitial", fx, top + row,
+                Lang("初始保护  ·  止损 ", "Initial  ·  SL ") + scSL
+                + Lang("  /  止盈 ", "  /  TP ") + scTP, COLOR_TEXT_BODY, 8);
+    CreateLabel("Foot_ScActivate", fx, top + row*2,
+                Lang("追踪启动  ·  浮盈达到 +", "Activate  ·  Profit +") + (string)Inp_ScalpBETrigger,
+                COLOR_TEXT_BODY, 8);
+    CreateLabel("Foot_ScExit", fx, top + row*3,
+                Lang("回撤退出  ·  距浮盈峰值回撤 ", "Exit  ·  Peak pullback ") + (string)Inp_ScalpTrailStep,
+                COLOR_TEXT_BODY, 8);
+    CreateLabel("Foot_ScTime", fx, top + row*4,
+                Lang("持仓时限  ·  ", "Time stop  ·  ")
+                + (Inp_ScalpTimeLimitOn
+                   ? (string)Inp_ScalpMaxHoldSecs + Lang(" 秒后强制平仓", " seconds")
+                   : Lang("未启用超时平仓", "Disabled")),
+                COLOR_TEXT_MUTED, 8);
 
-    // 趋势:初始止损 + 阶梯保本 + 减仓 + 峰值追踪
-    string tr = Lang("趋势 · ", "Trend · ")
-              + Lang("初始止损 ", "init SL ") + (string)Inp_TrendSL_Points + Lang("点", "pt")
-              + Lang(";阶梯保本 +", "; step BE +") + (string)Inp_TrendBE1_Trigger + Lang("→本, +", "→BE, +") + (string)Inp_TrendBE2_Trigger + Lang("→+", "→+") + (string)Inp_TrendBE2_Lock
-              + Lang(", +", ", +") + (string)Inp_TrendBE3_Trigger + Lang("→+", "→+") + (string)Inp_TrendBE3_Lock + Lang("点", "pt");
-    CreateLabel("Foot_Tr", fx, ly, tr, COLOR_TEXT_BODY, 8);
-    ly += 21;
+    CreateLabel("Foot_TrInitial", Col2X, top + row,
+                Lang("初始保护  ·  止损 ", "Initial  ·  SL ") + trSL
+                + Lang("  /  分级锁盈", "  /  Stepped protection"), COLOR_TEXT_BODY, 8);
+    CreateLabel("Foot_TrLocks", Col2X, top + row*2,
+                Lang("锁盈阶梯  ·  +", "SL steps  ·  +") + (string)Inp_TrendBE1_Trigger
+                + Lang("→保本", "→BE") + "  /  +" + (string)Inp_TrendBE2_Trigger
+                + "→+" + (string)Inp_TrendBE2_Lock + "  /  +" + (string)Inp_TrendBE3_Trigger
+                + "→+" + (string)Inp_TrendBE3_Lock, COLOR_TEXT_BODY, 8);
+    CreateLabel("Foot_TrReduce", Col2X, top + row*3,
+                Lang("分批止盈  ·  浮盈 +", "Partial exit  ·  Profit +") + (string)Inp_TrendBE3_Trigger
+                + Lang(" 时减仓 ", " → reduce ") + DoubleToString(Inp_TrendReducePercent, 1) + "%",
+                COLOR_TEXT_BODY, 8);
+    CreateLabel("Foot_TrTrail", Col2X, top + row*4,
+                Lang("峰值追踪  ·  +", "Peak trail  ·  +") + (string)Inp_TrendTrailTrigger
+                + Lang(" 启动  /  回撤 ", " activate  /  pullback ") + (string)Inp_TrendTrailStep
+                + Lang(" 退出", " exit"), COLOR_TEXT_BODY, 8);
 
-    string tr2 = Lang("趋势 · ", "Trend · ")
-               + Lang("+", "+") + (string)Inp_TrendBE3_Trigger + Lang("点减仓 ", "pt reduce ") + DoubleToString(Inp_TrendReducePercent,0) + "%"
-               + Lang(";浮盈≥", "; trail @+") + (string)Inp_TrendTrailTrigger + Lang("点启动峰值追踪,回撤 ", "pt, exit on ") + (string)Inp_TrendTrailStep + Lang("点离场", "pt pullback");
-    CreateLabel("Foot_Tr2", fx, ly, tr2, COLOR_TEXT_BODY, 8);
+    // 紧随内容收口，缩放时同步调整主面板及金色边框。
+    int fittedHeight = top + row*4 - StartY + Scale(28);
+    ObjectSetInteger(0, Prefix + "AppBg", OBJPROP_YSIZE, fittedHeight);
+    DrawGoldBorder(StartX, StartY, PanelWidth, fittedHeight, 3);
 }
 
 //+------------------------------------------------------------------+
@@ -3309,68 +3500,9 @@ void LoadArrays()
 }
 
 //+------------------------------------------------------------------+
-//| 数据同步模块 (TradeSync-Web) - 增量同步版本                       |
+//| 发布无密钥实例清单，供独立 tradeEZSync EA 读取                    |
 //+------------------------------------------------------------------+
-// 全局变量：服务器端最后同步游标（最近平仓成交时间，Unix UTC 秒）
-datetime g_ServerLastSyncTime = 0;
-bool     g_LastSyncQueryOK = false;  // 区分“服务器返回0”与“请求失败”
-
-// MT5 历史时间使用交易服务器时区；同步协议统一传 Unix UTC 秒。
-datetime ServerTimeToUtc(datetime serverTime) { return serverTime - ServerGmtOffset(); }
-datetime UtcToServerTime(datetime utcTime)     { return utcTime + ServerGmtOffset(); }
-
-// 标准 HMAC-SHA256：key=服务器生成的完整密钥，message=body+UTC timestamp。
-string ComputeHMAC(string secretKey, string body, long timestamp)
-{
-    uchar key[], message[], empty[], keyHash[];
-    StringToCharArray(secretKey, key, 0, WHOLE_ARRAY, CP_UTF8);
-    if(ArraySize(key) > 0) ArrayResize(key, ArraySize(key) - 1);
-    StringToCharArray(body + IntegerToString(timestamp), message, 0, WHOLE_ARRAY, CP_UTF8);
-    if(ArraySize(message) > 0) ArrayResize(message, ArraySize(message) - 1);
-
-    if(ArraySize(key) > 64)
-    {
-        if(CryptEncode(CRYPT_HASH_SHA256, key, empty, keyHash) <= 0) return "";
-        ArrayCopy(key, keyHash);
-        ArrayResize(key, ArraySize(keyHash));
-    }
-
-    uchar innerPad[], outerPad[];
-    ArrayResize(innerPad, 64);
-    ArrayResize(outerPad, 64);
-    for(int i = 0; i < 64; i++)
-    {
-        uchar b = (i < ArraySize(key)) ? key[i] : 0;
-        innerPad[i] = b ^ 0x36;
-        outerPad[i] = b ^ 0x5c;
-    }
-
-    uchar innerData[], innerHash[], outerData[], result[];
-    ArrayResize(innerData, 64 + ArraySize(message));
-    ArrayCopy(innerData, innerPad, 0, 0, 64);
-    ArrayCopy(innerData, message, 64, 0, ArraySize(message));
-    if(CryptEncode(CRYPT_HASH_SHA256, innerData, empty, innerHash) <= 0) return "";
-
-    ArrayResize(outerData, 64 + ArraySize(innerHash));
-    ArrayCopy(outerData, outerPad, 0, 0, 64);
-    ArrayCopy(outerData, innerHash, 64, 0, ArraySize(innerHash));
-    if(CryptEncode(CRYPT_HASH_SHA256, outerData, empty, result) <= 0) return "";
-
-    string hex = "";
-    for(int i = 0; i < ArraySize(result); i++) hex += StringFormat("%02x", result[i]);
-    return hex;
-}
-
-string SyncHeaders(string body, long timestamp)
-{
-    string signature = ComputeHMAC(Inp_SecretKey, body, timestamp);
-    return "Content-Type: application/json\r\n" +
-           "Authorization: Bearer " + Inp_SecretKey + "\r\n" +
-           "X-Timestamp: " + IntegerToString(timestamp) + "\r\n" +
-           "X-Signature: " + signature + "\r\n";
-}
-
-string JsonEscape(string value)
+string ManifestJsonEscape(string value)
 {
     StringReplace(value, "\\", "\\\\");
     StringReplace(value, "\"", "\\\"");
@@ -3380,607 +3512,104 @@ string JsonEscape(string value)
     return value;
 }
 
-// 获取服务器保存的同步游标。该值定义为“最近一笔已提交订单的开仓 UTC 时间”。
-datetime GetServerLastSyncTime()
+string ManifestBool(bool value) { return value ? "true" : "false"; }
+
+string InstanceManifestPath()
 {
-    g_LastSyncQueryOK = false;
-    if(!Inp_EnableSync || Inp_SecretKey == "") return 0;
-
-    long login = AccountInfoInteger(ACCOUNT_LOGIN);
-    string body = StringFormat("{\"mt5_login\":%I64d}", login);
-    long timestamp = TimeGMT();
-    string headers = SyncHeaders(body, timestamp);
-
-    char post[], result[];
-    StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
-    ArrayResize(post, ArraySize(post) - 1);
-
-    string url = Inp_ApiBaseURL + "/api/v1/sync/last_sync_time";
-    string responseHeaders = "";
-    ResetLastError();
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
-    int webError = GetLastError();
-    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
-
-    if(Inp_DebugSync)
-        Print("[Sync Cursor] POST ", url, " | HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
-
-    if(res >= 200 && res < 300)
-    {
-        int pos = StringFind(response, "\"last_sync_time\"");
-        int colonPos = (pos >= 0) ? StringFind(response, ":", pos) : -1;
-        if(colonPos >= 0)
-        {
-            string numStr = StringSubstr(response, colonPos + 1);
-            int commaPos = StringFind(numStr, ",");
-            int bracePos = StringFind(numStr, "}");
-            int endPos = -1;
-            if(commaPos >= 0) endPos = commaPos;
-            if(bracePos >= 0 && (endPos < 0 || bracePos < endPos)) endPos = bracePos;
-            if(endPos >= 0) numStr = StringSubstr(numStr, 0, endPos);
-            StringReplace(numStr, "\"", "");
-            StringTrimLeft(numStr);
-            StringTrimRight(numStr);
-            datetime lastTimeUtc = (datetime)StringToInteger(numStr);
-            g_LastSyncQueryOK = true;
-            if(Inp_DebugSync)
-                Print("[Sync Cursor] 服务器平仓时间游标(UTC)=", (long)lastTimeUtc);
-            return lastTimeUtc;
-        }
-        if(Inp_DebugSync) Print("[Sync Cursor] 失败:响应缺少 last_sync_time");
-    }
-    else if(Inp_DebugSync)
-        Print("[Sync Cursor] 请求失败;HTTP=-1时请检查WebRequest白名单");
-
-    return 0;
+    return "TradeEZ\\instances\\" + (string)AccountInfoInteger(ACCOUNT_LOGIN) + "_" +
+           (string)ChartID() + ".json";
 }
 
-// 收集平仓成交时间 >= 游标的订单所对应的全部成交。
-// 游标基准 = 最后一笔已同步的平仓成交时间(UTC),确保只上传已了结的完整交易,避免持仓中订单的脏数据。
-// 边界采用包含式,游标同秒的成交会安全重传,由服务器按 ticket 幂等去重。
-int CollectDealsAfterCloseTime(datetime cursorUtc, string &dealsJson[],
-                              datetime &latestCloseTimeUtc, bool &collectionOK)
+bool PublishInstanceManifest()
 {
-    ArrayResize(dealsJson, 0);
-    latestCloseTimeUtc = 0;
-    collectionOK = false;
+    FolderCreate("TradeEZ");
+    FolderCreate("TradeEZ\\instances");
 
-    datetime fromServer = UtcToServerTime(cursorUtc);
-    datetime toServer = TimeCurrent() + 1;
-    if(fromServer > toServer)
+    string settings = "{";
+    settings += "\"basic\":{";
+    settings += "\"magic\":" + (string)Inp_Magic + ",";
+    settings += "\"magic_scalp\":" + (string)Inp_MagicScalp + ",";
+    settings += "\"magic_trend\":" + (string)Inp_MagicTrend + ",";
+    settings += "\"comment_scalp\":\"" + ManifestJsonEscape(Inp_CommentScalp) + "\",";
+    settings += "\"comment_trend\":\"" + ManifestJsonEscape(Inp_CommentTrend) + "\",";
+    settings += "\"slippage\":" + (string)Inp_Slippage + ",";
+    settings += "\"refresh_seconds\":" + (string)Inp_RefreshSeconds + ",";
+    settings += "\"ui_scale\":" + DoubleToString(Inp_UIScale, 2) + ",";
+    settings += "\"use_session\":" + ManifestBool(Inp_UseSession) + ",";
+    settings += "\"session_start\":" + (string)Inp_SessionStartHour + ",";
+    settings += "\"session_end\":" + (string)Inp_SessionEndHour + ",";
+    settings += "\"reset_hour\":" + (string)Inp_ResetHour + ",";
+    settings += "\"reset_minute\":" + (string)Inp_ResetMinute + ",";
+    settings += "\"export_on_reset\":" + ManifestBool(Inp_ExportOnReset) + "},";
+    settings += "\"risk\":{";
+    settings += "\"daily_max_drawdown\":" + DoubleToString(Inp_DailyMaxDrawdown, 2) + ",";
+    settings += "\"daily_profit_target\":" + DoubleToString(Inp_DailyProfitTarget, 2) + ",";
+    settings += "\"scalp_drawdown_ratio\":" + DoubleToString(Inp_ScalpDrawdownRatio, 2) + ",";
+    settings += "\"trend_drawdown_ratio\":" + DoubleToString(Inp_TrendDrawdownRatio, 2) + ",";
+    settings += "\"weekly_profit_target\":" + DoubleToString(Inp_WeeklyProfitTarget, 2) + ",";
+    settings += "\"consec_loss_limit\":" + (string)Inp_ConsecLossLimit + ",";
+    settings += "\"cooldown_minutes\":" + (string)Inp_CooldownMinutes + ",";
+    settings += "\"enable_circuit_breaker\":" + ManifestBool(Inp_EnableCircuitBreaker) + ",";
+    settings += "\"alert_on_breaker\":" + ManifestBool(Inp_AlertOnBreaker) + "},";
+    settings += "\"scalp\":{";
+    settings += "\"lots\":" + DoubleToString(Inp_ScalpLots, 2) + ",";
+    settings += "\"max_positions\":" + (string)Inp_ScalpMaxPositions + ",";
+    settings += "\"sl_points\":" + (string)Inp_ScalpSL_Points + ",";
+    settings += "\"tp_points\":" + (string)Inp_ScalpTP_Points + ",";
+    settings += "\"be_trigger\":" + (string)Inp_ScalpBETrigger + ",";
+    settings += "\"trail_step\":" + (string)Inp_ScalpTrailStep + ",";
+    settings += "\"time_limit_on\":" + ManifestBool(Inp_ScalpTimeLimitOn) + ",";
+    settings += "\"max_hold_secs\":" + (string)Inp_ScalpMaxHoldSecs + "},";
+    settings += "\"trend\":{";
+    settings += "\"lots\":" + DoubleToString(Inp_TrendLots, 2) + ",";
+    settings += "\"max_positions\":" + (string)Inp_TrendMaxPositions + ",";
+    settings += "\"sl_points\":" + (string)Inp_TrendSL_Points + ",";
+    settings += "\"be1_trigger\":" + (string)Inp_TrendBE1_Trigger + ",";
+    settings += "\"be2_trigger\":" + (string)Inp_TrendBE2_Trigger + ",";
+    settings += "\"be2_lock\":" + (string)Inp_TrendBE2_Lock + ",";
+    settings += "\"be3_trigger\":" + (string)Inp_TrendBE3_Trigger + ",";
+    settings += "\"be3_lock\":" + (string)Inp_TrendBE3_Lock + ",";
+    settings += "\"reduce_percent\":" + DoubleToString(Inp_TrendReducePercent, 2) + ",";
+    settings += "\"trail_trigger\":" + (string)Inp_TrendTrailTrigger + ",";
+    settings += "\"trail_step\":" + (string)Inp_TrendTrailStep + "},";
+    settings += "\"moat\":{";
+    settings += "\"enable\":" + ManifestBool(Inp_EnableProfitProtect) + ",";
+    settings += "\"p1_trigger\":" + DoubleToString(Inp_ProfitProtect1_Trigger, 2) + ",";
+    settings += "\"p1_percent\":" + DoubleToString(Inp_ProfitProtect1_Percent, 2) + ",";
+    settings += "\"p2_trigger\":" + DoubleToString(Inp_ProfitProtect2_Trigger, 2) + ",";
+    settings += "\"p2_amount\":" + DoubleToString(Inp_ProfitProtect2_Amount, 2) + ",";
+    settings += "\"liquidation\":" + DoubleToString(Inp_ProfitLiquidation, 2) + ",";
+    settings += "\"shutdown\":" + DoubleToString(Inp_ProfitShutdown, 2) + "}}";
+
+    string utcNow = IntegerToString((long)TimeGMT());
+    string body = "{";
+    body += "\"schema_version\":1,";
+    body += "\"instance_id\":\"" + (string)AccountInfoInteger(ACCOUNT_LOGIN) + "-" + (string)ChartID() + "\",";
+    body += "\"account_login\":" + (string)AccountInfoInteger(ACCOUNT_LOGIN) + ",";
+    body += "\"server\":\"" + ManifestJsonEscape(AccountInfoString(ACCOUNT_SERVER)) + "\",";
+    body += "\"symbol\":\"" + ManifestJsonEscape(_Symbol) + "\",";
+    body += "\"ea_version\":\"1.03\",";
+    body += "\"updated_utc\":" + utcNow + ",";
+    body += "\"settings\":" + settings + "}";
+
+    string finalPath = InstanceManifestPath();
+    string tempPath = finalPath + ".tmp";
+    int handle = FileOpen(tempPath, FILE_WRITE | FILE_TXT | FILE_ANSI, 0, CP_UTF8);
+    if(handle == INVALID_HANDLE)
     {
-        if(Inp_DebugSync) Print("[Sync Collect] 失败:服务器游标晚于当前时间, cursor_utc=", (long)cursorUtc);
-        return 0;
-    }
-    if(!HistorySelect(fromServer, toServer))
-    {
-        if(Inp_DebugSync) Print("[Sync Collect] HistorySelect失败, cursor_utc=", (long)cursorUtc);
-        return 0;
-    }
-
-    int total = HistoryDealsTotal();
-    long positionIds[];     // 已平仓订单的 position_id 列表
-    datetime closeTimesUtc[]; // 对应每笔订单的平仓成交时间(UTC),用于推进游标
-    datetime openTimesUtc[];  // 对应每笔订单的开仓时间(UTC),传给服务器
-
-    // 第一遍:找出所有平仓成交在游标之后的订单,收集 position_id
-    for(int i = 0; i < total; i++)
-    {
-        ulong ticket = HistoryDealGetTicket(i);
-        if(ticket == 0) continue;
-        long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
-        if(entry != DEAL_ENTRY_OUT) continue;  // 只看平仓成交
-        long posId = HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
-        if(posId == 0) continue;
-
-        datetime closeUtc = ServerTimeToUtc((datetime)HistoryDealGetInteger(ticket, DEAL_TIME));
-        if(closeUtc < cursorUtc) continue;  // 平仓时间在游标之前 → 已同步过,跳过
-
-        // 计算开仓时间(用于传给服务器)
-        datetime openUtc = closeUtc;  // 兜底
-        for(int j = 0; j < total; j++)
-        {
-            ulong dj = HistoryDealGetTicket(j);
-            if(dj == 0) continue;
-            if(HistoryDealGetInteger(dj, DEAL_POSITION_ID) != posId) continue;
-            long e = HistoryDealGetInteger(dj, DEAL_ENTRY);
-            if(e != DEAL_ENTRY_IN && e != DEAL_ENTRY_INOUT) continue;
-            datetime t = ServerTimeToUtc((datetime)HistoryDealGetInteger(dj, DEAL_TIME));
-            if(t < openUtc) openUtc = t;  // 取最早的开仓时间
-        }
-
-        // 检查是否已存在(一个position可能有多次平仓如减仓,取最晚的平仓时间)
-        int idx = -1;
-        for(int j = 0; j < ArraySize(positionIds); j++)
-            if(positionIds[j] == posId) { idx = j; break; }
-        if(idx < 0)
-        {
-            int n = ArraySize(positionIds);
-            ArrayResize(positionIds, n + 1);
-            ArrayResize(closeTimesUtc, n + 1);
-            ArrayResize(openTimesUtc, n + 1);
-            positionIds[n] = posId;
-            closeTimesUtc[n] = closeUtc;
-            openTimesUtc[n] = openUtc;
-        }
-        else if(closeUtc > closeTimesUtc[idx])
-        {
-            closeTimesUtc[idx] = closeUtc;  // 更新为最晚的平仓时间
-        }
-    }
-
-    // 第二遍:为每个已平仓订单序列化其全部成交(开仓/减仓/平仓等),时间字段全部UTC
-    // HistorySelect范围就是游标到现在,所以在范围内的成交都能找到;
-    // 但开仓成交可能早于游标(跨游标区间的订单),需要扩大范围才能拿到开仓成交。
-    // 稳妥做法:扩大 HistorySelect 到 30 天前,确保开仓成交也在范围内。
-    datetime wideFrom = fromServer - 30 * 86400;
-    if(HistorySelect(wideFrom, toServer)) total = HistoryDealsTotal();
-
-    for(int i = 0; i < total; i++)
-    {
-        ulong dealTicket = HistoryDealGetTicket(i);
-        if(dealTicket == 0) continue;
-        long posId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-        int posIndex = -1;
-        for(int j = 0; j < ArraySize(positionIds); j++)
-            if(positionIds[j] == posId) { posIndex = j; break; }
-        if(posIndex < 0) continue;  // 不是目标订单
-
-        datetime openTimeUtc = openTimesUtc[posIndex];
-        datetime closeTimeUtc = closeTimesUtc[posIndex];
-        datetime dealTimeUtc = ServerTimeToUtc((datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME));
-        if(closeTimeUtc > latestCloseTimeUtc) latestCloseTimeUtc = closeTimeUtc;
-
-        long orderId = HistoryDealGetInteger(dealTicket, DEAL_ORDER);
-        string symbol = JsonEscape(HistoryDealGetString(dealTicket, DEAL_SYMBOL));
-        long entry = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
-        long type = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
-        double volume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
-        double price = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
-        double sl = HistoryDealGetDouble(dealTicket, DEAL_SL);
-        double tp = HistoryDealGetDouble(dealTicket, DEAL_TP);
-        double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
-        double swap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
-        double commission = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
-        long magic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
-        string comment = JsonEscape(HistoryDealGetString(dealTicket, DEAL_COMMENT));
-
-        string json = StringFormat(
-            "{" +
-            "\"ticket\":%I64d,\"position_id\":%I64d,\"order_id\":%I64d," +
-            "\"symbol\":\"%s\",\"entry\":%d,\"type\":%d," +
-            "\"volume\":%.2f,\"price\":%.5f,\"sl_price\":%.5f,\"tp_price\":%.5f," +
-            "\"profit\":%.2f,\"swap\":%.2f,\"commission\":%.2f," +
-            "\"magic\":%I64d,\"comment\":\"%s\"," +
-            "\"open_time\":%I64d,\"deal_time\":%I64d" +
-            "}",
-            dealTicket, posId, orderId, symbol, entry, type,
-            volume, price, sl, tp, profit, swap, commission, magic, comment,
-            (long)openTimeUtc, (long)dealTimeUtc);
-
-        int n = ArraySize(dealsJson);
-        ArrayResize(dealsJson, n + 1);
-        dealsJson[n] = json;
-    }
-
-    collectionOK = true;
-    return ArraySize(dealsJson);
-}
-// 成交全部被服务器接受后，再用单独请求推进“最后开仓时间”游标。
-
-// 分批上传成交到服务器
-bool UploadDealsBatch(const string &dealsJson[], int startIndex, int batchCount, int batchNumber)
-{
-    string bodyDeals = "";
-    for(int i = 0; i < batchCount; i++)
-    {
-        if(i > 0) bodyDeals += ",";
-        bodyDeals += dealsJson[startIndex + i];
-    }
-
-    long login = AccountInfoInteger(ACCOUNT_LOGIN);
-    string body = StringFormat("{\"mt5_login\":%I64d,\"deals\":[%s]}", login, bodyDeals);
-    long timestamp = TimeGMT();
-    string headers = SyncHeaders(body, timestamp);
-
-    char post[], result[];
-    StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
-    ArrayResize(post, ArraySize(post) - 1);
-    string url = Inp_ApiBaseURL + "/api/v1/ingest/deals";
-    string responseHeaders = "";
-    ResetLastError();
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
-    int webError = GetLastError();
-    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
-    if(Inp_DebugSync)
-        Print("[Sync Deals] 批次", batchNumber, " | 数量=", batchCount,
-              " | HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
-    return (res >= 200 && res < 300);
-}
-
-bool UpdateServerLastSyncTime(datetime latestCloseTimeUtc)
-{
-    long login = AccountInfoInteger(ACCOUNT_LOGIN);
-    string body = StringFormat("{\"mt5_login\":%I64d,\"last_sync_time\":%I64d}", login, (long)latestCloseTimeUtc);
-    long timestamp = TimeGMT();
-    string headers = SyncHeaders(body, timestamp);
-
-    char post[], result[];
-    StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
-    ArrayResize(post, ArraySize(post) - 1);
-    string url = Inp_ApiBaseURL + "/api/v1/sync/update_last_sync_time";
-    string responseHeaders = "";
-    ResetLastError();
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
-    int webError = GetLastError();
-    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
-    if(Inp_DebugSync)
-        Print("[Sync Cursor] 更新平仓时间游标(UTC)=", (long)latestCloseTimeUtc,
-              " | HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
-    return (res >= 200 && res < 300);
-}
-
-// 上传成交批次；所有批次成功后才提交平仓时间游标。
-bool SyncDeals()
-{
-    if(!Inp_EnableSync || Inp_SecretKey == "")
-    {
-        if(Inp_DebugSync) Print("[Sync Deals] 跳过:同步未启用或服务器密钥为空");
+        PrintFormat("[Instance Manifest] 写入失败，错误=%d", GetLastError());
         return false;
     }
-    if(g_SyncInProgress)
+    FileWriteString(handle, body);
+    FileFlush(handle);
+    FileClose(handle);
+    if(!FileMove(tempPath, 0, finalPath, FILE_REWRITE))
     {
-        if(Inp_DebugSync) Print("[Sync Deals] 跳过:已有同步任务执行中");
+        PrintFormat("[Instance Manifest] 原子替换失败，错误=%d", GetLastError());
+        FileDelete(tempPath);
         return false;
     }
-    g_SyncInProgress = true;
-    if(Inp_DebugSync) Print("[Sync Deals] ========== 开始同步成交(UTC/平仓游标) ==========");
-
-    datetime cursorUtc = GetServerLastSyncTime();
-    bool cursorQueryOK = g_LastSyncQueryOK;
-    if(!cursorQueryOK || cursorUtc == 0)
-    {
-        cursorUtc = TimeGMT() - 7 * 86400;
-        if(Inp_DebugSync)
-            Print("[Sync Deals] ", cursorQueryOK ? "首次同步" : "游标获取失败",
-                  ",按近7日回溯,起点UTC=", (long)cursorUtc);
-    }
-
-    string deals[];
-    datetime latestCloseTimeUtc = 0;
-    bool collectionOK = false;
-    int count = CollectDealsAfterCloseTime(cursorUtc, deals, latestCloseTimeUtc, collectionOK);
-    if(!collectionOK)
-    {
-        g_SyncInProgress = false;
-        if(Inp_DebugSync) Print("[Sync Deals] 失败:MT5历史成交读取失败");
-        return false;
-    }
-
-    if(count == 0)
-    {
-        g_SyncInProgress = false;
-        if(!cursorQueryOK)
-        {
-            if(Inp_DebugSync) Print("[Sync Deals] 失败:游标查询失败且近7日无可提交订单");
-            return false;
-        }
-        g_LastSyncTime = TimeCurrent();
-        if(Inp_DebugSync) Print("[Sync Deals] 完成:没有新订单,服务器游标已核对");
-        return true;
-    }
-
-    int batchLimit = Inp_MaxBatchSize;
-    if(batchLimit < 1) batchLimit = 1;
-    if(batchLimit > 1000) batchLimit = 1000;
-    int batchNumber = 0;
-    for(int start = 0; start < count; start += batchLimit)
-    {
-        batchNumber++;
-        int batchCount = MathMin(batchLimit, count - start);
-        if(!UploadDealsBatch(deals, start, batchCount, batchNumber))
-        {
-            g_SyncInProgress = false;
-            if(Inp_DebugSync) Print("[Sync Deals] 失败:批次上传未全部完成,不推进游标");
-            return false;
-        }
-    }
-
-    if(latestCloseTimeUtc <= 0 || !UpdateServerLastSyncTime(latestCloseTimeUtc))
-    {
-        g_SyncInProgress = false;
-        if(Inp_DebugSync) Print("[Sync Deals] 失败:成交已上传但游标更新失败,下次将幂等重传");
-        return false;
-    }
-
-    g_ServerLastSyncTime = latestCloseTimeUtc;
-    g_LastSyncTime = TimeCurrent();
-    g_SyncInProgress = false;
-    if(Inp_DebugSync)
-        Print("[Sync Deals] 完成:上传", count, "笔成交,最后平仓时间游标UTC=", (long)latestCloseTimeUtc);
     return true;
-}
-
-// 上传品种规格
-bool SyncSymbols()
-{
-    if(Inp_DebugSync) Print("[Sync Symbols] ========== 开始同步品种规格 ==========");
-    if(!Inp_EnableSync)
-    {
-        if(Inp_DebugSync) Print("[Sync Symbols] 跳过:订单同步未启用");
-        return false;
-    }
-    if(Inp_SecretKey == "")
-    {
-        if(Inp_DebugSync) Print("[Sync Symbols] 失败:账户密钥为空");
-        return false;
-    }
-
-    long login = AccountInfoInteger(ACCOUNT_LOGIN);
-    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
-    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-
-    string body = StringFormat(
-        "{\"mt5_login\":%I64d,\"symbols\":[{\"name\":\"%s\",\"digits\":%d,\"point\":%.10f," +
-        "\"tick_value\":%.5f,\"contract_size\":%.2f}]}",
-        login, _Symbol, digits, point, tickValue, contractSize
-    );
-
-    long timestamp = TimeGMT();
-    string headers = SyncHeaders(body, timestamp);
-
-    char post[], result[];
-    StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
-    ArrayResize(post, ArraySize(post) - 1);
-
-    string url = Inp_ApiBaseURL + "/api/v1/ingest/symbols";
-    if(Inp_DebugSync)
-        Print("[Sync Symbols] POST ", url, " | 品种=", _Symbol, " | digits=", digits,
-              " | point=", DoubleToString(point, digits), " | 请求字节=", ArraySize(post));
-
-    string responseHeaders = "";
-    ResetLastError();
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
-    int webError = GetLastError();
-    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
-
-    if(Inp_DebugSync)
-        Print("[Sync Symbols] HTTP=", res, " | MT5错误=", webError, " | 响应=", response);
-
-    if(res == 200)
-    {
-        if(Inp_DebugSync)
-            Print("[Sync Symbols] 完成:品种规格同步成功");
-        return true;
-    }
-    if(Inp_DebugSync) Print("[Sync Symbols] 失败:品种规格未被服务器接受");
-    return false;
-}
-
-// 上传账户快照
-bool SyncSnapshot()
-{
-    if(Inp_DebugSync) Print("[Sync Snapshot] ========== 开始同步账户快照 ==========");
-    if(!Inp_EnableSync)
-    {
-        if(Inp_DebugSync) Print("[Sync Snapshot] 跳过:订单同步未启用");
-        return false;
-    }
-    if(Inp_SecretKey == "")
-    {
-        if(Inp_DebugSync) Print("[Sync Snapshot] 失败:账户密钥为空");
-        return false;
-    }
-
-    long login = AccountInfoInteger(ACCOUNT_LOGIN);
-    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-    double margin = AccountInfoDouble(ACCOUNT_MARGIN);
-    double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
-    datetime timestamp = TimeGMT();
-
-    string body = StringFormat(
-        "{\"mt5_login\":%I64d,\"snapshots\":[{\"balance\":%.2f,\"equity\":%.2f," +
-        "\"margin\":%.2f,\"free_margin\":%.2f,\"snapshot_time\":%I64d}]}",
-        login, balance, equity, margin, freeMargin, (long)timestamp
-    );
-
-    long ts = TimeGMT();
-    string headers = SyncHeaders(body, ts);
-
-    char post[], result[];
-    StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
-    ArrayResize(post, ArraySize(post) - 1);
-
-    string url = Inp_ApiBaseURL + "/api/v1/ingest/snapshots";
-    if(Inp_DebugSync)
-        Print("[Sync Snapshot] POST ", url, " | balance=", DoubleToString(balance, 2),
-              " | equity=", DoubleToString(equity, 2), " | 请求字节=", ArraySize(post));
-
-    string responseHeaders = "";
-    ResetLastError();
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
-    int webError = GetLastError();
-    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
-    bool ok = (res == 200);
-
-    if(Inp_DebugSync)
-        Print("[Sync Snapshot] ", ok ? "完成" : "失败", ":HTTP=", res,
-              " | MT5错误=", webError, " | 响应=", response);
-
-    return ok;
-}
-
-// 上传EA配置参数快照
-bool SyncSettings()
-{
-    if(Inp_DebugSync) Print("[Sync Settings] ========== 开始上传EA参数配置 ==========");
-    if(!Inp_EnableSync)
-    {
-        if(Inp_DebugSync) Print("[Sync Settings] 跳过:订单同步未启用");
-        return false;
-    }
-    if(Inp_SecretKey == "")
-    {
-        if(Inp_DebugSync) Print("[Sync Settings] 失败:账户密钥为空");
-        return false;
-    }
-
-    long login = AccountInfoInteger(ACCOUNT_LOGIN);
-
-    // 构造 settings JSON 对象(所有关键输入参数),按分类组织
-    string settings = StringFormat(
-        "{" +
-        "\"basic\":{" +
-            "\"magic\":%I64d,\"magic_scalp\":%I64d,\"magic_trend\":%I64d," +
-            "\"comment_scalp\":\"%s\",\"comment_trend\":\"%s\"," +
-            \"slippage\":%d,\"refresh_seconds\":%d," +
-            \"ui_scale\":%.2f," +
-            \"use_session\":%s,\"session_start\":%d,\"session_end\":%d," +
-            \"reset_hour\":%d,\"reset_minute\":%d," +
-            \"export_on_reset\":%s" +
-        "}," +
-        "\"risk\":{" +
-            \"daily_max_drawdown\":%.2f,\"daily_profit_target\":%.2f," +
-            \"scalp_drawdown_ratio\":%.2f,\"trend_drawdown_ratio\":%.2f," +
-            \"weekly_profit_target\":%.2f," +
-            \"consec_loss_limit\":%d,\"cooldown_minutes\":%d," +
-            \"enable_circuit_breaker\":%s,\"alert_on_breaker\":%s" +
-        "}," +
-        "\"scalp\":{" +
-            \"lots\":%.2f,\"max_positions\":%d," +
-            \"sl_points\":%d,\"tp_points\":%d," +
-            \"be_trigger\":%d,\"trail_step\":%d," +
-            \"time_limit_on\":%s,\"max_hold_secs\":%d" +
-        "}," +
-        \"trend\":{" +
-            \"lots\":%.2f,\"max_positions\":%d," +
-            \"sl_points\":%d," +
-            \"be1_trigger\":%d,\"be2_trigger\":%d,\"be2_lock\":%d," +
-            \"be3_trigger\":%d,\"be3_lock\":%d," +
-            \"reduce_percent\":%.2f," +
-            \"trail_trigger\":%d,\"trail_step\":%d" +
-        "}," +
-        "\"moat\":{" +
-            \"enable\":%s," +
-            \"p1_trigger\":%.2f,\"p1_percent\":%.2f," +
-            \"p2_trigger\":%.2f,\"p2_amount\":%.2f," +
-            \"liquidation\":%.2f,\"shutdown\":%.2f" +
-        "}," +
-        "\"sync\":{" +
-            \"enable\":%s,\"api_base_url\":\"%s\"," +
-            \"sync_interval_min\":%d,\"request_timeout_ms\":%d," +
-            \"max_batch_size\":%d,\"debug\":%s" +
-        "}" +
-        "}",
-        // basic
-        Inp_Magic, Inp_MagicScalp, Inp_MagicTrend,
-        JsonEscape(Inp_CommentScalp), JsonEscape(Inp_CommentTrend),
-        Inp_Slippage, Inp_RefreshSeconds,
-        Inp_UIScale,
-        (Inp_UseSession ? "true" : "false"), Inp_SessionStartHour, Inp_SessionEndHour,
-        Inp_ResetHour, Inp_ResetMinute,
-        (Inp_ExportOnReset ? "true" : "false"),
-        // risk
-        Inp_DailyMaxDrawdown, Inp_DailyProfitTarget,
-        Inp_ScalpDrawdownRatio, Inp_TrendDrawdownRatio,
-        Inp_WeeklyProfitTarget,
-        Inp_ConsecLossLimit, Inp_CooldownMinutes,
-        (Inp_EnableCircuitBreaker ? "true" : "false"), (Inp_AlertOnBreaker ? "true" : "false"),
-        // scalp
-        Inp_ScalpLots, Inp_ScalpMaxPositions,
-        Inp_ScalpSL_Points, Inp_ScalpTP_Points,
-        Inp_ScalpBETrigger, Inp_ScalpTrailStep,
-        (Inp_ScalpTimeLimitOn ? "true" : "false"), Inp_ScalpMaxHoldSecs,
-        // trend
-        Inp_TrendLots, Inp_TrendMaxPositions,
-        Inp_TrendSL_Points,
-        Inp_TrendBE1_Trigger, Inp_TrendBE2_Trigger, Inp_TrendBE2_Lock,
-        Inp_TrendBE3_Trigger, Inp_TrendBE3_Lock,
-        Inp_TrendReducePercent,
-        Inp_TrendTrailTrigger, Inp_TrendTrailStep,
-        // moat
-        (Inp_EnableProfitProtect ? "true" : "false"),
-        Inp_ProfitProtect1_Trigger, Inp_ProfitProtect1_Percent,
-        Inp_ProfitProtect2_Trigger, Inp_ProfitProtect2_Amount,
-        Inp_ProfitLiquidation, Inp_ProfitShutdown,
-        // sync
-        (Inp_EnableSync ? "true" : "false"), JsonEscape(Inp_ApiBaseURL),
-        Inp_SyncIntervalMin, Inp_RequestTimeoutMS,
-        Inp_MaxBatchSize, (Inp_DebugSync ? "true" : "false")
-    );
-
-    long timestamp = TimeGMT();
-    string body = StringFormat("{\"mt5_login\":%I64d,\"snapshot_time\":%I64d,\"settings\":%s}",
-                              login, timestamp, settings);
-
-    string headers = SyncHeaders(body, timestamp);
-
-    char post[], result[];
-    StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
-    ArrayResize(post, ArraySize(post) - 1);
-
-    string url = Inp_ApiBaseURL + "/api/v1/ingest/settings";
-    if(Inp_DebugSync)
-        Print("[Sync Settings] POST ", url, " | 请求字节=", ArraySize(post));
-
-    string responseHeaders = "";
-    ResetLastError();
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
-    int webError = GetLastError();
-    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
-    bool ok = (res >= 200 && res < 300);
-
-    if(Inp_DebugSync)
-        Print("[Sync Settings] ", ok ? "完成" : "失败", ":HTTP=", res,
-              " | MT5错误=", webError, " | 响应=", response);
-
-    return ok;
-}
-
-// 发送心跳
-bool SyncHeartbeat()
-{
-    if(Inp_DebugSync) Print("[Sync Heartbeat] ========== 开始发送心跳 ==========");
-    if(!Inp_EnableSync)
-    {
-        if(Inp_DebugSync) Print("[Sync Heartbeat] 跳过:订单同步未启用");
-        return false;
-    }
-    if(Inp_SecretKey == "")
-    {
-        if(Inp_DebugSync) Print("[Sync Heartbeat] 失败:账户密钥为空");
-        return false;
-    }
-
-    long login = AccountInfoInteger(ACCOUNT_LOGIN);
-    string body = StringFormat("{\"mt5_login\":%I64d}", login);
-
-    long timestamp = TimeGMT();
-    string headers = SyncHeaders(body, timestamp);
-
-    char post[], result[];
-    StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8);
-    ArrayResize(post, ArraySize(post) - 1);
-
-    string url = Inp_ApiBaseURL + "/api/v1/ingest/heartbeat";
-    if(Inp_DebugSync)
-        Print("[Sync Heartbeat] POST ", url, " | 账户=", login, " | 请求字节=", ArraySize(post));
-
-    string responseHeaders = "";
-    ResetLastError();
-    int res = WebRequest("POST", url, headers, Inp_RequestTimeoutMS, post, result, responseHeaders);
-    int webError = GetLastError();
-    string response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
-    bool ok = (res == 200);
-
-    if(Inp_DebugSync)
-        Print("[Sync Heartbeat] ", ok ? "完成" : "失败", ":HTTP=", res,
-              " | MT5错误=", webError, " | 响应=", response);
-
-    return ok;
 }
 
 //+------------------------------------------------------------------+
@@ -4021,48 +3650,13 @@ int OnInit()
 
     ChartSetInteger(0, CHART_EVENT_OBJECT_CREATE, true);
     ChartSetInteger(0, CHART_EVENT_OBJECT_DELETE, true);
+    ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, true);
 
     CheckAllRiskControl();
     RenderPerfectUI();
+    PublishInstanceManifest();
 
     EventSetTimer(MathMax(1, Inp_RefreshSeconds));
-
-    // 数据同步初始化:启用后立即执行一次,不等待首个定时周期
-    g_LastSyncTime = 0;
-    g_ServerLastSyncTime = 0;
-    g_SyncTimerCounter = 0;
-    g_AlignTimerCounter = 0;
-
-    if(Inp_EnableSync)
-    {
-        if(Inp_SecretKey == "")
-        {
-            Print("[Sync Init] 初始化失败:已启用订单同步,但账户密钥为空");
-        }
-        else
-        {
-            if(Inp_DebugSync)
-                Print("[Sync Init] ========== 数据同步模块启动 ==========",
-                      " | API=", Inp_ApiBaseURL, " | 周期=", Inp_SyncIntervalMin, "分钟");
-
-            if(Inp_DebugSync) Print("[Sync Init] 步骤1/2:上传当前品种规格");
-            bool symbolOk = SyncSymbols();
-
-            if(Inp_DebugSync) Print("[Sync Init] 步骤2/2:立即同步成交");
-            bool dealsOk = SyncDeals();
-            if(Inp_DebugSync) Print("[Sync Init] 步骤3/3:上传EA参数配置");
-            bool settingsOk = SyncSettings();
-
-            if(Inp_DebugSync)
-                Print("[Sync Init] 初始化完成 | 品种规格=", symbolOk ? "成功" : "失败",
-                      " | 成交同步=", dealsOk ? "成功" : "失败",
-                      " | 下次同步=", Inp_SyncIntervalMin, "分钟后");
-
-            // 立即刷新标题栏同步状态。
-            RenderPerfectUI();
-            ChartRedraw();
-        }
-    }
 
     return INIT_SUCCEEDED;
 }
@@ -4081,57 +3675,19 @@ void OnTick()
     CheckAllRiskControl();
 
     // 每tick更新报价条(不重建整个面板,避免打字被打断)
-    if(!g_Collapsed) UpdateQuoteBar();
+    UpdateQuoteBar(); // 紧凑面板也需要实时报价
 }
 
 void OnTimer()
 {
+    static int manifestSeconds = 0;
     CheckAllRiskControl();
     RenderPerfectUI();
-
-    // 数据同步定时器(按实际定时器周期累计秒数)
-    if(Inp_EnableSync)
+    manifestSeconds += MathMax(1, Inp_RefreshSeconds);
+    if(manifestSeconds >= 60)
     {
-        int timerStep = MathMax(1, Inp_RefreshSeconds);
-        g_SyncTimerCounter += timerStep;
-        g_AlignTimerCounter += timerStep;
-
-        // 每N分钟常规同步成交
-        int syncInterval = MathMax(1, Inp_SyncIntervalMin * 60); // 转换为秒
-        if(g_SyncTimerCounter >= syncInterval)
-        {
-            g_SyncTimerCounter = 0;
-            SyncDeals();
-            RenderPerfectUI();
-            ChartRedraw();
-        }
-
-        // 每30秒上传一次快照(净值曲线)
-        static int snapshotCounter = 0;
-        snapshotCounter += timerStep;
-        if(snapshotCounter >= 30)
-        {
-            snapshotCounter = 0;
-            SyncSnapshot();
-        }
-
-        // 每5分钟发送一次心跳
-        static int heartbeatCounter = 0;
-        heartbeatCounter += timerStep;
-        if(heartbeatCounter >= 300)
-        {
-            heartbeatCounter = 0;
-            SyncHeartbeat();
-        }
-
-        // 每小时上传一次EA参数配置
-        static int settingsCounter = 0;
-        settingsCounter += timerStep;
-        if(settingsCounter >= 3600)
-        {
-            settingsCounter = 0;
-            SyncSettings();
-        }
+        manifestSeconds = 0;
+        PublishInstanceManifest();
     }
 }
 
@@ -4139,9 +3695,6 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 {
     if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
     {
-        // 增量同步版本：不需要在这里入队，由定时器统一同步
-        // OnTimer 会定期调用 SyncDeals()，自动获取服务器最后同步时间后的所有成交
-
         CheckAllRiskControl();
         RenderPerfectUI();
     }
@@ -4150,8 +3703,86 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 //+------------------------------------------------------------------+
 //| 图表事件:按钮点击                                                |
 //+------------------------------------------------------------------+
+// 在实际控件矩形内显示手型；文字命中范围按其锚点换算。
+void UpdateHoverCursor(int mouseX, int mouseY)
+{
+    if(!MQLInfoInteger(MQL_DLLS_ALLOWED))
+    {
+        static bool notified = false;
+        if(!notified)
+        {
+            Print("[UI Cursor] 手型鼠标需要在 EA 属性中启用允许 DLL 导入。");
+            notified = true;
+        }
+        return;
+    }
+    bool hand = false;
+    for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+    {
+        string obj = ObjectName(0, i);
+        if(StringFind(obj, Prefix) != 0) continue;
+        string name = StringSubstr(obj, StringLen(Prefix));
+        ENUM_OBJECT type = (ENUM_OBJECT)ObjectGetInteger(0, obj, OBJPROP_TYPE);
+        bool clickable = (type == OBJ_BUTTON) || name == "Title" || name == "Version" ||
+                         name == "C1_Real_Left" || name == "C1_Real_Right" ||
+                         name == "Sc_Orders_Left" || name == "Sc_Orders_Right" ||
+                         name == "Tr_Orders_Left" || name == "Tr_Orders_Right";
+        if(!clickable || (color)ObjectGetInteger(0, obj, OBJPROP_COLOR) == COLOR_BTN_DISABLED_TXT) continue;
+        int x = (int)ObjectGetInteger(0, obj, OBJPROP_XDISTANCE);
+        int y = (int)ObjectGetInteger(0, obj, OBJPROP_YDISTANCE);
+        int w = (int)ObjectGetInteger(0, obj, OBJPROP_XSIZE);
+        int h = (int)ObjectGetInteger(0, obj, OBJPROP_YSIZE);
+        if(type == OBJ_LABEL)
+        {
+            int anchor = (int)ObjectGetInteger(0, obj, OBJPROP_ANCHOR);
+            if(anchor == ANCHOR_RIGHT || anchor == ANCHOR_RIGHT_UPPER || anchor == ANCHOR_RIGHT_LOWER) x -= w;
+            else if(anchor == ANCHOR_CENTER || anchor == ANCHOR_UPPER || anchor == ANCHOR_LOWER) x -= w / 2;
+            if(anchor == ANCHOR_LEFT_LOWER || anchor == ANCHOR_LOWER || anchor == ANCHOR_RIGHT_LOWER) y -= h;
+            else if(anchor == ANCHOR_LEFT || anchor == ANCHOR_CENTER || anchor == ANCHOR_RIGHT) y -= h / 2;
+        }
+        if(mouseX >= x && mouseX < x + w && mouseY >= y && mouseY < y + h)
+        {
+            hand = true;
+            break;
+        }
+    }
+    static long handCursor = 0, arrowCursor = 0;
+    if(handCursor == 0) handCursor = LoadCursorW(0, 32649); // IDC_HAND
+    if(arrowCursor == 0) arrowCursor = LoadCursorW(0, 32512); // IDC_ARROW
+    long cursor = hand ? handCursor : arrowCursor;
+    if(cursor == 0) return;
+    // EA 工作线程与图表 UI 线程不同，临时共享输入状态后设置窗口鼠标。
+    // 立即解除连接，不将交易事件线程长期绑定到 UI 线程。
+    uint processId = 0;
+    uint uiThread = GetWindowThreadProcessId(ChartGetInteger(0, CHART_WINDOW_HANDLE), processId);
+    uint eaThread = GetCurrentThreadId();
+    if(uiThread == 0) return;
+    if(uiThread == eaThread) { SetCursor(cursor); return; }
+    if(AttachThreadInput(eaThread, uiThread, 1) != 0)
+    {
+        SetCursor(cursor);
+        AttachThreadInput(eaThread, uiThread, 0);
+    }
+    else
+    {
+        static bool attachReported = false;
+        if(!attachReported)
+        {
+            Print("[UI Cursor] 无法连接图表输入线程，手型切换未生效。");
+            attachReported = true;
+        }
+    }
+}
+
 void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
 {
+    if(id == CHARTEVENT_MOUSE_MOVE)
+    {
+        // MT5 的窗口光标处理会覆盖 EA 线程的 SetCursor，造成手型/箭头交替闪烁。
+        // 停用该路径，等待窗口级光标处理实现后再启用手型。
+        return;
+    }
+
     // 点击价格输入框后进入编辑保护状态。在收到 ENDEDIT 前不重建整套UI。
     if(id == CHARTEVENT_OBJECT_CLICK &&
        (sparam == Prefix + "Edt_Sc_Price" || sparam == Prefix + "Edt_Tr_Price"))
@@ -4198,6 +3829,8 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
     // 折叠/展开
     if(sparam == Prefix + "Btn_Fold")
     {
+        // 仅在切换布局时重建对象，确保背景不会覆盖复用的旧按钮。
+        ObjectsDeleteAll(0, Prefix);
         g_Collapsed = !g_Collapsed;
         if(g_Collapsed) g_ShowDetails = false;
         RenderPerfectUI();
@@ -4208,24 +3841,41 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
     if(sparam == Prefix + "Btn_Stat_Open")  { g_ShowStats = !g_ShowStats; ResetBtn(sparam); RenderPerfectUI(); return; }
     if(sparam == Prefix + "Btn_Stat_Close") { g_ShowStats = false; ResetBtn(sparam); RenderPerfectUI(); return; }
 
-    // 更新日志舱开/关（点击版本号）
-    if(sparam == Prefix + "Version")
+    // 更新日志舱开/关（点击标题或版本号）
+    if(sparam == Prefix + "Version" || sparam == Prefix + "Title" || sparam == Prefix + "BrandLogo")
     {
         g_ShowChangelog = !g_ShowChangelog;
         RenderPerfectUI();
         return;
     }
-    if(sparam == Prefix + "Btn_CL_Close") { g_ShowChangelog = false; ResetBtn(sparam); RenderPerfectUI(); return; }
-
-    // 更新日志：版本切换按钮
-    if(StringFind(sparam, Prefix + "Btn_CL_Ver_") == 0)
+    if(sparam == Prefix + "CL_Website")
     {
-        string ver = StringSubstr(sparam, StringLen(Prefix + "Btn_CL_Ver_"));
-        g_ChangelogVer = ver;
+        ResetBtn(sparam);
+        if(!MQLInfoInteger(MQL_DLLS_ALLOWED))
+        {
+            Alert(Lang("打开官网需要在 EA 属性中勾选允许 DLL 导入。官网：https://www.tradeez.cn",
+                       "Enable Allow DLL imports in EA properties to open https://www.tradeez.cn"));
+            return;
+        }
+        long result = ShellExecuteW(0, "open", "https://www.tradeez.cn", "", "", 1);
+        if(result <= 32)
+            Alert(Lang("无法打开默认浏览器，请手动访问 https://www.tradeez.cn，错误码：",
+                       "Unable to open browser. Visit https://www.tradeez.cn manually. Error: ") + (string)result);
+        return;
+    }
+    if(sparam == Prefix + "Btn_CL_Close") { g_ShowChangelog = false; ResetBtn(sparam); RenderPerfectUI(); return; }
+    if(StringFind(sparam, Prefix + "Btn_CL_Select_") == 0)
+    {
+        int selected = (int)StringToInteger(StringSubstr(sparam, StringLen(Prefix + "Btn_CL_Select_")));
+        ReleaseNote notes[];
+        LoadReleaseNotes(notes);
+        if(selected >= 0 && selected < MathMin(ArraySize(notes), RELEASE_HISTORY_LIMIT))
+            g_ReleaseSelected = selected;
         ResetBtn(sparam);
         RenderPerfectUI();
         return;
     }
+
 
     // 明细舱:点击"今日实现盈亏"→ 展示今日全部平仓单(含手动)
     if(sparam == Prefix + "C1_Real_Left" || sparam == Prefix + "C1_Real_Right")
@@ -4310,6 +3960,21 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
     // 重置统计基线
     if(sparam == Prefix + "Btn_Reset_All")
     {
+        ResetBtn(sparam);
+        string confirmation = Lang(
+            "您想从现在开始，重新记录本轮交易表现吗？\n\n"
+            "重置后，将以当前账户余额作为新的统计基准，重新累计本轮盈亏与盈利高点，并清除连亏计数、冷却时间及风控锁定。\n\n"
+            "请放心，这不会平仓、撤单、修改已有止损止盈，也不会删除账户交易记录。已有持仓的浮动盈亏仍会参与风控，必要时可能再次触发限制。\n\n"
+            "温馨提示：确认窗口停留期间，本 EA 的动态风控会暂停处理，请及时选择；如有持仓，建议先取消，待合适时再操作。\n\n"
+            "确认开始新的统计吗？选择“否”将保持现状。",
+            "Would you like to start a fresh tracking period now?\n\n"
+            "This uses the current balance as the new baseline, restarts tracked P/L and peaks, and clears the loss streak, cooldown and risk locks.\n\n"
+            "No positions or pending orders will be closed, SL/TP will stay unchanged, and account trade history will be preserved. Existing floating P/L still counts toward risk limits and may trigger them again.\n\n"
+            "Please respond promptly: this dialog pauses this EA's dynamic risk handling. With open positions, consider cancelling and returning later.\n\n"
+            "Start fresh? Choose No to leave everything unchanged.");
+        if(MessageBox(confirmation, Lang("重新开始统计", "Start a fresh tracking period"),
+                      MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+            return;
         g_ResetTime       = TimeCurrent();
         g_TodayHighProfit = 0.0;
         g_HighInit        = false;
