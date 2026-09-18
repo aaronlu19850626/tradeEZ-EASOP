@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  最后修改时间：2026-09-19 03:11（北京时间）       |
+//|                  最后修改时间：2026-09-19 03:51（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -235,6 +235,30 @@ enum ENUM_SCALP_TP_POLICY
     SCALP_TP_REMOVED        = 2
 };
 
+// 交易请求闭环：函数返回 true 只表示请求已提交，最终结果必须由服务器事实核销。
+enum ENUM_TRADE_OP_ACTION
+{
+    TRADE_OP_OPEN_MARKET   = 1,
+    TRADE_OP_OPEN_LIMIT    = 2,
+    TRADE_OP_CLOSE         = 3,
+    TRADE_OP_PARTIAL_CLOSE = 4,
+    TRADE_OP_DELETE_ORDER  = 5,
+    TRADE_OP_MODIFY        = 6,
+    TRADE_OP_MODIFY_ORDER  = 7
+};
+
+enum ENUM_TRADE_OP_STATE
+{
+    TRADE_OP_CREATED   = 0,
+    TRADE_OP_SUBMITTED = 1,
+    TRADE_OP_ACCEPTED  = 2,
+    TRADE_OP_PARTIAL   = 3,
+    TRADE_OP_CONFIRMED = 4,
+    TRADE_OP_FAILED    = 5,
+    TRADE_OP_AMBIGUOUS = 6,
+    TRADE_OP_CANCELLED = 7
+};
+
 //+------------------------------------------------------------------+
 //| 全局状态                                                          |
 //+------------------------------------------------------------------+
@@ -333,6 +357,39 @@ double         g_ScalpTrackLoggedPeak[];  // 仅用于日志限频，不参与�
 
 // 数组状态变化标记(脏则下次落盘,避免每 tick 写文件)
 bool           g_ArraysDirty = false;
+
+struct TradeOperation
+{
+    string   operation_id;
+    string   batch_id;
+    string   source;
+    int      action;
+    int      state;
+    ulong    target_ticket;
+    ulong    target_position_id;
+    long     magic;
+    double   requested_volume;
+    double   target_remaining_volume;
+    double   target_sl;
+    double   target_tp;
+    ulong    request_id;
+    ulong    order_ticket;
+    ulong    deal_ticket;
+    uint     last_retcode;
+    int      retry_count;
+    long     created_utc_msc;
+    long     last_submit_utc_msc;
+    long     next_retry_utc_msc;
+    long     updated_utc_msc;
+    bool     critical_exit;
+    bool     continuous_batch;
+};
+TradeOperation g_TradeOps[];
+long           g_TradeOpSequence = 0;
+bool           g_TradeLedgerDirty = false;
+bool           g_TradeLedgerDeferSave = false;
+string         g_MoatBatchId = "";
+const int      TRADE_LEDGER_SCHEMA = 1;
 
 // 版本化逐票持久化记录。运行期仍沿用原数组，降低交易管理逻辑改动风险。
 struct TicketStateRecord
@@ -1073,35 +1130,20 @@ bool TryRepairPositionProtection(ulong ticket, double requiredSL, double require
     if(!PositionSelectByTicket(ticket)) return true;
     double curTP = PositionGetDouble(POSITION_TP);
     double targetTP = (requiredTP > 0.0 && curTP <= 0.0) ? requiredTP : curTP;
-    ResetLastError();
-    bool sent = g_trade.PositionModify(ticket, NormalizePrice(requiredSL), NormalizePrice(targetTP));
-    retcode = g_trade.ResultRetcode();
-    if(!sent || !TradeRetcodeAccepted(retcode))
-    {
-        PrintFormat("[Protection] 修复提交失败 ticket=%I64u requiredSL=%.5f retcode=%u(%s) error=%d",
-                    ticket, requiredSL, retcode, g_trade.ResultRetcodeDescription(), GetLastError());
-        return false;
-    }
-    if(!PositionSelectByTicket(ticket)) return true;
-    ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-    double actualSL = PositionGetDouble(POSITION_SL);
-    bool slConfirmed = IsSLAtLeastAsSafe(type, actualSL, requiredSL);
-    bool tpConfirmed = requiredTP <= 0.0 || PositionGetDouble(POSITION_TP) > 0.0;
-    bool confirmed = slConfirmed && tpConfirmed;
-    PrintFormat("[Protection] 修复复核 ticket=%I64u requiredSL=%.5f actualSL=%.5f requiredTP=%.5f actualTP=%.5f confirmed=%s retcode=%u",
-                ticket, requiredSL, actualSL, requiredTP, PositionGetDouble(POSITION_TP), confirmed ? "true" : "false", retcode);
-    return confirmed;
+    int opIdx = TrackModifyOperation(ticket, requiredSL, targetTP, "protection_modify", true);
+    if(opIdx >= 0 && g_TradeOps[opIdx].state == TRADE_OP_CREATED) SubmitTradeOperation(opIdx);
+    if(opIdx >= 0) retcode = g_TradeOps[opIdx].last_retcode;
+    return opIdx >= 0 && TradeOperationSatisfied(opIdx);
 }
 
 bool TryEmergencyClosePosition(ulong ticket, uint &retcode)
 {
     retcode = 0;
     if(!PositionSelectByTicket(ticket)) return true;
-    ResetLastError();
-    bool sent = g_trade.PositionClose(ticket, (ulong)Inp_Slippage);
-    retcode = g_trade.ResultRetcode();
-    PrintFormat("[Protection] 安全退出 ticket=%I64u sent=%s retcode=%u(%s) error=%d",
-                ticket, sent ? "true" : "false", retcode, g_trade.ResultRetcodeDescription(), GetLastError());
+    int opIdx = EnsureCloseOperation(ticket, "protection_exit", NewTradeBatchId("protection_exit"), false);
+    if(opIdx >= 0) retcode = g_TradeOps[opIdx].last_retcode;
+    PrintFormat("[Protection] 安全退出已纳入交易闭环 ticket=%I64u op=%s retcode=%u",
+                ticket, opIdx >= 0 ? g_TradeOps[opIdx].operation_id : "existing", retcode);
     return !PositionSelectByTicket(ticket);
 }
 
@@ -1176,24 +1218,10 @@ bool TryRepairSelectedOrder(ulong ticket, double requiredSL, double requiredTP, 
     retcode = 0;
     if(!OrderSelect(ticket)) return true;
     double tp = requiredTP > 0.0 ? requiredTP : OrderGetDouble(ORDER_TP);
-    ResetLastError();
-    bool sent = g_trade.OrderModify(ticket,
-                                    OrderGetDouble(ORDER_PRICE_OPEN),
-                                    NormalizePrice(requiredSL), NormalizePrice(tp),
-                                    (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME),
-                                    (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION),
-                                    OrderGetDouble(ORDER_PRICE_STOPLIMIT));
-    retcode = g_trade.ResultRetcode();
-    if(!sent || !TradeRetcodeAccepted(retcode))
-    {
-        PrintFormat("[Protection] 挂单修复失败 ticket=%I64u retcode=%u(%s) error=%d",
-                    ticket, retcode, g_trade.ResultRetcodeDescription(), GetLastError());
-        return false;
-    }
-    if(!OrderSelect(ticket)) return true;
-    ENUM_SOP_ORDER kind = SelectedOrderKind();
-    double verifySL, verifyTP;
-    return kind != SOP_IGNORE && SelectedOrderProtectionSafe(kind, verifySL, verifyTP);
+    int opIdx = TrackOrderModifyOperation(ticket, requiredSL, tp, "protection_order_modify");
+    if(opIdx >= 0 && g_TradeOps[opIdx].state == TRADE_OP_CREATED) SubmitTradeOperation(opIdx);
+    if(opIdx >= 0) retcode = g_TradeOps[opIdx].last_retcode;
+    return opIdx >= 0 && TradeOperationSatisfied(opIdx);
 }
 
 bool ValidateEntryProtection(ENUM_SOP_ORDER kind, bool isBuy, double entryPrice, bool pendingOrder)
@@ -1271,18 +1299,24 @@ void AuditServerProtection()
         {
             if(g_TicketState[idx].scalp_tp_policy == SCALP_TP_REMOVE_PENDING)
             {
-                // 中断恢复：以服务器最终状态收敛，不让PENDING永久悬挂。
+                // 以服务器最终状态收敛；账本仍在处理时不得把异步请求误判为失败。
                 if(actualTP == 0.0 && IsSLAtLeastAsSafe(type, actualSL, required))
                 {
                     g_TicketState[idx].scalp_tp_policy = SCALP_TP_REMOVED;
                     PrintFormat("[Scalp TP] Ticket=%I64u PENDING -> REMOVED，服务器已确认", ticket);
+                    stateChanged = true;
                 }
                 else
                 {
-                    g_TicketState[idx].scalp_tp_policy = SCALP_TP_REQUIRED;
-                    PrintFormat("[Scalp TP] Ticket=%I64u PENDING -> REQUIRED，撤除未确认", ticket);
+                    int tpOpIdx = ActiveTradeOpIndex(TRADE_OP_MODIFY, ticket);
+                    bool requestPending = tpOpIdx >= 0 && g_TradeOps[tpOpIdx].source == "scalp_let_run";
+                    if(!requestPending)
+                    {
+                        g_TicketState[idx].scalp_tp_policy = SCALP_TP_REQUIRED;
+                        PrintFormat("[Scalp TP] Ticket=%I64u PENDING -> REQUIRED，撤除未确认", ticket);
+                        stateChanged = true;
+                    }
                 }
-                stateChanged = true;
             }
             else if(g_TicketState[idx].scalp_tp_policy == SCALP_TP_REMOVED && actualTP > 0.0)
             {
@@ -1390,11 +1424,9 @@ void AuditServerProtection()
         else if(elapsed >= 8000 &&
                 (g_UnsafeOrderRetryCount[unsafeIdx] >= 0 || nowMsc >= g_UnsafeOrderNextRetryMsc[unsafeIdx]))
         {
-            ResetLastError();
-            bool deleted = g_trade.OrderDelete(ticket);
-            uint retcode = g_trade.ResultRetcode();
-            PrintFormat("[Protection] 不安全挂单撤销 ticket=%I64u sent=%s retcode=%u(%s) error=%d",
-                        ticket, deleted ? "true" : "false", retcode, g_trade.ResultRetcodeDescription(), GetLastError());
+            int opIdx = EnsureDeleteOperation(ticket, "protection_delete", NewTradeBatchId("protection_delete"), false);
+            uint retcode = (opIdx >= 0) ? g_TradeOps[opIdx].last_retcode : 0;
+            PrintFormat("[Protection] 不安全挂单撤销已纳入交易闭环 ticket=%I64u retcode=%u", ticket, retcode);
             g_UnsafeOrderRetryCount[unsafeIdx] = -1; // 标记已进入撤单阶段，后续按4秒节流核对
             g_UnsafeOrderNextRetryMsc[unsafeIdx] = nowMsc + 4000;
         }
@@ -1430,28 +1462,9 @@ bool ModifyPositionSL(ulong ticket, double newSL)
     newSL = NormalizePrice(newSL);
     double curSL = PositionGetDouble(POSITION_SL);
     if(MathAbs(curSL - newSL) < _Point) return true; // 无变化
-    for(int attempt = 0; attempt < 3; attempt++)
-    {
-        bool sent = g_trade.PositionModify(ticket, newSL, curTP);
-        uint retcode = g_trade.ResultRetcode();
-        if(sent && TradeRetcodeAccepted(retcode) && PositionSelectByTicket(ticket))
-        {
-            ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-            double actualSL = PositionGetDouble(POSITION_SL);
-            if(IsSLAtLeastAsSafe(type, actualSL, newSL))
-            {
-                int idx = TicketStateIndex(ticket);
-                if(idx >= 0)
-                {
-                    g_TicketState[idx].last_confirmed_sl = StrongerSL(type, g_TicketState[idx].last_confirmed_sl, actualSL);
-                    g_TicketState[idx].protection_status = PROTECTION_CONFIRMED;
-                    MarkTicketStateDirty(false);
-                }
-                return true;
-            }
-        }
-    }
-    return false;
+    int opIdx = TrackModifyOperation(ticket, newSL, curTP, "trailing_sl", true);
+    if(opIdx >= 0 && g_TradeOps[opIdx].state == TRADE_OP_CREATED) SubmitTradeOperation(opIdx);
+    return opIdx >= 0 && TradeOperationSatisfied(opIdx);
 }
 
 bool IsScalpLetRunEligible(ulong ticket)
@@ -1503,7 +1516,7 @@ void EnableScalpLetRun()
                   MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
         return;
 
-    int succeeded = 0, failed = 0, skipped = 0;
+    int submitted = 0, failed = 0, skipped = 0;
     for(int i = 0; i < eligible; i++)
     {
         ulong ticket = tickets[i];
@@ -1517,36 +1530,23 @@ void EnableScalpLetRun()
         g_TicketState[idx].scalp_tp_last_retcode = 0;
         MarkTicketStateDirty(); // 先持久化意图，避免中断后误判为外部删TP
 
-        ResetLastError();
-        bool sent = g_trade.PositionModify(ticket, currentSL, 0.0);
-        uint retcode = g_trade.ResultRetcode();
+        int opIdx = TrackModifyOperation(ticket, currentSL, 0.0, "scalp_let_run", true);
+        if(opIdx >= 0 && g_TradeOps[opIdx].state == TRADE_OP_CREATED) SubmitTradeOperation(opIdx);
         idx = TicketStateIndex(ticket);
         if(idx < 0) { skipped++; continue; }
-        g_TicketState[idx].scalp_tp_last_retcode = retcode;
-
-        bool confirmed = sent && TradeRetcodeAccepted(retcode) && PositionSelectByTicket(ticket) &&
-                         PositionGetDouble(POSITION_TP) == 0.0 && IsPositionProtectionConfirmed(ticket);
-        if(confirmed)
+        if(opIdx >= 0)
         {
-            g_TicketState[idx].scalp_tp_policy = SCALP_TP_REMOVED;
-            succeeded++;
-            PrintFormat("[Scalp TP] Ticket=%I64u REQUIRED -> REMOVED，追踪持有已确认", ticket);
+            g_TicketState[idx].scalp_tp_last_retcode = g_TradeOps[opIdx].last_retcode;
+            submitted++;
         }
-        else
-        {
-            g_TicketState[idx].scalp_tp_policy = SCALP_TP_REQUIRED;
-            failed++;
-            PrintFormat("[Scalp TP] Ticket=%I64u 撤TP失败，恢复REQUIRED sent=%s retcode=%u(%s) error=%d",
-                        ticket, sent ? "true" : "false", retcode,
-                        g_trade.ResultRetcodeDescription(), GetLastError());
-        }
+        else failed++;
         MarkTicketStateDirty();
     }
 
     if(failed > 0) AuditServerProtection();
-    Alert(StringFormat(Lang("追踪持有完成：成功 %d，失败 %d，跳过 %d。",
-                            "LET RUN complete: %d succeeded, %d failed, %d skipped."),
-                       succeeded, failed, skipped));
+    Alert(StringFormat(Lang("追踪持有请求：已提交 %d，提交失败 %d，跳过 %d。服务器确认后才会正式生效。",
+                            "LET RUN requests: %d submitted, %d failed, %d skipped. Changes take effect only after server confirmation."),
+                       submitted, failed, skipped));
 }
 
 void ActivateScalpTrail(ulong ticket, double profitPoints)
@@ -1583,22 +1583,14 @@ void ProcessScalpExit(ulong ticket)
         return;
     }
 
-    long nowMsc = ProtectionNowMsc();
-    if(nowMsc < g_TicketState[idx].scalp_exit_next_retry_utc_msc) return;
-    ResetLastError();
-    bool sent = g_trade.PositionClose(ticket, (ulong)Inp_Slippage);
-    uint retcode = g_trade.ResultRetcode();
-    g_TicketState[idx].scalp_exit_retry_count++;
-    g_TicketState[idx].scalp_exit_last_retcode = retcode;
-    g_TicketState[idx].scalp_exit_next_retry_utc_msc = nowMsc + 1000;
-    PrintFormat("[Scalp Exit] Ticket=%I64u reason=%s attempt=%d sent=%s retcode=%u(%s) error=%d",
-                ticket, ScalpExitReasonText(g_TicketState[idx].scalp_exit_reason),
-                g_TicketState[idx].scalp_exit_retry_count, sent ? "true" : "false",
-                retcode, g_trade.ResultRetcodeDescription(), GetLastError());
-    if(!PositionSelectByTicket(ticket))
+    string source = (g_TicketState[idx].scalp_exit_reason == SCALP_EXIT_TIMEOUT)
+                  ? "scalp_timeout" : "scalp_pullback";
+    int opIdx = EnsureCloseOperation(ticket, source, NewTradeBatchId(source), false);
+    if(opIdx >= 0)
     {
-        g_TicketState[idx].scalp_phase = SCALP_CLOSED;
-        g_TicketState[idx].closed_utc = TimeGMT();
+        g_TicketState[idx].scalp_exit_retry_count = g_TradeOps[opIdx].retry_count;
+        g_TicketState[idx].scalp_exit_last_retcode = g_TradeOps[opIdx].last_retcode;
+        g_TicketState[idx].scalp_exit_next_retry_utc_msc = g_TradeOps[opIdx].next_retry_utc_msc;
     }
     MarkTicketStateDirty();
 }
@@ -1749,7 +1741,7 @@ void ManageTrendTrailingStop(ulong ticket)
         // 回撤达阈值 → 平仓离场
         if(g_TrPeakPoints[idx] - profitPoints >= Inp_TrendTrailStep)
         {
-            g_trade.PositionClose(ticket);
+            EnsureCloseOperation(ticket, "trend_pullback", NewTradeBatchId("trend_pullback"), false);
             return;
         }
 
@@ -1793,8 +1785,8 @@ void ManageTrendTrailingStop(ulong ticket)
         double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
         if(closeVol >= vmin && closeVol < vol)
         {
-            if(g_trade.PositionClosePartial(ticket, closeVol))
-                { g_TrReduced[idx] = true; MarkTicketStateDirty(); }
+            double targetRemaining = NormalizeDouble(vol - closeVol, 2);
+            EnsurePartialCloseOperation(ticket, targetRemaining, "trend_reduce");
         }
         else
         {
@@ -2308,6 +2300,12 @@ double DrawdownBase()
 //+------------------------------------------------------------------+
 bool ValidateOpenConditions(ENUM_SOP_ORDER kind)
 {
+    if(HasUnfinishedNewRiskOperation())
+    {
+        Alert(Lang("【拒绝】上一笔开仓请求仍在核对中，请等待服务器确认。",
+                   "[REJECT] A previous entry request is still being reconciled."));
+        return false;
+    }
     if(!g_AccountModeSupported)
     {
         Alert(Lang("【拒绝】当前版本仅支持对冲账户", "[REJECT] Hedging accounts only"));
@@ -2359,59 +2357,766 @@ bool ValidateOpenConditions(ENUM_SOP_ORDER kind)
 }
 
 //+------------------------------------------------------------------+
-//| 一键平仓:平掉本品种所有持仓 + 删除本品种所有挂单                   |
+//| 交易请求结果闭环                                                  |
 //+------------------------------------------------------------------+
-// 异步提交一组平仓请求。MT5 没有“单请求平多个持仓”的协议，
-// OrderSendAsync 可把全部请求连续交给交易服务器，不逐单等待服务器响应。
-int ClosePositionsAsync(const ulong &tickets[])
+bool TradeOpIsFinal(int state)
 {
-    int submitted = 0;
+    return state == TRADE_OP_CONFIRMED || state == TRADE_OP_FAILED ||
+           state == TRADE_OP_CANCELLED;
+}
+
+string NewTradeOperationId(string prefix)
+{
+    g_TradeOpSequence++;
+    return prefix + "-" + (string)ProtectionNowMsc() + "-" + (string)g_TradeOpSequence;
+}
+
+string NewTradeBatchId(string source)
+{
+    return NewTradeOperationId("B-" + source);
+}
+
+int ActiveTradeOpIndex(int action, ulong targetTicket)
+{
+    for(int i = ArraySize(g_TradeOps) - 1; i >= 0; i--)
+        if(g_TradeOps[i].action == action && g_TradeOps[i].target_ticket == targetTicket &&
+           !TradeOpIsFinal(g_TradeOps[i].state))
+            return i;
+    return -1;
+}
+
+int TradeOpIndexByRequest(ulong requestId)
+{
+    if(requestId == 0) return -1;
+    for(int i = ArraySize(g_TradeOps) - 1; i >= 0; i--)
+        if(g_TradeOps[i].request_id == requestId && !TradeOpIsFinal(g_TradeOps[i].state))
+            return i;
+    return -1;
+}
+
+int ActiveTradeOperationCount()
+{
+    int count = 0;
+    for(int i = 0; i < ArraySize(g_TradeOps); i++)
+        if(!TradeOpIsFinal(g_TradeOps[i].state)) count++;
+    return count;
+}
+
+string TradeOperationStatusText(color &statusColor)
+{
+    int active = 0, ambiguous = 0, partial = 0;
+    long nowMsc = ProtectionNowMsc();
+    bool recentFailure = false, recentConfirmed = false;
+    for(int i = 0; i < ArraySize(g_TradeOps); i++)
+    {
+        bool background = g_TradeOps[i].source == "trailing_sl" ||
+                          g_TradeOps[i].source == "protection_modify" ||
+                          g_TradeOps[i].source == "protection_order_modify";
+        if(background) continue;
+        if(!TradeOpIsFinal(g_TradeOps[i].state))
+        {
+            active++;
+            if(g_TradeOps[i].state == TRADE_OP_AMBIGUOUS) ambiguous++;
+            if(g_TradeOps[i].state == TRADE_OP_PARTIAL) partial++;
+        }
+        else if(g_TradeOps[i].state == TRADE_OP_FAILED && nowMsc - g_TradeOps[i].updated_utc_msc <= 30000)
+            recentFailure = true;
+        else if(g_TradeOps[i].state == TRADE_OP_CONFIRMED && nowMsc - g_TradeOps[i].updated_utc_msc <= 5000)
+            recentConfirmed = true;
+    }
+    if(ambiguous > 0)
+    {
+        statusColor = COLOR_SIGNAL_LOSS;
+        return Lang("交易待确认 (", "TRADE AMBIGUOUS (") + (string)ambiguous + ")";
+    }
+    if(partial > 0)
+    {
+        statusColor = COLOR_SIGNAL_WARNING;
+        return Lang("交易部分完成 (", "TRADE PARTIAL (") + (string)active + ")";
+    }
+    if(active > 0)
+    {
+        statusColor = COLOR_SIGNAL_WARNING;
+        return Lang("交易处理中 (", "TRADE PROCESSING (") + (string)active + ")";
+    }
+    if(recentFailure)
+    {
+        statusColor = COLOR_SIGNAL_LOSS;
+        return Lang("交易请求失败", "TRADE FAILED");
+    }
+    if(recentConfirmed)
+    {
+        statusColor = COLOR_SIGNAL_PROFIT;
+        return Lang("服务器已确认", "SERVER CONFIRMED");
+    }
+    statusColor = COLOR_SIGNAL_PROFIT;
+    return "";
+}
+
+bool HasUnfinishedNewRiskOperation()
+{
+    for(int i = 0; i < ArraySize(g_TradeOps); i++)
+        if((g_TradeOps[i].action == TRADE_OP_OPEN_MARKET || g_TradeOps[i].action == TRADE_OP_OPEN_LIMIT) &&
+           !TradeOpIsFinal(g_TradeOps[i].state))
+            return true;
+    return false;
+}
+
+string TradeLedgerFolder() { return "TradeEZ\\requests\\v1"; }
+string TradeLedgerFileName()
+{
+    return TradeLedgerFolder() + "\\" + (string)StableTextHash(AccountInfoString(ACCOUNT_SERVER)) + "_" +
+           (string)AccountInfoInteger(ACCOUNT_LOGIN) + "_" + NormalizeNamespacePart(_Symbol) + "_" +
+           NormalizeNamespacePart(Inp_InstanceId) + ".csv";
+}
+
+void EnsureTradeLedgerFolder()
+{
+    FolderCreate("TradeEZ");
+    FolderCreate("TradeEZ\\requests");
+    FolderCreate(TradeLedgerFolder());
+}
+
+void SaveTradeLedger()
+{
+    if(!g_InstanceOwnsState) return;
+    long keepAfterMsc = ((long)TimeGMT() - 7 * 86400) * 1000;
+    for(int i = ArraySize(g_TradeOps) - 1; i >= 0; i--)
+    {
+        if(!TradeOpIsFinal(g_TradeOps[i].state) || g_TradeOps[i].updated_utc_msc >= keepAfterMsc) continue;
+        int last = ArraySize(g_TradeOps) - 1;
+        g_TradeOps[i] = g_TradeOps[last];
+        ArrayResize(g_TradeOps, last);
+    }
+    EnsureTradeLedgerFolder();
+    string finalPath = TradeLedgerFileName();
+    string tempPath = finalPath + ".tmp";
+    int h = FileOpen(tempPath, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+    if(h == INVALID_HANDLE)
+    {
+        PrintFormat("[Trade Ledger] 临时文件写入失败 error=%d", GetLastError());
+        return;
+    }
+    FileWrite(h, "META", TRADE_LEDGER_SCHEMA, TicketStateNamespace(), (long)TimeGMT());
+    for(int i = 0; i < ArraySize(g_TradeOps); i++)
+    {
+        TradeOperation op = g_TradeOps[i];
+        FileWrite(h, "OP", op.operation_id, op.batch_id, op.source, op.action, op.state,
+                  (long)op.target_ticket, (long)op.target_position_id, op.magic,
+                  op.requested_volume, op.target_remaining_volume, op.target_sl, op.target_tp,
+                  (long)op.request_id, (long)op.order_ticket, (long)op.deal_ticket,
+                  (long)op.last_retcode, op.retry_count, op.created_utc_msc,
+                  op.last_submit_utc_msc, op.next_retry_utc_msc, op.updated_utc_msc,
+                  op.critical_exit ? 1 : 0, op.continuous_batch ? 1 : 0);
+    }
+    FileFlush(h);
+    FileClose(h);
+    if(!FileMove(tempPath, 0, finalPath, FILE_REWRITE))
+    {
+        PrintFormat("[Trade Ledger] 原子替换失败 error=%d", GetLastError());
+        FileDelete(tempPath);
+        return;
+    }
+    g_TradeLedgerDirty = false;
+}
+
+void LoadTradeLedger()
+{
+    ArrayResize(g_TradeOps, 0);
+    string path = TradeLedgerFileName();
+    if(!FileIsExist(path)) return;
+    int h = FileOpen(path, FILE_READ | FILE_CSV | FILE_ANSI, ',');
+    if(h == INVALID_HANDLE) { PrintFormat("[Trade Ledger] 读取失败 error=%d", GetLastError()); return; }
+    string tag = FileReadString(h);
+    int schema = (int)FileReadNumber(h);
+    string ns = FileReadString(h);
+    FileReadNumber(h);
+    if(tag != "META" || schema != TRADE_LEDGER_SCHEMA || ns != TicketStateNamespace())
+    {
+        Print("[Trade Ledger] 文件头或命名空间不匹配，忽略旧账本");
+        FileClose(h);
+        return;
+    }
+    datetime keepAfter = TimeGMT() - 7 * 86400;
+    while(!FileIsEnding(h))
+    {
+        tag = FileReadString(h);
+        if(tag == "") break;
+        if(tag != "OP") break;
+        TradeOperation op;
+        op.operation_id = FileReadString(h);
+        op.batch_id = FileReadString(h);
+        op.source = FileReadString(h);
+        op.action = (int)FileReadNumber(h);
+        op.state = (int)FileReadNumber(h);
+        op.target_ticket = (ulong)FileReadNumber(h);
+        op.target_position_id = (ulong)FileReadNumber(h);
+        op.magic = (long)FileReadNumber(h);
+        op.requested_volume = FileReadNumber(h);
+        op.target_remaining_volume = FileReadNumber(h);
+        op.target_sl = FileReadNumber(h);
+        op.target_tp = FileReadNumber(h);
+        op.request_id = (ulong)FileReadNumber(h);
+        op.order_ticket = (ulong)FileReadNumber(h);
+        op.deal_ticket = (ulong)FileReadNumber(h);
+        op.last_retcode = (uint)(long)FileReadNumber(h);
+        op.retry_count = (int)FileReadNumber(h);
+        op.created_utc_msc = (long)FileReadNumber(h);
+        op.last_submit_utc_msc = (long)FileReadNumber(h);
+        op.next_retry_utc_msc = (long)FileReadNumber(h);
+        op.updated_utc_msc = (long)FileReadNumber(h);
+        op.critical_exit = ((int)FileReadNumber(h) != 0);
+        op.continuous_batch = ((int)FileReadNumber(h) != 0);
+        if(!TradeOpIsFinal(op.state) || op.updated_utc_msc / 1000 >= (long)keepAfter)
+        {
+            int n = ArraySize(g_TradeOps);
+            ArrayResize(g_TradeOps, n + 1);
+            g_TradeOps[n] = op;
+        }
+    }
+    FileClose(h);
+    PrintFormat("[Trade Ledger] 已恢复 %d 条操作记录", ArraySize(g_TradeOps));
+}
+
+int CreateTradeOperation(int action, string source, string batchId, ulong ticket,
+                         double requestedVolume, double targetRemaining,
+                         double targetSL, double targetTP,
+                         bool criticalExit, bool continuousBatch)
+{
+    int existing = ActiveTradeOpIndex(action, ticket);
+    if(existing >= 0) return existing;
+    TradeOperation op;
+    op.operation_id = NewTradeOperationId("OP");
+    op.batch_id = batchId;
+    op.source = source;
+    op.action = action;
+    op.state = TRADE_OP_CREATED;
+    op.target_ticket = ticket;
+    op.target_position_id = 0;
+    op.magic = 0;
+    if(ticket > 0 && PositionSelectByTicket(ticket))
+    {
+        op.target_position_id = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
+        op.magic = PositionGetInteger(POSITION_MAGIC);
+    }
+    else if(ticket > 0 && OrderSelect(ticket))
+        op.magic = OrderGetInteger(ORDER_MAGIC);
+    op.requested_volume = requestedVolume;
+    op.target_remaining_volume = targetRemaining;
+    op.target_sl = targetSL;
+    op.target_tp = targetTP;
+    op.request_id = 0;
+    op.order_ticket = 0;
+    op.deal_ticket = 0;
+    op.last_retcode = 0;
+    op.retry_count = 0;
+    op.created_utc_msc = ProtectionNowMsc();
+    op.last_submit_utc_msc = 0;
+    op.next_retry_utc_msc = 0;
+    op.updated_utc_msc = op.created_utc_msc;
+    op.critical_exit = criticalExit;
+    op.continuous_batch = continuousBatch;
+    int n = ArraySize(g_TradeOps);
+    ArrayResize(g_TradeOps, n + 1);
+    g_TradeOps[n] = op;
+    g_TradeLedgerDirty = true;
+    if(!g_TradeLedgerDeferSave) SaveTradeLedger(); // 单笔先保存意图；批量由调用方统一原子保存。
+    return n;
+}
+
+long TradeRetryDelayMsc(int retryCount)
+{
+    if(retryCount <= 1) return 1000;
+    if(retryCount == 2) return 2000;
+    if(retryCount == 3) return 4000;
+    if(retryCount == 4) return 8000;
+    return 15000;
+}
+
+void ApplyTradeSubmissionResult(int idx, bool sent, const MqlTradeResult &result)
+{
+    if(idx < 0 || idx >= ArraySize(g_TradeOps)) return;
+    long nowMsc = ProtectionNowMsc();
+    g_TradeOps[idx].request_id = result.request_id;
+    if(result.order > 0) g_TradeOps[idx].order_ticket = result.order;
+    if(result.deal > 0) g_TradeOps[idx].deal_ticket = result.deal;
+    g_TradeOps[idx].last_retcode = result.retcode;
+    g_TradeOps[idx].last_submit_utc_msc = nowMsc;
+    g_TradeOps[idx].updated_utc_msc = nowMsc;
+    g_TradeOps[idx].retry_count++;
+    if(sent)
+    {
+        g_TradeOps[idx].state = TRADE_OP_SUBMITTED;
+        g_TradeOps[idx].next_retry_utc_msc = nowMsc + TradeRetryDelayMsc(g_TradeOps[idx].retry_count);
+    }
+    else if(g_TradeOps[idx].critical_exit)
+    {
+        g_TradeOps[idx].state = TRADE_OP_AMBIGUOUS;
+        g_TradeOps[idx].next_retry_utc_msc = nowMsc + TradeRetryDelayMsc(g_TradeOps[idx].retry_count);
+    }
+    else
+    {
+        g_TradeOps[idx].state = TRADE_OP_FAILED;
+        g_TradeOps[idx].next_retry_utc_msc = 0;
+    }
+    g_TradeLedgerDirty = true;
+    if(!g_TradeLedgerDeferSave) SaveTradeLedger();
+}
+
+ENUM_ORDER_TYPE_FILLING RequestFillingMode(string symbol)
+{
+    long mode = SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+    if((mode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) return ORDER_FILLING_FOK;
+    if((mode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) return ORDER_FILLING_IOC;
+    return ORDER_FILLING_RETURN;
+}
+
+bool SubmitTradeOperation(int idx)
+{
+    if(idx < 0 || idx >= ArraySize(g_TradeOps) || TradeOpIsFinal(g_TradeOps[idx].state)) return false;
+    TradeOperation op = g_TradeOps[idx];
+    MqlTradeRequest request = {};
+    MqlTradeResult result = {};
+    bool targetPresent = false;
+
+    if(op.action == TRADE_OP_CLOSE || op.action == TRADE_OP_PARTIAL_CLOSE)
+    {
+        if(!PositionSelectByTicket(op.target_ticket)) return true;
+        string symbol = PositionGetString(POSITION_SYMBOL);
+        ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        double currentVolume = PositionGetDouble(POSITION_VOLUME);
+        double volume = currentVolume;
+        double vmin = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+        if(op.action == TRADE_OP_PARTIAL_CLOSE)
+        {
+            double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+            if(step <= 0.0) step = 0.01;
+            double rawDifference = MathMax(0.0, currentVolume - op.target_remaining_volume);
+            volume = NormalizeDouble(MathFloor((rawDifference + step * 0.001) / step) * step, 8);
+            if(volume < vmin)
+            {
+                g_TradeOps[idx].state = TRADE_OP_FAILED;
+                g_TradeOps[idx].updated_utc_msc = ProtectionNowMsc();
+                g_TradeOps[idx].last_retcode = TRADE_RETCODE_INVALID_VOLUME;
+                g_TradeLedgerDirty = true;
+                SaveTradeLedger();
+                PrintFormat("[Trade Ledger] 部分平仓剩余差额低于最小手数，停止重试 ticket=%I64u difference=%.8f",
+                            op.target_ticket, rawDifference);
+                return false;
+            }
+        }
+        request.action = TRADE_ACTION_DEAL;
+        request.position = op.target_ticket;
+        request.symbol = symbol;
+        request.volume = MathMin(currentVolume, volume);
+        request.magic = (ulong)PositionGetInteger(POSITION_MAGIC);
+        request.deviation = (ulong)Inp_Slippage;
+        request.type = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+        request.price = SymbolInfoDouble(symbol, request.type == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID);
+        request.type_filling = RequestFillingMode(symbol);
+        request.comment = (op.action == TRADE_OP_CLOSE) ? "TradeEZ close" : "TradeEZ partial";
+        targetPresent = true;
+    }
+    else if(op.action == TRADE_OP_DELETE_ORDER)
+    {
+        if(!OrderSelect(op.target_ticket)) return true;
+        request.action = TRADE_ACTION_REMOVE;
+        request.order = op.target_ticket;
+        targetPresent = true;
+    }
+    else if(op.action == TRADE_OP_MODIFY)
+    {
+        if(!PositionSelectByTicket(op.target_ticket)) return true;
+        request.action = TRADE_ACTION_SLTP;
+        request.position = op.target_ticket;
+        request.symbol = PositionGetString(POSITION_SYMBOL);
+        request.sl = NormalizePrice(op.target_sl);
+        request.tp = NormalizePrice(op.target_tp);
+        targetPresent = true;
+    }
+    else if(op.action == TRADE_OP_MODIFY_ORDER)
+    {
+        if(!OrderSelect(op.target_ticket)) return true;
+        request.action = TRADE_ACTION_MODIFY;
+        request.order = op.target_ticket;
+        request.symbol = OrderGetString(ORDER_SYMBOL);
+        request.price = OrderGetDouble(ORDER_PRICE_OPEN);
+        request.stoplimit = OrderGetDouble(ORDER_PRICE_STOPLIMIT);
+        request.sl = NormalizePrice(op.target_sl);
+        request.tp = NormalizePrice(op.target_tp);
+        request.type_time = (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
+        request.expiration = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+        targetPresent = true;
+    }
+    if(!targetPresent) return false;
+    ResetLastError();
+    bool sent = OrderSendAsync(request, result);
+    ApplyTradeSubmissionResult(idx, sent, result);
+    PrintFormat("[Trade Ledger] submit op=%s action=%d ticket=%I64u attempt=%d sent=%s request=%I64u retcode=%u error=%d",
+                g_TradeOps[idx].operation_id, g_TradeOps[idx].action, g_TradeOps[idx].target_ticket,
+                g_TradeOps[idx].retry_count, sent ? "true" : "false", result.request_id,
+                result.retcode, GetLastError());
+    if(g_TradeOps[idx].critical_exit && g_TradeOps[idx].retry_count == 5)
+        Alert(StringFormat(Lang("【交易执行告警】Ticket %I64u 尚未完成，系统将每15秒持续重试。",
+                                "[TRADE ALERT] Ticket %I64u is still pending; retrying every 15 seconds."),
+                           g_TradeOps[idx].target_ticket));
+    return sent;
+}
+
+bool TradeOperationSatisfied(int idx)
+{
+    if(idx < 0 || idx >= ArraySize(g_TradeOps)) return false;
+    TradeOperation op = g_TradeOps[idx];
+    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    if(step <= 0.0) step = 0.01;
+    if(op.action == TRADE_OP_CLOSE) return !PositionSelectByTicket(op.target_ticket);
+    if(op.action == TRADE_OP_DELETE_ORDER) return !OrderSelect(op.target_ticket);
+    if(op.action == TRADE_OP_PARTIAL_CLOSE)
+    {
+        if(!PositionSelectByTicket(op.target_ticket)) return true;
+        return PositionGetDouble(POSITION_VOLUME) <= op.target_remaining_volume + step * 0.5;
+    }
+    if(op.action == TRADE_OP_MODIFY)
+    {
+        if(!PositionSelectByTicket(op.target_ticket)) return true;
+        double actualSL = PositionGetDouble(POSITION_SL);
+        double actualTP = PositionGetDouble(POSITION_TP);
+        ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        bool slOK = (op.target_sl <= 0.0) ? actualSL <= 0.0 : IsSLAtLeastAsSafe(type, actualSL, op.target_sl);
+        bool tpOK = (op.target_tp <= 0.0) ? actualTP <= 0.0 : MathAbs(actualTP - op.target_tp) <= MathMax(_Point, SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE));
+        return slOK && tpOK;
+    }
+    if(op.action == TRADE_OP_MODIFY_ORDER)
+    {
+        if(!OrderSelect(op.target_ticket)) return true;
+        double tick = MathMax(_Point, SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE));
+        double actualSL = OrderGetDouble(ORDER_SL);
+        double actualTP = OrderGetDouble(ORDER_TP);
+        ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+        ENUM_POSITION_TYPE posType = (orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_BUY_STOP_LIMIT)
+                                   ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+        bool slOK = (op.target_sl <= 0.0) ? actualSL <= 0.0 : IsSLAtLeastAsSafe(posType, actualSL, op.target_sl);
+        bool tpOK = (op.target_tp <= 0.0) ? actualTP <= 0.0 : MathAbs(actualTP - op.target_tp) <= tick;
+        return slOK && tpOK;
+    }
+    if(op.action == TRADE_OP_OPEN_MARKET)
+    {
+        if(op.deal_ticket > 0 && HistoryDealSelect(op.deal_ticket)) return true;
+        for(int i = PositionsTotal() - 1; i >= 0; i--)
+            if(PositionGetTicket(i) > 0 && PositionGetInteger(POSITION_MAGIC) == op.magic &&
+               StringFind(PositionGetString(POSITION_COMMENT), op.operation_id) >= 0)
+                return true;
+        if(HistorySelect((datetime)(op.created_utc_msc / 1000 - 60), TimeCurrent() + 60))
+            for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+            {
+                ulong deal = HistoryDealGetTicket(i);
+                if(deal > 0 && HistoryDealGetInteger(deal, DEAL_MAGIC) == op.magic &&
+                   StringFind(HistoryDealGetString(deal, DEAL_COMMENT), op.operation_id) >= 0)
+                {
+                    g_TradeOps[idx].deal_ticket = deal;
+                    return true;
+                }
+            }
+        return false;
+    }
+    if(op.action == TRADE_OP_OPEN_LIMIT)
+    {
+        if(op.order_ticket > 0 && OrderSelect(op.order_ticket)) return true;
+        if(op.order_ticket > 0 && HistoryOrderSelect(op.order_ticket)) return true;
+        for(int i = OrdersTotal() - 1; i >= 0; i--)
+            if(OrderGetTicket(i) > 0 && OrderGetInteger(ORDER_MAGIC) == op.magic &&
+               StringFind(OrderGetString(ORDER_COMMENT), op.operation_id) >= 0)
+                return true;
+        if(HistorySelect((datetime)(op.created_utc_msc / 1000 - 60), TimeCurrent() + 60))
+            for(int i = HistoryOrdersTotal() - 1; i >= 0; i--)
+            {
+                ulong order = HistoryOrderGetTicket(i);
+                if(order > 0 && HistoryOrderGetInteger(order, ORDER_MAGIC) == op.magic &&
+                   StringFind(HistoryOrderGetString(order, ORDER_COMMENT), op.operation_id) >= 0)
+                {
+                    g_TradeOps[idx].order_ticket = order;
+                    return true;
+                }
+            }
+        return false;
+    }
+    return false;
+}
+
+void OnTradeOperationConfirmed(int idx)
+{
+    if(idx < 0 || idx >= ArraySize(g_TradeOps)) return;
+    ulong ticket = g_TradeOps[idx].target_ticket;
+    if(g_TradeOps[idx].action == TRADE_OP_PARTIAL_CLOSE)
+    {
+        int trIdx = TrIndex(ticket);
+        if(trIdx >= 0) g_TrReduced[trIdx] = true;
+        int stateIdx = TicketStateIndex(ticket);
+        if(stateIdx >= 0) g_TicketState[stateIdx].trend_reduced = true;
+        MarkTicketStateDirty(false);
+    }
+    if(g_TradeOps[idx].action == TRADE_OP_CLOSE)
+    {
+        int stateIdx = TicketStateIndex(ticket);
+        if(stateIdx >= 0 && g_TicketState[stateIdx].scalp_phase == SCALP_EXIT_PENDING)
+        {
+            g_TicketState[stateIdx].scalp_phase = SCALP_CLOSED;
+            g_TicketState[stateIdx].closed_utc = TimeGMT();
+            MarkTicketStateDirty(false);
+        }
+    }
+    if(g_TradeOps[idx].action == TRADE_OP_MODIFY && PositionSelectByTicket(ticket))
+    {
+        int stateIdx = TicketStateIndex(ticket);
+        if(stateIdx >= 0)
+        {
+            ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            double actualSL = PositionGetDouble(POSITION_SL);
+            g_TicketState[stateIdx].last_confirmed_sl = StrongerSL(type, g_TicketState[stateIdx].last_confirmed_sl, actualSL);
+            g_TicketState[stateIdx].last_confirmed_tp = PositionGetDouble(POSITION_TP);
+            g_TicketState[stateIdx].protection_status = PROTECTION_CONFIRMED;
+            if(g_TradeOps[idx].source == "scalp_let_run" && PositionGetDouble(POSITION_TP) == 0.0)
+            {
+                g_TicketState[stateIdx].scalp_tp_policy = SCALP_TP_REMOVED;
+                g_TicketState[stateIdx].scalp_tp_last_retcode = g_TradeOps[idx].last_retcode;
+                PrintFormat("[Scalp TP] Ticket=%I64u REQUIRED -> REMOVED，服务器已确认追踪持有", ticket);
+            }
+            MarkTicketStateDirty(false);
+        }
+    }
+}
+
+void ReconcileTradeOperations()
+{
+    long nowMsc = ProtectionNowMsc();
+    bool changed = false;
+    for(int i = 0; i < ArraySize(g_TradeOps); i++)
+    {
+        if(TradeOpIsFinal(g_TradeOps[i].state)) continue;
+        if(TradeOperationSatisfied(i))
+        {
+            g_TradeOps[i].state = TRADE_OP_CONFIRMED;
+            g_TradeOps[i].updated_utc_msc = nowMsc;
+            g_TradeOps[i].next_retry_utc_msc = 0;
+            OnTradeOperationConfirmed(i);
+            PrintFormat("[Trade Ledger] CONFIRMED op=%s action=%d ticket=%I64u request=%I64u",
+                        g_TradeOps[i].operation_id, g_TradeOps[i].action,
+                        g_TradeOps[i].target_ticket, g_TradeOps[i].request_id);
+            changed = true;
+            continue;
+        }
+
+        if((g_TradeOps[i].action == TRADE_OP_CLOSE || g_TradeOps[i].action == TRADE_OP_PARTIAL_CLOSE) &&
+           PositionSelectByTicket(g_TradeOps[i].target_ticket))
+        {
+            double currentVolume = PositionGetDouble(POSITION_VOLUME);
+            double initialVolume = g_TradeOps[i].requested_volume + g_TradeOps[i].target_remaining_volume;
+            double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+            if(step <= 0.0) step = 0.01;
+            if(currentVolume < initialVolume - step * 0.5 && g_TradeOps[i].state != TRADE_OP_PARTIAL)
+            {
+                g_TradeOps[i].state = TRADE_OP_PARTIAL;
+                g_TradeOps[i].updated_utc_msc = nowMsc;
+                changed = true;
+            }
+        }
+
+        bool entryAction = g_TradeOps[i].action == TRADE_OP_OPEN_MARKET ||
+                           g_TradeOps[i].action == TRADE_OP_OPEN_LIMIT;
+        if(entryAction)
+        {
+            if(g_TradeOps[i].state != TRADE_OP_AMBIGUOUS &&
+               g_TradeOps[i].last_submit_utc_msc > 0 && nowMsc - g_TradeOps[i].last_submit_utc_msc >= 15000)
+            {
+                g_TradeOps[i].state = TRADE_OP_AMBIGUOUS;
+                g_TradeOps[i].updated_utc_msc = nowMsc;
+                changed = true; // 新增风险状态不明时绝不自动重发。
+            }
+            continue;
+        }
+        if(g_TradeOps[i].next_retry_utc_msc == 0 || nowMsc >= g_TradeOps[i].next_retry_utc_msc)
+            SubmitTradeOperation(i);
+    }
+    if(changed) { g_TradeLedgerDirty = true; SaveTradeLedger(); }
+}
+
+void HandleTradeRequestTransaction(const MqlTradeTransaction &trans,
+                                   const MqlTradeRequest &request,
+                                   const MqlTradeResult &result)
+{
+    if(trans.type != TRADE_TRANSACTION_REQUEST) return;
+    int idx = TradeOpIndexByRequest(result.request_id);
+    if(idx < 0) return;
+    g_TradeOps[idx].last_retcode = result.retcode;
+    if(result.order > 0) g_TradeOps[idx].order_ticket = result.order;
+    if(result.deal > 0) g_TradeOps[idx].deal_ticket = result.deal;
+    g_TradeOps[idx].updated_utc_msc = ProtectionNowMsc();
+    if(result.retcode == TRADE_RETCODE_DONE_PARTIAL)
+        g_TradeOps[idx].state = TRADE_OP_PARTIAL;
+    else if(TradeRetcodeAccepted(result.retcode))
+        g_TradeOps[idx].state = TRADE_OP_ACCEPTED;
+    else if(g_TradeOps[idx].critical_exit)
+    {
+        g_TradeOps[idx].state = TRADE_OP_AMBIGUOUS;
+        g_TradeOps[idx].next_retry_utc_msc = ProtectionNowMsc() + TradeRetryDelayMsc(g_TradeOps[idx].retry_count);
+    }
+    else
+        g_TradeOps[idx].state = TRADE_OP_FAILED;
+    g_TradeLedgerDirty = true;
+}
+
+int EnsureCloseOperation(ulong ticket, string source, string batchId, bool continuousBatch)
+{
+    if(ticket == 0 || !PositionSelectByTicket(ticket)) return -1;
+    int idx = ActiveTradeOpIndex(TRADE_OP_CLOSE, ticket);
+    if(idx >= 0) return idx;
+    double volume = PositionGetDouble(POSITION_VOLUME);
+    idx = CreateTradeOperation(TRADE_OP_CLOSE, source, batchId, ticket, volume, 0.0, 0.0, 0.0, true, continuousBatch);
+    SubmitTradeOperation(idx);
+    return idx;
+}
+
+int EnsureDeleteOperation(ulong ticket, string source, string batchId, bool continuousBatch)
+{
+    if(ticket == 0 || !OrderSelect(ticket)) return -1;
+    int idx = ActiveTradeOpIndex(TRADE_OP_DELETE_ORDER, ticket);
+    if(idx >= 0) return idx;
+    idx = CreateTradeOperation(TRADE_OP_DELETE_ORDER, source, batchId, ticket, 0.0, 0.0, 0.0, 0.0, true, continuousBatch);
+    SubmitTradeOperation(idx);
+    return idx;
+}
+
+int EnsurePartialCloseOperation(ulong ticket, double targetRemaining, string source)
+{
+    if(ticket == 0 || !PositionSelectByTicket(ticket)) return -1;
+    int idx = ActiveTradeOpIndex(TRADE_OP_PARTIAL_CLOSE, ticket);
+    if(idx >= 0) return idx;
+    double currentVolume = PositionGetDouble(POSITION_VOLUME);
+    idx = CreateTradeOperation(TRADE_OP_PARTIAL_CLOSE, source, NewTradeBatchId(source), ticket,
+                               MathMax(0.0, currentVolume - targetRemaining), targetRemaining,
+                               0.0, 0.0, true, false);
+    SubmitTradeOperation(idx);
+    return idx;
+}
+
+int TrackModifyOperation(ulong ticket, double targetSL, double targetTP, string source,
+                         bool criticalExit = true)
+{
+    int idx = ActiveTradeOpIndex(TRADE_OP_MODIFY, ticket);
+    if(idx >= 0)
+    {
+        // 更安全的新止损覆盖旧目标；下一次核销/重试将采用最新保护目标。
+        if(PositionSelectByTicket(ticket))
+        {
+            ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            g_TradeOps[idx].target_sl = StrongerSL(type, g_TradeOps[idx].target_sl, NormalizePrice(targetSL));
+        }
+        g_TradeOps[idx].target_tp = NormalizePrice(targetTP);
+        if(source == "scalp_let_run") g_TradeOps[idx].source = source;
+        g_TradeLedgerDirty = true;
+        SaveTradeLedger();
+        return idx;
+    }
+    return CreateTradeOperation(TRADE_OP_MODIFY, source, NewTradeBatchId(source), ticket,
+                                0.0, 0.0, NormalizePrice(targetSL), NormalizePrice(targetTP),
+                                criticalExit, false);
+}
+
+int TrackOrderModifyOperation(ulong ticket, double targetSL, double targetTP, string source)
+{
+    int idx = ActiveTradeOpIndex(TRADE_OP_MODIFY_ORDER, ticket);
+    if(idx >= 0)
+    {
+        g_TradeOps[idx].target_sl = NormalizePrice(targetSL);
+        g_TradeOps[idx].target_tp = NormalizePrice(targetTP);
+        g_TradeLedgerDirty = true;
+        SaveTradeLedger();
+        return idx;
+    }
+    return CreateTradeOperation(TRADE_OP_MODIFY_ORDER, source, NewTradeBatchId(source), ticket,
+                                0.0, 0.0, NormalizePrice(targetSL), NormalizePrice(targetTP),
+                                true, false);
+}
+
+// 异步提交一组平仓请求；返回值仅表示纳入闭环的目标数，不代表已成交。
+int ClosePositionsAsync(const ulong &tickets[], string source = "manual_close", string batchId = "", bool continuousBatch = false)
+{
+    if(batchId == "") batchId = NewTradeBatchId(source);
+    int tracked = 0;
+    int newOps[];
+    g_TradeLedgerDeferSave = true;
     for(int i = 0; i < ArraySize(tickets); i++)
     {
         ulong ticket = tickets[i];
         if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
-
-        string symbol = PositionGetString(POSITION_SYMBOL);
-        ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-
-        MqlTradeRequest request = {};
-        MqlTradeResult  result  = {};
-        request.action       = TRADE_ACTION_DEAL;
-        request.position     = ticket;
-        request.symbol       = symbol;
-        request.volume       = PositionGetDouble(POSITION_VOLUME);
-        request.magic        = (ulong)PositionGetInteger(POSITION_MAGIC);
-        request.deviation    = (ulong)Inp_Slippage;
-        request.type         = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-        request.price        = SymbolInfoDouble(symbol, request.type == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID);
-        long fillingMode = SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
-        if((fillingMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
-            request.type_filling = ORDER_FILLING_FOK;
-        else if((fillingMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
-            request.type_filling = ORDER_FILLING_IOC;
-        else
-            request.type_filling = ORDER_FILLING_RETURN;
-        request.comment      = "TradeEZ batch close";
-
-        if(OrderSendAsync(request, result)) submitted++;
-        else PrintFormat("[批量平仓] 异步提交失败 ticket=%I64u error=%d", ticket, GetLastError());
+        int existing = ActiveTradeOpIndex(TRADE_OP_CLOSE, ticket);
+        if(existing < 0)
+        {
+            int idx = CreateTradeOperation(TRADE_OP_CLOSE, source, batchId, ticket,
+                                           PositionGetDouble(POSITION_VOLUME), 0.0,
+                                           0.0, 0.0, true, continuousBatch);
+            int n = ArraySize(newOps);
+            ArrayResize(newOps, n + 1);
+            newOps[n] = idx;
+        }
+        tracked++;
     }
-    return submitted;
+    g_TradeLedgerDeferSave = false;
+    if(ArraySize(newOps) > 0) SaveTradeLedger(); // 整批意图必须先于任何服务器请求落盘。
+    g_TradeLedgerDeferSave = true;
+    for(int i = 0; i < ArraySize(newOps); i++) SubmitTradeOperation(newOps[i]);
+    g_TradeLedgerDeferSave = false;
+    if(ArraySize(newOps) > 0) SaveTradeLedger();
+    return tracked;
 }
 
-bool DeleteOrderAsync(ulong ticket)
+bool DeleteOrderAsync(ulong ticket, string source = "manual_delete", string batchId = "", bool continuousBatch = false)
 {
-    MqlTradeRequest request = {};
-    MqlTradeResult  result  = {};
-    request.action = TRADE_ACTION_REMOVE;
-    request.order  = ticket;
-    if(OrderSendAsync(request, result)) return true;
-    PrintFormat("[批量撤单] 异步提交失败 ticket=%I64u error=%d", ticket, GetLastError());
-    return false;
+    if(batchId == "") batchId = NewTradeBatchId(source);
+    return EnsureDeleteOperation(ticket, source, batchId, continuousBatch) >= 0;
 }
 
-void CloseAllOrders()
+int DeleteOrdersAsync(const ulong &tickets[], string source, string batchId, bool continuousBatch)
 {
+    int tracked = 0;
+    int newOps[];
+    g_TradeLedgerDeferSave = true;
+    for(int i = 0; i < ArraySize(tickets); i++)
+    {
+        ulong ticket = tickets[i];
+        if(ticket == 0 || !OrderSelect(ticket)) continue;
+        int existing = ActiveTradeOpIndex(TRADE_OP_DELETE_ORDER, ticket);
+        if(existing < 0)
+        {
+            int idx = CreateTradeOperation(TRADE_OP_DELETE_ORDER, source, batchId, ticket,
+                                           0.0, 0.0, 0.0, 0.0, true, continuousBatch);
+            int n = ArraySize(newOps);
+            ArrayResize(newOps, n + 1);
+            newOps[n] = idx;
+        }
+        tracked++;
+    }
+    g_TradeLedgerDeferSave = false;
+    if(ArraySize(newOps) > 0) SaveTradeLedger();
+    g_TradeLedgerDeferSave = true;
+    for(int i = 0; i < ArraySize(newOps); i++) SubmitTradeOperation(newOps[i]);
+    g_TradeLedgerDeferSave = false;
+    if(ArraySize(newOps) > 0) SaveTradeLedger();
+    return tracked;
+}
+
+bool SymbolIsFlat()
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+        if(PositionGetTicket(i) > 0 && PositionGetString(POSITION_SYMBOL) == _Symbol) return false;
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+        if(OrderGetTicket(i) > 0 && OrderGetString(ORDER_SYMBOL) == _Symbol) return false;
+    return true;
+}
+
+void CloseAllOrders(string source = "manual_all", string batchId = "", bool continuousBatch = false)
+{
+    if(batchId == "") batchId = NewTradeBatchId(source);
     ulong tickets[];
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -2422,15 +3127,19 @@ void CloseAllOrders()
         ArrayResize(tickets, n + 1);
         tickets[n] = tk;
     }
-    ClosePositionsAsync(tickets);
+    ClosePositionsAsync(tickets, source, batchId, continuousBatch);
 
+    ulong orderTickets[];
     for(int i = OrdersTotal() - 1; i >= 0; i--)
     {
         ulong tk = OrderGetTicket(i);
         if(tk == 0) continue;
         if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
-        DeleteOrderAsync(tk);
+        int n = ArraySize(orderTickets);
+        ArrayResize(orderTickets, n + 1);
+        orderTickets[n] = tk;
     }
+    DeleteOrdersAsync(orderTickets, source, batchId, continuousBatch);
 }
 
 //+------------------------------------------------------------------+
@@ -2439,28 +3148,39 @@ void CloseAllOrders()
 //+------------------------------------------------------------------+
 void EnforceMoatLiquidation()
 {
-    // 已锁定:保持禁开,不重复平仓
+    // 已锁定后仍持续扫描服务器事实，直到本品种真实空仓且无挂单。
     if(g_MoatLiquidated)
     {
         g_TotalBlocked = true;
-        g_TotalReason  = Lang("利润护城河-已清盘锁定", "Profit moat — locked");
+        if(SymbolIsFlat())
+            g_TotalReason = Lang("利润护城河-清盘完成", "Profit moat — cleared");
+        else
+        {
+            g_TotalReason = Lang("利润护城河-清盘处理中", "Profit moat — clearing");
+            if(g_MoatBatchId == "") g_MoatBatchId = NewTradeBatchId("moat");
+            CloseAllOrders("moat", g_MoatBatchId, true);
+        }
         return;
     }
     if(!g_MoatDrawHit) return;   // 本tick未触发回撤保护条件
 
-    // 首次触发:强平本品种全部持仓 + 删除全部挂单(含手动单,与护城河全局口径一致)
-    CloseAllOrders();
+    // 首次触发：先持久化锁定，再持续清理本品种全部持仓和挂单。
     g_MoatLiquidated = true;
     g_TotalBlocked   = true;
-    g_TotalReason    = Lang("利润护城河-已清盘锁定", "Profit moat — locked");
+    g_TotalReason    = Lang("利润护城河-清盘处理中", "Profit moat — clearing");
+    g_MoatBatchId = NewTradeBatchId("moat");
+    SaveState();
+    CloseAllOrders("moat", g_MoatBatchId, true);
     if(Inp_AlertOnBreaker)
-        Alert(Lang("【护城河强平】动态回撤阈值触及0,已平仓并锁定当日",
-                   "[MOAT] Drawdown floor hit — liquidated & locked for the day"));
+        Alert(Lang("【护城河强平】动态回撤阈值已触发，正在持续核对并清理全部持仓与挂单。",
+                   "[MOAT] Drawdown floor hit. Positions and orders are being reconciled until cleared."));
 }
 
 // 平掉指定策略的所有持仓(剥头皮/趋势)
 void CloseByKind(ENUM_SOP_ORDER kind)
 {
+    string source = (kind == SOP_SCALP) ? "manual_scalp" : "manual_trend";
+    string batchId = NewTradeBatchId(source);
     ulong tickets[];
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -2472,12 +3192,13 @@ void CloseByKind(ENUM_SOP_ORDER kind)
         ArrayResize(tickets, n + 1);
         tickets[n] = tk;
     }
-    ClosePositionsAsync(tickets);
+    ClosePositionsAsync(tickets, source, batchId, false);
 }
 
 // 只平当前浮盈>0 的持仓(锁定利润单)
 void CloseProfitable()
 {
+    string batchId = NewTradeBatchId("manual_profit");
     ulong tickets[];
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -2490,7 +3211,7 @@ void CloseProfitable()
         ArrayResize(tickets, n + 1);
         tickets[n] = tk;
     }
-    ClosePositionsAsync(tickets);
+    ClosePositionsAsync(tickets, "manual_profit", batchId, false);
 }
 
 //+------------------------------------------------------------------+
@@ -2516,19 +3237,31 @@ void OpenMarket(ENUM_SOP_ORDER kind, bool isBuy)
     if(tpPts > 0.0)
         tp = isBuy ? price + PointsToPrice(tpPts) : price - PointsToPrice(tpPts);
 
-    g_trade.SetDeviationInPoints((ulong)Inp_Slippage);
-    g_trade.SetExpertMagicNumber((kind == SOP_SCALP) ? Inp_MagicScalp : Inp_MagicTrend);
+    long magic = (kind == SOP_SCALP) ? Inp_MagicScalp : Inp_MagicTrend;
     string cmt = (kind == SOP_SCALP) ? Inp_CommentScalp : Inp_CommentTrend;
-
-    bool ok = isBuy
-            ? g_trade.Buy(lots, _Symbol, 0.0, NormalizePrice(sl), NormalizePrice(tp), cmt)
-            : g_trade.Sell(lots, _Symbol, 0.0, NormalizePrice(sl), NormalizePrice(tp), cmt);
-
-    uint retcode = g_trade.ResultRetcode();
-    if(!ok || !TradeRetcodeAccepted(retcode))
-        Alert(Lang("下单失败: ", "Order failed: ") + (string)retcode + " " + g_trade.ResultRetcodeDescription());
+    int opIdx = CreateTradeOperation(TRADE_OP_OPEN_MARKET, "manual_entry", NewTradeBatchId("entry"),
+                                     0, lots, 0.0, sl, tp, false, false);
+    g_TradeOps[opIdx].magic = magic;
+    MqlTradeRequest request = {};
+    MqlTradeResult result = {};
+    request.action = TRADE_ACTION_DEAL;
+    request.symbol = _Symbol;
+    request.volume = lots;
+    request.magic = (ulong)magic;
+    request.deviation = (ulong)Inp_Slippage;
+    request.type = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+    request.price = price;
+    request.sl = NormalizePrice(sl);
+    request.tp = NormalizePrice(tp);
+    request.type_filling = RequestFillingMode(_Symbol);
+    request.comment = StringSubstr(cmt + "|" + g_TradeOps[opIdx].operation_id, 0, 31);
+    ResetLastError();
+    bool sent = OrderSendAsync(request, result);
+    ApplyTradeSubmissionResult(opIdx, sent, result);
+    if(!sent)
+        Alert(Lang("下单请求未能提交，请查看专家日志。", "Entry request could not be submitted; check the Experts log."));
     else
-        AuditServerProtection();
+        PrintFormat("[Trade Ledger] 开仓已提交，等待服务器确认 op=%s request=%I64u", g_TradeOps[opIdx].operation_id, result.request_id);
 }
 
 //+------------------------------------------------------------------+
@@ -2595,22 +3328,32 @@ void OpenLimit(ENUM_SOP_ORDER kind, bool isBuy, double limitPrice)
     if(tpPts > 0.0)
         tp = isBuy ? limitPrice + PointsToPrice(tpPts) : limitPrice - PointsToPrice(tpPts);
 
-    g_trade.SetExpertMagicNumber((kind == SOP_SCALP) ? Inp_MagicScalp : Inp_MagicTrend);
+    long magic = (kind == SOP_SCALP) ? Inp_MagicScalp : Inp_MagicTrend;
     string cmt = (kind == SOP_SCALP) ? Inp_CommentScalp : Inp_CommentTrend;
+    int opIdx = CreateTradeOperation(TRADE_OP_OPEN_LIMIT, "manual_limit", NewTradeBatchId("limit"),
+                                     0, lots, 0.0, sl, tp, false, false);
+    g_TradeOps[opIdx].magic = magic;
+    MqlTradeRequest request = {};
+    MqlTradeResult result = {};
+    request.action = TRADE_ACTION_PENDING;
+    request.symbol = _Symbol;
+    request.volume = lots;
+    request.magic = (ulong)magic;
+    request.type = isBuy ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
+    request.price = limitPrice;
+    request.sl = NormalizePrice(sl);
+    request.tp = NormalizePrice(tp);
+    request.type_time = ORDER_TIME_GTC;
+    request.type_filling = ORDER_FILLING_RETURN;
+    request.comment = StringSubstr(cmt + "|" + g_TradeOps[opIdx].operation_id, 0, 31);
+    ResetLastError();
+    bool sent = OrderSendAsync(request, result);
+    ApplyTradeSubmissionResult(opIdx, sent, result);
 
-    bool ok = isBuy
-            ? g_trade.BuyLimit(lots, limitPrice, _Symbol, NormalizePrice(sl), NormalizePrice(tp), ORDER_TIME_GTC, 0, cmt)
-            : g_trade.SellLimit(lots, limitPrice, _Symbol, NormalizePrice(sl), NormalizePrice(tp), ORDER_TIME_GTC, 0, cmt);
-
-    PrintFormat("[挂单结果] %s 价格=%.5f SL=%.5f TP=%.5f 成功=%s Retcode=%d(%s)",
-                dir, limitPrice, sl, tp, (ok ? "是" : "否"),
-                g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
-
-    if(!ok || !TradeRetcodeAccepted(g_trade.ResultRetcode()))
-        Alert(Lang("挂单失败: ", "Limit order failed: ") + (string)g_trade.ResultRetcode()
-              + " " + g_trade.ResultRetcodeDescription());
-    else
-        AuditServerProtection();
+    PrintFormat("[挂单结果] %s 价格=%.5f SL=%.5f TP=%.5f 已提交=%s request=%I64u retcode=%u",
+                dir, limitPrice, sl, tp, sent ? "是" : "否", result.request_id, result.retcode);
+    if(!sent)
+        Alert(Lang("挂单请求未能提交，请查看专家日志。", "Limit request could not be submitted; check the Experts log."));
 }
 
 // 现价偏移挂单:在当前价基础上 ± offsetUSD 美金处挂多/空(限价单)
@@ -3798,7 +4541,9 @@ void RenderPerfectUI()
     cY += Scale(24);
     // 6 系统安全状态(显示熔断原因)
     string secTxt; color secClr;
-    if(InCooldown())        { secTxt = Lang("连亏熔断-冷却中", "STREAK BREAKER"); secClr = COLOR_SIGNAL_LOSS; }
+    string tradeStatus = TradeOperationStatusText(secClr);
+    if(tradeStatus != "")  { secTxt = tradeStatus; }
+    else if(InCooldown())   { secTxt = Lang("连亏熔断-冷却中", "STREAK BREAKER"); secClr = COLOR_SIGNAL_LOSS; }
     else if(g_TotalBlocked) { secTxt = g_TotalReason;  secClr = COLOR_SIGNAL_LOSS; }
     else if(g_ScalpBlocked && g_TrendBlocked) { secTxt = Lang("双策略熔断", "Both blocked"); secClr = COLOR_SIGNAL_LOSS; }
     else if(g_ScalpBlocked) { secTxt = g_ScalpReason;  secClr = COLOR_SIGNAL_WARNING; }
@@ -5384,7 +6129,11 @@ int OnInit()
     }
 
     if(g_InstanceOwnsState)
+    {
+        LoadTradeLedger();
         AttemptStartupRecovery();
+        ReconcileTradeOperations();
+    }
 
     if(MathAbs(Inp_ScalpDrawdownRatio + Inp_TrendDrawdownRatio - 100.0) > 0.01)
         Print("提示:剥头皮+趋势回撤占比之和不等于100%,请确认参数。");
@@ -5427,6 +6176,7 @@ void OnDeinit(const int reason)
             SaveArrays();
             SaveState();
         }
+        if(g_TradeLedgerDirty) SaveTradeLedger();
         ReleaseInstanceLease();
     }
     ObjectsDeleteAll(0, Prefix);
@@ -5462,6 +6212,8 @@ void OnTimer()
         AttemptStartupRecovery();
     if(g_InstanceOwnsState)
     {
+        ReconcileTradeOperations();
+        if(g_TradeLedgerDirty) SaveTradeLedger();
         AuditServerProtection();
         ProcessPendingScalpExits();
         if(g_RecoveryStatus != RECOVERY_CHECKING && g_RecoveryStatus != RECOVERY_FAILED)
@@ -5495,14 +6247,10 @@ void OnTimer()
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
 {
     if(g_InstanceOwnsState)
-        AuditServerProtection();
+        HandleTradeRequestTransaction(trans, request, result);
     if(g_InstanceOwnsState && g_RecoveryStatus != RECOVERY_CHECKING && g_RecoveryStatus != RECOVERY_FAILED &&
        (trans.type == TRADE_TRANSACTION_DEAL_ADD || trans.type == TRADE_TRANSACTION_POSITION))
-    {
-        SaveArrays(); // 新开仓、部分减仓或平仓后立即刷新逐票状态与剩余手数
-        CheckAllRiskControl();
-        RenderPerfectUI();
-    }
+        g_ArraysDirty = true; // 回调只记脏标志；核销、持久化、风控和UI统一由1秒安全时钟处理。
 }
 
 //+------------------------------------------------------------------+
@@ -5794,10 +6542,30 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
     if(sparam == Prefix + "Btn_Tr_B5") { ResetBtn(sparam); if(OrderDebounceOK()) OpenOffsetLimit(SOP_TREND, true,  5.0); return; }
 
     // 平仓功能:全平 / 平剥头皮 / 平趋势 / 平盈利单
-    if(sparam == Prefix + "Btn_Close_All")    { CloseAllOrders();       ResetBtn(sparam); RenderPerfectUI(); return; }
-    if(sparam == Prefix + "Btn_Close_Scalp")  { CloseByKind(SOP_SCALP);  ResetBtn(sparam); RenderPerfectUI(); return; }
-    if(sparam == Prefix + "Btn_Close_Trend")  { CloseByKind(SOP_TREND);  ResetBtn(sparam); RenderPerfectUI(); return; }
-    if(sparam == Prefix + "Btn_Close_Profit") { CloseProfitable();       ResetBtn(sparam); RenderPerfectUI(); return; }
+    if(sparam == Prefix + "Btn_Close_All")
+    {
+        CloseAllOrders(); ResetBtn(sparam); RenderPerfectUI();
+        Print("[Trade Ledger] 一键全平已纳入闭环，最终结果以服务器事实为准");
+        return;
+    }
+    if(sparam == Prefix + "Btn_Close_Scalp")
+    {
+        CloseByKind(SOP_SCALP); ResetBtn(sparam); RenderPerfectUI();
+        Print("[Trade Ledger] 剥头皮平仓已提交，等待服务器确认");
+        return;
+    }
+    if(sparam == Prefix + "Btn_Close_Trend")
+    {
+        CloseByKind(SOP_TREND); ResetBtn(sparam); RenderPerfectUI();
+        Print("[Trade Ledger] 趋势平仓已提交，等待服务器确认");
+        return;
+    }
+    if(sparam == Prefix + "Btn_Close_Profit")
+    {
+        CloseProfitable(); ResetBtn(sparam); RenderPerfectUI();
+        Print("[Trade Ledger] 盈利单平仓已提交，等待服务器确认");
+        return;
+    }
 
     // 重置统计基线
     if(sparam == Prefix + "Btn_Reset_All")
