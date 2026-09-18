@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  最后修改时间：2026-09-19 03:51（北京时间）       |
+//|                  最后修改时间：2026-09-19 04:29（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -176,11 +176,18 @@ input int      Inp_ConsecLossLimit      = 3;     // 连续亏损熔断阈值(笔
 input int      Inp_CooldownMinutes      = 10;    // 连续亏损熔断冷却(分钟)
 input bool     Inp_EnableCircuitBreaker = true;  // 启用熔断
 input bool     Inp_AlertOnBreaker       = true;  // 熔断弹窗
+input bool     Inp_CloseOnDailyDrawdown = false; // 日回撤熔断时强平本品种全部仓位/挂单
+
+input group "===== 新增风险门禁 ====="
+input double   Inp_RiskBufferPercent       = 10.0;  // 预计止损风险附加缓冲%
+input int      Inp_MaxEntrySpreadPoints    = 80;    // 最大允许点差(MT5平台点)
+input int      Inp_MaxQuoteAgeSeconds      = 5;     // 报价最大允许延迟(秒)
+input double   Inp_MinProjectedMarginLevel = 200.0; // 开仓后最低预计保证金水平%
 
 input group "===== 利润护城河 ====="
 input bool     Inp_EnableProfitProtect    = true;
 input double   Inp_ProfitProtect1_Trigger = 500.0;  // 第1档触发($)
-input double   Inp_ProfitProtect1_Percent = 300.0;  // 第1档最大回撤%
+input double   Inp_ProfitProtect1_Percent = 30.0;   // 第1档最大回撤%
 input double   Inp_ProfitProtect2_Trigger = 800.0;  // 第2档触发($)
 input double   Inp_ProfitProtect2_Amount  = 500.0;  // 第2档最多回撤$
 input double   Inp_ProfitLiquidation      = 1000.0; // 清盘触发($)
@@ -311,6 +318,20 @@ bool           g_HighInit        = false;  // 高水位是否已初始化(允许
 double         g_EffectiveLimit  = 0.0;    // 护城河生效后的有效回撤限额(显示用)
 bool           g_MoatDrawHit     = false;  // 本次风控:回撤保护条件是否触发(每tick重算,不持久化)
 bool           g_MoatLiquidated  = false;  // 当日是否已因回撤保护强平并锁定(持久化,跨日自愈)
+bool           g_DailyLiquidationActive = false; // 日回撤强平锁：持续执行至服务器确认空仓
+
+// 当前品种统一风险快照。风险无从可靠计算时 fail-closed，禁止新增风险。
+bool           g_RiskSnapshotValid = false;
+string         g_RiskSnapshotReason = "尚未计算";
+double         g_ScalpProjectedPL = 0.0;
+double         g_TrendProjectedPL = 0.0;
+double         g_SymbolProjectedPL = 0.0;
+double         g_ScalpProjectedRisk = 0.0;
+double         g_TrendProjectedRisk = 0.0;
+double         g_SymbolProjectedRisk = 0.0;
+int            g_ScalpRiskSlots = 0;
+int            g_TrendRiskSlots = 0;
+datetime       g_LastRiskSnapshotAt = 0;
 
 // 余额峰值统计(从初始化/重置时刻起)
 double         g_InitBalance     = 0.0;    // 初始化时账户余额基准
@@ -368,6 +389,8 @@ struct TradeOperation
     ulong    target_ticket;
     ulong    target_position_id;
     long     magic;
+    int      requested_order_type;
+    double   requested_entry_price;
     double   requested_volume;
     double   target_remaining_volume;
     double   target_sl;
@@ -389,7 +412,7 @@ long           g_TradeOpSequence = 0;
 bool           g_TradeLedgerDirty = false;
 bool           g_TradeLedgerDeferSave = false;
 string         g_MoatBatchId = "";
-const int      TRADE_LEDGER_SCHEMA = 1;
+const int      TRADE_LEDGER_SCHEMA = 2;
 
 // 版本化逐票持久化记录。运行期仍沿用原数组，降低交易管理逻辑改动风险。
 struct TicketStateRecord
@@ -905,6 +928,288 @@ string FmtHold(double sec)
 double ScalpDrawdownLimit() { return Inp_DailyMaxDrawdown * (Inp_ScalpDrawdownRatio / 100.0); }
 double TrendDrawdownLimit() { return Inp_DailyMaxDrawdown * (Inp_TrendDrawdownRatio / 100.0); }
 double TotalDrawdownLimit() { return Inp_DailyMaxDrawdown; }
+
+double BufferedRiskPL(double profitAtStop)
+{
+    if(profitAtStop >= 0.0) return profitAtStop;
+    return profitAtStop * (1.0 + MathMax(0.0, Inp_RiskBufferPercent) / 100.0);
+}
+
+ENUM_ORDER_TYPE PositionOrderType(ENUM_POSITION_TYPE type)
+{
+    return type == POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+}
+
+bool IsBuyOrderType(ENUM_ORDER_TYPE type)
+{
+    return type == ORDER_TYPE_BUY || type == ORDER_TYPE_BUY_LIMIT ||
+           type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_STOP_LIMIT;
+}
+
+bool IsPendingOrderType(ENUM_ORDER_TYPE type)
+{
+    return type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_SELL_LIMIT ||
+           type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_SELL_STOP ||
+           type == ORDER_TYPE_BUY_STOP_LIMIT || type == ORDER_TYPE_SELL_STOP_LIMIT;
+}
+
+bool IsSupportedRiskOrderType(ENUM_ORDER_TYPE type)
+{
+    return type == ORDER_TYPE_BUY || type == ORDER_TYPE_SELL || IsPendingOrderType(type);
+}
+
+ENUM_ORDER_TYPE ProfitCalcOrderType(ENUM_ORDER_TYPE type)
+{
+    return IsBuyOrderType(type) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+}
+
+bool CalculateStopPL(ENUM_ORDER_TYPE type, double volume, double entryPrice, double stopPrice,
+                     double extraCosts, double &stopPL, string &reason)
+{
+    stopPL = 0.0;
+    if(!IsSupportedRiskOrderType(type) || volume <= 0.0 || entryPrice <= 0.0 || stopPrice <= 0.0)
+    {
+        reason = Lang("方向、止损、价格或手数无效", "Invalid side, stop, price or volume");
+        return false;
+    }
+    double raw = 0.0;
+    ResetLastError();
+    if(!OrderCalcProfit(ProfitCalcOrderType(type), _Symbol, volume, entryPrice, stopPrice, raw))
+    {
+        reason = Lang("无法换算止损风险", "Unable to calculate stop risk") + " #" + (string)GetLastError();
+        return false;
+    }
+    stopPL = BufferedRiskPL(raw + extraCosts);
+    return true;
+}
+
+bool TradeOperationMaterialized(TradeOperation &op)
+{
+    if(op.order_ticket > 0 && OrderSelect(op.order_ticket)) return true;
+    if(op.deal_ticket > 0 && HistoryDealSelect(op.deal_ticket)) return true;
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0 && PositionGetString(POSITION_SYMBOL) == _Symbol &&
+           StringFind(PositionGetString(POSITION_COMMENT), op.operation_id) >= 0) return true;
+    }
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = OrderGetTicket(i);
+        if(ticket > 0 && OrderGetString(ORDER_SYMBOL) == _Symbol &&
+           StringFind(OrderGetString(ORDER_COMMENT), op.operation_id) >= 0) return true;
+    }
+    return false;
+}
+
+double RealizedCashByScope(ENUM_SOP_ORDER kind)
+{
+    if(!HistorySelect(StatStart(), RecoveryNowServer() + 1)) return 0.0;
+    double result = 0.0;
+    for(int i = 0; i < HistoryDealsTotal(); i++)
+    {
+        ulong deal = HistoryDealGetTicket(i);
+        if(deal == 0 || HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) continue;
+        ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
+        ENUM_SOP_ORDER dealKind = (entry == DEAL_ENTRY_IN)
+                                ? TypeByMagic(HistoryDealGetInteger(deal, DEAL_MAGIC))
+                                : DealStrategyType(deal);
+        if(kind != SOP_IGNORE && dealKind != kind) continue;
+        result += HistoryDealGetDouble(deal, DEAL_PROFIT)
+                + HistoryDealGetDouble(deal, DEAL_SWAP)
+                + HistoryDealGetDouble(deal, DEAL_COMMISSION);
+    }
+    return result;
+}
+
+void InvalidateRiskSnapshot(string reason)
+{
+    if(g_RiskSnapshotValid)
+        g_RiskSnapshotReason = reason;
+    else if(g_RiskSnapshotReason == "" || g_RiskSnapshotReason == "尚未计算")
+        g_RiskSnapshotReason = reason;
+    g_RiskSnapshotValid = false;
+}
+
+bool UpdateRiskSnapshot(bool force = false)
+{
+    datetime now = TimeTradeServer();
+    if(now <= 0) now = TimeCurrent();
+    if(!force && g_LastRiskSnapshotAt == now) return g_RiskSnapshotValid;
+    g_LastRiskSnapshotAt = now;
+    g_RiskSnapshotValid = true;
+    g_RiskSnapshotReason = "";
+    g_ScalpProjectedPL = RealizedCashByScope(SOP_SCALP);
+    g_TrendProjectedPL = RealizedCashByScope(SOP_TREND);
+    g_SymbolProjectedPL = RealizedCashByScope(SOP_IGNORE);
+    g_ScalpProjectedRisk = 0.0;
+    g_TrendProjectedRisk = 0.0;
+    g_SymbolProjectedRisk = 0.0;
+    g_ScalpRiskSlots = 0;
+    g_TrendRiskSlots = 0;
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        ENUM_SOP_ORDER kind = PosType();
+        double stopPL = 0.0; string reason = "";
+        if(!CalculateStopPL(PositionOrderType((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)),
+                            PositionGetDouble(POSITION_VOLUME), PositionGetDouble(POSITION_PRICE_OPEN),
+                            PositionGetDouble(POSITION_SL), PositionGetDouble(POSITION_SWAP), stopPL, reason))
+        {
+            InvalidateRiskSnapshot(Lang("持仓 #", "Position #") + (string)ticket + ": " + reason);
+            continue;
+        }
+        g_SymbolProjectedPL += stopPL;
+        if(stopPL < 0.0) g_SymbolProjectedRisk += -stopPL;
+        if(kind == SOP_SCALP)
+        {
+            g_ScalpProjectedPL += stopPL; if(stopPL < 0.0) g_ScalpProjectedRisk += -stopPL; g_ScalpRiskSlots++;
+        }
+        else if(kind == SOP_TREND)
+        {
+            g_TrendProjectedPL += stopPL; if(stopPL < 0.0) g_TrendProjectedRisk += -stopPL; g_TrendRiskSlots++;
+        }
+    }
+
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = OrderGetTicket(i);
+        if(ticket == 0 || OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+        ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+        if(!IsPendingOrderType(type)) continue;
+        ENUM_SOP_ORDER kind = TypeByMagic(OrderGetInteger(ORDER_MAGIC));
+        double stopPL = 0.0; string reason = "";
+        if(!CalculateStopPL(type, OrderGetDouble(ORDER_VOLUME_CURRENT), OrderGetDouble(ORDER_PRICE_OPEN),
+                            OrderGetDouble(ORDER_SL), 0.0, stopPL, reason))
+        {
+            InvalidateRiskSnapshot(Lang("挂单 #", "Order #") + (string)ticket + ": " + reason);
+            continue;
+        }
+        g_SymbolProjectedPL += stopPL;
+        if(stopPL < 0.0) g_SymbolProjectedRisk += -stopPL;
+        if(kind == SOP_SCALP)
+        {
+            g_ScalpProjectedPL += stopPL; if(stopPL < 0.0) g_ScalpProjectedRisk += -stopPL; g_ScalpRiskSlots++;
+        }
+        else if(kind == SOP_TREND)
+        {
+            g_TrendProjectedPL += stopPL; if(stopPL < 0.0) g_TrendProjectedRisk += -stopPL; g_TrendRiskSlots++;
+        }
+    }
+
+    for(int i = 0; i < ArraySize(g_TradeOps); i++)
+    {
+        TradeOperation op = g_TradeOps[i];
+        if(TradeOpIsFinal(op.state) ||
+           (op.action != TRADE_OP_OPEN_MARKET && op.action != TRADE_OP_OPEN_LIMIT) ||
+           TradeOperationMaterialized(op)) continue;
+        ENUM_SOP_ORDER kind = TypeByMagic(op.magic);
+        double stopPL = 0.0; string reason = "";
+        if(op.requested_order_type < 0 ||
+           !CalculateStopPL((ENUM_ORDER_TYPE)op.requested_order_type, op.requested_volume,
+                            op.requested_entry_price, op.target_sl, 0.0, stopPL, reason))
+        {
+            InvalidateRiskSnapshot(Lang("未落地开仓请求 ", "Unmaterialized entry ") + op.operation_id + ": " + reason);
+            continue;
+        }
+        g_SymbolProjectedPL += stopPL;
+        if(stopPL < 0.0) g_SymbolProjectedRisk += -stopPL;
+        if(kind == SOP_SCALP)
+        {
+            g_ScalpProjectedPL += stopPL; if(stopPL < 0.0) g_ScalpProjectedRisk += -stopPL; g_ScalpRiskSlots++;
+        }
+        else if(kind == SOP_TREND)
+        {
+            g_TrendProjectedPL += stopPL; if(stopPL < 0.0) g_TrendProjectedRisk += -stopPL; g_TrendRiskSlots++;
+        }
+    }
+    return g_RiskSnapshotValid;
+}
+
+double ActiveProjectedFloor()
+{
+    double floor = -TotalDrawdownLimit();
+    if(Inp_EnableProfitProtect && g_TodayHighProfit >= Inp_ProfitProtect2_Trigger)
+        floor = MathMax(floor, g_TodayHighProfit - Inp_ProfitProtect2_Amount);
+    else if(Inp_EnableProfitProtect && g_TodayHighProfit >= Inp_ProfitProtect1_Trigger)
+        floor = MathMax(floor, g_TodayHighProfit * (1.0 - Inp_ProfitProtect1_Percent / 100.0));
+    return floor;
+}
+
+bool ValidateQuoteForEntry(MqlTick &tick, string &reason)
+{
+    if(!SymbolInfoTick(_Symbol, tick) || tick.ask <= 0.0 || tick.bid <= 0.0)
+    {
+        reason = Lang("报价不可用", "Quote unavailable"); return false;
+    }
+    datetime now = TimeTradeServer(); if(now <= 0) now = TimeCurrent();
+    long ageMsc = (long)now * 1000 - tick.time_msc;
+    if(ageMsc < 0) ageMsc = 0;
+    if(Inp_MaxQuoteAgeSeconds > 0 && ageMsc > (long)Inp_MaxQuoteAgeSeconds * 1000)
+    {
+        reason = Lang("报价已过期", "Quote is stale"); return false;
+    }
+    double spreadPoints = (tick.ask - tick.bid) / _Point;
+    if(Inp_MaxEntrySpreadPoints > 0 && spreadPoints > Inp_MaxEntrySpreadPoints + 1e-6)
+    {
+        reason = Lang("点差过大: ", "Spread too wide: ") + DoubleToString(spreadPoints, 1);
+        return false;
+    }
+    return true;
+}
+
+bool ValidateNewRiskCandidate(ENUM_SOP_ORDER kind, ENUM_ORDER_TYPE type, double volume,
+                              double entryPrice, double stopPrice)
+{
+    if(!UpdateRiskSnapshot(true))
+    {
+        Alert(Lang("【拒绝】风险无法完整计算：", "[REJECT] Risk is unknown: ") + g_RiskSnapshotReason);
+        return false;
+    }
+    double candidatePL = 0.0; string reason = "";
+    if(!CalculateStopPL(type, volume, entryPrice, stopPrice, 0.0, candidatePL, reason))
+    {
+        Alert(Lang("【拒绝】新订单风险无法计算：", "[REJECT] Candidate risk is unknown: ") + reason);
+        return false;
+    }
+    int slots = (kind == SOP_SCALP) ? g_ScalpRiskSlots : g_TrendRiskSlots;
+    int maxSlots = (kind == SOP_SCALP) ? Inp_ScalpMaxPositions : Inp_TrendMaxPositions;
+    double strategyProjected = (kind == SOP_SCALP ? g_ScalpProjectedPL : g_TrendProjectedPL) + candidatePL;
+    double strategyFloor = -(kind == SOP_SCALP ? ScalpDrawdownLimit() : TrendDrawdownLimit());
+    if(slots + 1 > maxSlots)
+    {
+        Alert(Lang("【拒绝】持仓、挂单及待确认请求合计已达策略上限", "[REJECT] Strategy capacity includes positions, orders and pending requests"));
+        return false;
+    }
+    if(strategyProjected < strategyFloor - 0.01)
+    {
+        Alert(Lang("【拒绝】新增订单将使策略预计止损超过分配额度", "[REJECT] Projected strategy stop exceeds its allocation"));
+        return false;
+    }
+    if(g_SymbolProjectedPL + candidatePL < ActiveProjectedFloor() - 0.01)
+    {
+        Alert(Lang("【拒绝】新增订单将突破当前品种日回撤/利润保护底线", "[REJECT] Projected symbol stop breaches the daily/moat floor"));
+        return false;
+    }
+    double margin = 0.0;
+    ResetLastError();
+    if(!OrderCalcMargin(ProfitCalcOrderType(type), _Symbol, volume, entryPrice, margin))
+    {
+        Alert(Lang("【拒绝】无法计算预计保证金", "[REJECT] Unable to calculate projected margin"));
+        return false;
+    }
+    double projectedMargin = AccountInfoDouble(ACCOUNT_MARGIN) + margin;
+    double projectedLevel = projectedMargin > 0.0 ? AccountInfoDouble(ACCOUNT_EQUITY) / projectedMargin * 100.0 : 999999.0;
+    if(margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE) + 0.01 || projectedLevel < Inp_MinProjectedMarginLevel)
+    {
+        Alert(Lang("【拒绝】开仓后的预计保证金水平不足：", "[REJECT] Projected margin level is insufficient: ") +
+              DoubleToString(projectedLevel, 1) + "%");
+        return false;
+    }
+    return true;
+}
 
 //+------------------------------------------------------------------+
 //| 趋势 per-ticket 状态管理                                          |
@@ -1991,6 +2296,7 @@ void CheckDayRollover()
         g_TrendBlocked    = false;
         g_TotalBlocked    = false;
         g_MoatLiquidated  = false;   // 新的一天解除护城河清盘锁定
+        g_DailyLiquidationActive = false;
         g_MoatDrawHit     = false;
         g_TodayHighProfit = 0.0;
         g_HighInit        = false;
@@ -2138,6 +2444,7 @@ void CheckAllRiskControl()
     if(!EnsureRuntimeHistoryAvailable()) return;
     CheckDayRollover();
     UpdateConsecutiveLoss();
+    UpdateRiskSnapshot(true);
 
     // 各分项净盈亏 + 高水位更新
     double scalpNet = ScalpNetPL();
@@ -2187,11 +2494,26 @@ void CheckAllRiskControl()
     // 净盈亏跌破 -额度 即熔断
     if(-scalpNet  >= ScalpDrawdownLimit()) { g_ScalpBlocked = true; g_ScalpReason = Lang("剥头皮回撤风控熔断", "Scalp drawdown breaker"); }
     if(-trendNet  >= TrendDrawdownLimit()) { g_TrendBlocked = true; g_TrendReason = Lang("波段趋势回撤风控熔断", "Trend drawdown breaker"); }
-    if(-globalNet >= TotalDrawdownLimit()) { g_TotalBlocked = true; g_TotalReason = Lang("日回撤阈值熔断", "Daily drawdown breaker"); }
+    bool dailyDrawdownHit = (-globalNet >= TotalDrawdownLimit());
+    if(dailyDrawdownHit) { g_TotalBlocked = true; g_TotalReason = Lang("日回撤阈值熔断", "Daily drawdown breaker"); }
 
     // 护城河(用全局净盈亏含浮动 + 手动单)
     CheckProfitProtection(globalNet);
     EnforceMoatLiquidation();   // 动态回撤阈值触及0 → 强平本品种全部持仓并锁定当日
+
+    // 熔断先撤销尚未成交的受管风险；策略熔断绝不主动平仓。
+    if(g_ScalpBlocked) CancelManagedPendingOrders(SOP_SCALP, "scalp_breaker");
+    if(g_TrendBlocked) CancelManagedPendingOrders(SOP_TREND, "trend_breaker");
+    if(InCooldown() || dailyDrawdownHit) CancelManagedPendingOrders(SOP_IGNORE, dailyDrawdownHit ? "daily_breaker" : "streak_breaker");
+    if(dailyDrawdownHit && Inp_CloseOnDailyDrawdown && !g_DailyLiquidationActive)
+    {
+        g_DailyLiquidationActive = true;
+        SaveState();
+        if(Inp_AlertOnBreaker)
+            Alert(Lang("【日回撤强平】已触发，系统会持续核对直至当前品种全部仓位与挂单清理完成。",
+                       "[DAILY LIQUIDATION] Triggered; reconciliation continues until this symbol is flat."));
+    }
+    EnforceDailyDrawdownLiquidation();
 
     if(Inp_AlertOnBreaker)
     {
@@ -2209,8 +2531,15 @@ bool RecoveryAllowsNewRisk()
     return g_RecoveryStatus == RECOVERY_EXACT ||
            (g_RecoveryStatus == RECOVERY_CONSERVATIVE && g_RecoveryAcknowledged);
 }
-bool IsScalpAllowed() { return g_InstanceOwnsState && g_AccountModeSupported && !g_ProtectionBlocksNewRisk && !HasScalpExitPending() && RecoveryAllowsNewRisk() && !g_ScalpBlocked && !g_TotalBlocked && !InCooldown(); }
-bool IsTrendAllowed() { return g_InstanceOwnsState && g_AccountModeSupported && !g_ProtectionBlocksNewRisk && RecoveryAllowsNewRisk() && !g_TrendBlocked && !g_TotalBlocked && !InCooldown(); }
+bool ProjectedRiskAllows(ENUM_SOP_ORDER kind)
+{
+    if(!g_RiskSnapshotValid || g_SymbolProjectedPL < ActiveProjectedFloor() - 0.01) return false;
+    if(kind == SOP_SCALP) return g_ScalpProjectedPL >= -ScalpDrawdownLimit() - 0.01;
+    if(kind == SOP_TREND) return g_TrendProjectedPL >= -TrendDrawdownLimit() - 0.01;
+    return false;
+}
+bool IsScalpAllowed() { return g_InstanceOwnsState && g_AccountModeSupported && ProjectedRiskAllows(SOP_SCALP) && !g_ProtectionBlocksNewRisk && !HasScalpExitPending() && RecoveryAllowsNewRisk() && !g_ScalpBlocked && !g_TotalBlocked && !InCooldown() && g_ScalpRiskSlots < Inp_ScalpMaxPositions; }
+bool IsTrendAllowed() { return g_InstanceOwnsState && g_AccountModeSupported && ProjectedRiskAllows(SOP_TREND) && !g_ProtectionBlocksNewRisk && RecoveryAllowsNewRisk() && !g_TrendBlocked && !g_TotalBlocked && !InCooldown() && g_TrendRiskSlots < Inp_TrendMaxPositions; }
 
 //+------------------------------------------------------------------+
 //| 周目标提示(仅建议,不自动改参数)                                 |
@@ -2300,6 +2629,17 @@ double DrawdownBase()
 //+------------------------------------------------------------------+
 bool ValidateOpenConditions(ENUM_SOP_ORDER kind)
 {
+    MqlTick gateTick; string gateReason = "";
+    if(!ValidateQuoteForEntry(gateTick, gateReason))
+    {
+        Alert(Lang("【拒绝】", "[REJECT] ") + gateReason);
+        return false;
+    }
+    if(!UpdateRiskSnapshot(true))
+    {
+        Alert(Lang("【拒绝】风险无法完整计算：", "[REJECT] Risk is unknown: ") + g_RiskSnapshotReason);
+        return false;
+    }
     if(HasUnfinishedNewRiskOperation())
     {
         Alert(Lang("【拒绝】上一笔开仓请求仍在核对中，请等待服务器确认。",
@@ -2334,9 +2674,9 @@ bool ValidateOpenConditions(ENUM_SOP_ORDER kind)
             Alert(Lang("【拒绝】剥头皮已熔断/受限", "[REJECT] Scalping blocked"));
             return false;
         }
-        if(CountScalpPositions() >= Inp_ScalpMaxPositions)
+        if(g_ScalpRiskSlots >= Inp_ScalpMaxPositions)
         {
-            Alert(Lang("【拒绝】剥头皮已满仓", "[REJECT] Scalping max positions"));
+            Alert(Lang("【拒绝】剥头皮仓位/挂单/待确认请求已达上限", "[REJECT] Scalping capacity reached"));
             return false;
         }
     }
@@ -2347,9 +2687,9 @@ bool ValidateOpenConditions(ENUM_SOP_ORDER kind)
             Alert(Lang("【拒绝】趋势已熔断/受限", "[REJECT] Trend blocked"));
             return false;
         }
-        if(CountTrendPositions() >= Inp_TrendMaxPositions)
+        if(g_TrendRiskSlots >= Inp_TrendMaxPositions)
         {
-            Alert(Lang("【拒绝】趋势已满仓", "[REJECT] Trend max positions"));
+            Alert(Lang("【拒绝】趋势仓位/挂单/待确认请求已达上限", "[REJECT] Trend capacity reached"));
             return false;
         }
     }
@@ -2462,13 +2802,15 @@ bool HasUnfinishedNewRiskOperation()
     return false;
 }
 
-string TradeLedgerFolder() { return "TradeEZ\\requests\\v1"; }
-string TradeLedgerFileName()
+string TradeLedgerFolderForSchema(int schema) { return "TradeEZ\\requests\\v" + IntegerToString(schema); }
+string TradeLedgerFolder() { return TradeLedgerFolderForSchema(TRADE_LEDGER_SCHEMA); }
+string TradeLedgerFileNameForSchema(int schema)
 {
-    return TradeLedgerFolder() + "\\" + (string)StableTextHash(AccountInfoString(ACCOUNT_SERVER)) + "_" +
+    return TradeLedgerFolderForSchema(schema) + "\\" + (string)StableTextHash(AccountInfoString(ACCOUNT_SERVER)) + "_" +
            (string)AccountInfoInteger(ACCOUNT_LOGIN) + "_" + NormalizeNamespacePart(_Symbol) + "_" +
            NormalizeNamespacePart(Inp_InstanceId) + ".csv";
 }
+string TradeLedgerFileName() { return TradeLedgerFileNameForSchema(TRADE_LEDGER_SCHEMA); }
 
 void EnsureTradeLedgerFolder()
 {
@@ -2503,6 +2845,7 @@ void SaveTradeLedger()
         TradeOperation op = g_TradeOps[i];
         FileWrite(h, "OP", op.operation_id, op.batch_id, op.source, op.action, op.state,
                   (long)op.target_ticket, (long)op.target_position_id, op.magic,
+                  op.requested_order_type, op.requested_entry_price,
                   op.requested_volume, op.target_remaining_volume, op.target_sl, op.target_tp,
                   (long)op.request_id, (long)op.order_ticket, (long)op.deal_ticket,
                   (long)op.last_retcode, op.retry_count, op.created_utc_msc,
@@ -2524,6 +2867,12 @@ void LoadTradeLedger()
 {
     ArrayResize(g_TradeOps, 0);
     string path = TradeLedgerFileName();
+    bool migrateV1 = false;
+    if(!FileIsExist(path) && FileIsExist(TradeLedgerFileNameForSchema(1)))
+    {
+        path = TradeLedgerFileNameForSchema(1);
+        migrateV1 = true;
+    }
     if(!FileIsExist(path)) return;
     int h = FileOpen(path, FILE_READ | FILE_CSV | FILE_ANSI, ',');
     if(h == INVALID_HANDLE) { PrintFormat("[Trade Ledger] 读取失败 error=%d", GetLastError()); return; }
@@ -2531,7 +2880,7 @@ void LoadTradeLedger()
     int schema = (int)FileReadNumber(h);
     string ns = FileReadString(h);
     FileReadNumber(h);
-    if(tag != "META" || schema != TRADE_LEDGER_SCHEMA || ns != TicketStateNamespace())
+    if(tag != "META" || (schema != TRADE_LEDGER_SCHEMA && schema != 1) || ns != TicketStateNamespace())
     {
         Print("[Trade Ledger] 文件头或命名空间不匹配，忽略旧账本");
         FileClose(h);
@@ -2552,6 +2901,8 @@ void LoadTradeLedger()
         op.target_ticket = (ulong)FileReadNumber(h);
         op.target_position_id = (ulong)FileReadNumber(h);
         op.magic = (long)FileReadNumber(h);
+        op.requested_order_type = (schema >= 2) ? (int)FileReadNumber(h) : -1;
+        op.requested_entry_price = (schema >= 2) ? FileReadNumber(h) : 0.0;
         op.requested_volume = FileReadNumber(h);
         op.target_remaining_volume = FileReadNumber(h);
         op.target_sl = FileReadNumber(h);
@@ -2576,6 +2927,12 @@ void LoadTradeLedger()
     }
     FileClose(h);
     PrintFormat("[Trade Ledger] 已恢复 %d 条操作记录", ArraySize(g_TradeOps));
+    if(migrateV1)
+    {
+        g_TradeLedgerDirty = true;
+        SaveTradeLedger();
+        Print("[Trade Ledger] V1 已迁移至 V2；旧版未完成开仓缺少方向/价格时将按未知风险禁止新增交易");
+    }
 }
 
 int CreateTradeOperation(int action, string source, string batchId, ulong ticket,
@@ -2594,6 +2951,8 @@ int CreateTradeOperation(int action, string source, string batchId, ulong ticket
     op.target_ticket = ticket;
     op.target_position_id = 0;
     op.magic = 0;
+    op.requested_order_type = -1;
+    op.requested_entry_price = 0.0;
     if(ticket > 0 && PositionSelectByTicket(ticket))
     {
         op.target_position_id = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
@@ -3105,6 +3464,37 @@ int DeleteOrdersAsync(const ulong &tickets[], string source, string batchId, boo
     return tracked;
 }
 
+void CancelManagedPendingOrders(ENUM_SOP_ORDER kind, string source)
+{
+    ulong tickets[];
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = OrderGetTicket(i);
+        if(ticket == 0 || OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+        ENUM_SOP_ORDER orderKind = TypeByMagic(OrderGetInteger(ORDER_MAGIC));
+        if(orderKind == SOP_IGNORE) continue;
+        if(kind != SOP_IGNORE && orderKind != kind) continue;
+        int n = ArraySize(tickets);
+        ArrayResize(tickets, n + 1);
+        tickets[n] = ticket;
+    }
+    if(ArraySize(tickets) > 0)
+        DeleteOrdersAsync(tickets, source, NewTradeBatchId(source), true);
+}
+
+void EnforceDailyDrawdownLiquidation()
+{
+    if(!g_DailyLiquidationActive) return;
+    g_TotalBlocked = true;
+    if(SymbolIsFlat())
+    {
+        g_TotalReason = Lang("日回撤强平完成", "Daily liquidation completed");
+        return;
+    }
+    g_TotalReason = Lang("日回撤强平处理中", "Daily liquidation in progress");
+    CloseAllOrders("daily_liquidation", "", true);
+}
+
 bool SymbolIsFlat()
 {
     for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -3236,12 +3626,20 @@ void OpenMarket(ENUM_SOP_ORDER kind, bool isBuy)
         sl = MinimumProtectionSL(kind, isBuy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL, price);
     if(tpPts > 0.0)
         tp = isBuy ? price + PointsToPrice(tpPts) : price - PointsToPrice(tpPts);
+    ENUM_ORDER_TYPE orderType = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+    if(!ValidateNewRiskCandidate(kind, orderType, lots, price, sl)) return;
 
     long magic = (kind == SOP_SCALP) ? Inp_MagicScalp : Inp_MagicTrend;
     string cmt = (kind == SOP_SCALP) ? Inp_CommentScalp : Inp_CommentTrend;
+    g_TradeLedgerDeferSave = true;
     int opIdx = CreateTradeOperation(TRADE_OP_OPEN_MARKET, "manual_entry", NewTradeBatchId("entry"),
                                      0, lots, 0.0, sl, tp, false, false);
     g_TradeOps[opIdx].magic = magic;
+    g_TradeOps[opIdx].requested_order_type = (int)orderType;
+    g_TradeOps[opIdx].requested_entry_price = price;
+    g_TradeLedgerDeferSave = false;
+    g_TradeLedgerDirty = true;
+    SaveTradeLedger(); // 完整开仓意图必须先于服务器请求落盘。
     MqlTradeRequest request = {};
     MqlTradeResult result = {};
     request.action = TRADE_ACTION_DEAL;
@@ -3249,7 +3647,7 @@ void OpenMarket(ENUM_SOP_ORDER kind, bool isBuy)
     request.volume = lots;
     request.magic = (ulong)magic;
     request.deviation = (ulong)Inp_Slippage;
-    request.type = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+    request.type = orderType;
     request.price = price;
     request.sl = NormalizePrice(sl);
     request.tp = NormalizePrice(tp);
@@ -3327,19 +3725,27 @@ void OpenLimit(ENUM_SOP_ORDER kind, bool isBuy, double limitPrice)
         sl = MinimumProtectionSL(kind, isBuy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL, limitPrice);
     if(tpPts > 0.0)
         tp = isBuy ? limitPrice + PointsToPrice(tpPts) : limitPrice - PointsToPrice(tpPts);
+    ENUM_ORDER_TYPE orderType = isBuy ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
+    if(!ValidateNewRiskCandidate(kind, orderType, lots, limitPrice, sl)) return;
 
     long magic = (kind == SOP_SCALP) ? Inp_MagicScalp : Inp_MagicTrend;
     string cmt = (kind == SOP_SCALP) ? Inp_CommentScalp : Inp_CommentTrend;
+    g_TradeLedgerDeferSave = true;
     int opIdx = CreateTradeOperation(TRADE_OP_OPEN_LIMIT, "manual_limit", NewTradeBatchId("limit"),
                                      0, lots, 0.0, sl, tp, false, false);
     g_TradeOps[opIdx].magic = magic;
+    g_TradeOps[opIdx].requested_order_type = (int)orderType;
+    g_TradeOps[opIdx].requested_entry_price = limitPrice;
+    g_TradeLedgerDeferSave = false;
+    g_TradeLedgerDirty = true;
+    SaveTradeLedger(); // 完整挂单意图必须先于服务器请求落盘。
     MqlTradeRequest request = {};
     MqlTradeResult result = {};
     request.action = TRADE_ACTION_PENDING;
     request.symbol = _Symbol;
     request.volume = lots;
     request.magic = (ulong)magic;
-    request.type = isBuy ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
+    request.type = orderType;
     request.price = limitPrice;
     request.sl = NormalizePrice(sl);
     request.tp = NormalizePrice(tp);
@@ -4060,7 +4466,8 @@ void RenderStrategyCardButtons(string tag, int cardX, int contentY, string title
         CreateButton("Btn_Sc_SpeedPlan", leftX + 2*(bw+marketGap), contentY, bw, marketH,
                      Lang("极速单", "SPEED"), COLOR_BTN_DISABLED_BG, COLOR_BTN_DISABLED_BG,
                      COLOR_BTN_DISABLED_TXT, 9, true);
-        bool letRunEnabled = allowed && HasEligibleScalpLetRun();
+        // 追踪持有不新增仓位且不撤销服务器 SL，风险未知或熔断时仍允许管理既有仓位。
+        bool letRunEnabled = g_InstanceOwnsState && HasEligibleScalpLetRun();
         color letRunBg = letRunEnabled ? COLOR_BTN_SYS_BG : COLOR_BTN_DISABLED_BG;
         color letRunTx = letRunEnabled ? COLOR_SIGNAL_WARNING : COLOR_BTN_DISABLED_TXT;
         color letRunBd = letRunEnabled ? COLOR_SIGNAL_WARNING : COLOR_BTN_DISABLED_BG;
@@ -4169,7 +4576,7 @@ void RenderStrategyCard(string tag, int cardX, int currentY, int cardH, color ac
 
     double lots   = (kind == SOP_SCALP) ? Inp_ScalpLots : Inp_TrendLots;
     int maxPos    = (kind == SOP_SCALP) ? Inp_ScalpMaxPositions : Inp_TrendMaxPositions;
-    int posCnt    = CountPositions(kind);
+    int posCnt    = (kind == SOP_SCALP) ? g_ScalpRiskSlots : g_TrendRiskSlots;
     double realized = (kind == SOP_SCALP) ? ScalpRealized() : TrendRealized();
     double floatPL  = FloatingPL(kind);
     double netPL    = (kind == SOP_SCALP) ? ScalpNetPL() : TrendNetPL();
@@ -4189,6 +4596,7 @@ void RenderStrategyCard(string tag, int cardX, int currentY, int cardH, color ac
     // 熔断原因(优先级:连亏冷却 > 全局 > 本策略)
     string blkReason = "";
     if(kind == SOP_SCALP && HasScalpExitPending()) blkReason = Lang("剥头皮退出处理中", "Scalp exit pending");
+    else if(!g_RiskSnapshotValid) blkReason = Lang("风险未知: ", "Risk unknown: ") + g_RiskSnapshotReason;
     else if(g_ProtectionBlocksNewRisk) blkReason = g_ProtectionReason +
         (g_ProtectionIssueCount > 0 ? " (" + (string)g_ProtectionIssueCount + ")" : "");
     else if(InCooldown())       blkReason = Lang("连亏熔断", "Streak breaker");
@@ -4206,8 +4614,8 @@ void RenderStrategyCard(string tag, int cardX, int currentY, int cardH, color ac
                 Lang("策略运行状态", "Strategy Status"), stTxt, COLOR_TEXT_MUTED, stClr);
     contentY += Scale(22);
 
-    CreateRowLR(tag + "_Pos", cardX, contentY, Lang("策略当前持仓", "Active Position"),
-                (string)posCnt + " / " + (string)maxPos + Lang(" 仓位", " Pos"),
+    CreateRowLR(tag + "_Pos", cardX, contentY, Lang("风险占用单元", "Risk Capacity"),
+                (string)posCnt + " / " + (string)maxPos + Lang(" 单元", " Slots"),
                 COLOR_TEXT_MUTED, COLOR_TEXT_BODY);
     contentY += Scale(22);
 
@@ -4224,9 +4632,13 @@ void RenderStrategyCard(string tag, int cardX, int currentY, int cardH, color ac
     CreateRowLR(tag + "_Hi", cardX, contentY, Lang("今日最高盈利", "Peak Profit"), FmtMoney(hiProfit), COLOR_TEXT_MUTED, PLColor(hiProfit), true);
     contentY += Scale(22);
 
-    CreateRowLR(tag + "_Melt", cardX, contentY, Lang("风控熔断间距", "Drawdown Gap"),
-                FmtMoneyPlain(usedLoss) + " / " + FmtMoneyPlain(limit),
-                COLOR_TEXT_MUTED, GapColor(usedLoss, limit));
+    double projectedRisk = (kind == SOP_SCALP) ? g_ScalpProjectedRisk : g_TrendProjectedRisk;
+    string riskText = g_RiskSnapshotValid
+                    ? FmtMoneyPlain(projectedRisk) + " / " + FmtMoneyPlain(limit)
+                    : Lang("未知", "UNKNOWN");
+    CreateRowLR(tag + "_Melt", cardX, contentY, Lang("预计止损风险", "Projected Stop Risk"),
+                riskText, COLOR_TEXT_MUTED,
+                g_RiskSnapshotValid ? GapColor(projectedRisk, limit) : COLOR_SIGNAL_LOSS);
     contentY += Scale(28);
     RenderStrategyCardButtons(tag, cardX, contentY, title, kind, allowed);
 }
@@ -4467,7 +4879,7 @@ void RenderPerfectUI()
     // --- 账户核心数据(7项)---
     CreateCard("Card1", Col1X, rowA_Y, CardW, rowA_H, clrWhite);
     int cY = rowA_Y + Scale(12);
-    CreateLabel("C1_Title", Col1X + LeftPad, cY, Lang("账户核心数据", "ACCOUNT METRICS"), COLOR_TEXT_HEADER, 9.5, true);
+    CreateLabel("C1_Title", Col1X + LeftPad, cY, Lang("账户与品种数据", "ACCOUNT & SYMBOL"), COLOR_TEXT_HEADER, 9.5, true);
     cY += Scale(28);
     double bal = AccountInfoDouble(ACCOUNT_BALANCE);
     double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -4480,13 +4892,13 @@ void RenderPerfectUI()
     CreateRowLR("C1_Bal", Col1X, cY, Lang("当前账户余额", "Account Balance"), "$ " + DoubleToString(bal, 2), COLOR_TEXT_MUTED, COLOR_TEXT_BODY);
     cY += Scale(26);
     // 3 今日实现盈亏(可点击,展开今日全部平仓明细)
-    CreateRowLR("C1_Real", Col1X, cY, Lang("今日实现盈亏 🔍", "Realized PNL 🔍"), FmtMoney(realTotal), COLOR_TEXT_MUTED, PLColor(realTotal), true);
+    CreateRowLR("C1_Real", Col1X, cY, Lang("本品种今日实现 🔍", "Symbol Realized 🔍"), FmtMoney(realTotal), COLOR_TEXT_MUTED, PLColor(realTotal), true);
     cY += Scale(26);
     // 4 实时账户净值
     CreateRowLR("C1_Eq", Col1X, cY, Lang("实时账户净值", "Real-time Equity"), "$ " + DoubleToString(eq, 2), COLOR_TEXT_MUTED, (eq >= bal ? COLOR_SIGNAL_PROFIT : COLOR_SIGNAL_LOSS), true);
     cY += Scale(26);
     // 5 账户浮动盈亏
-    CreateRowLR("C1_Float", Col1X, cY, Lang("账户浮动盈亏", "Floating PNL"), FmtMoney(floatTotal), COLOR_TEXT_MUTED, PLColor(floatTotal), true);
+    CreateRowLR("C1_Float", Col1X, cY, Lang("本品种浮动盈亏", "Symbol Floating"), FmtMoney(floatTotal), COLOR_TEXT_MUTED, PLColor(floatTotal), true);
     cY += Scale(26);
     // 6 系统激活时段
     string sess = StringFormat("%02d:00 ~ %02d:00 ", Inp_SessionStartHour, Inp_SessionEndHour)
@@ -4521,35 +4933,38 @@ void RenderPerfectUI()
     double peakProfit = g_GlobalRealHigh;
     CreateRowLR("C4_Hi", Col2X, cY, Lang("今日最高盈利", "Peak Profit"), FmtMoney(peakProfit), COLOR_TEXT_MUTED, PLColor(peakProfit), true);
     cY += Scale(24);
-    // 2 动态回撤基准(具体金额:未达档=初始-日回撤;达档=初始+保底利润)
-    double ddBase = DrawdownBase();
-    CreateRowLR("C4_Base", Col2X, cY, Lang("动态回撤基准", "Drawdown Base"), "$ " + DoubleToString(ddBase, 0), COLOR_TEXT_MUTED, COLOR_TEXT_BODY, true);
+    // 2 当前品种实际盈亏的生效底线，与真实熔断/护城河判定保持同一口径。
+    double activeFloor = ActiveProjectedFloor();
+    CreateRowLR("C4_Base", Col2X, cY, Lang("本品种生效底线", "Symbol Active Floor"), FmtMoney(activeFloor), COLOR_TEXT_MUTED, COLOR_TEXT_BODY, true);
     cY += Scale(24);
-    // 3 动态回撤阈值 = 当前净值 - 基准(距离触发的剩余金额,随持仓浮动)
-    double eqNow = AccountInfoDouble(ACCOUNT_EQUITY);
-    double ddRemain = eqNow - ddBase;
+    // 3 当前品种实际净盈亏距离生效底线的剩余金额。
+    double ddRemain = GlobalNetPL() - activeFloor;
     // 口径与真实触发一致:阈值 > 0 = 尚有缓冲(蓝);≤ 0 = 已触及/跌破基准(红)
     color  thClr = (ddRemain > 0.0) ? COLOR_SIGNAL_PROFIT : COLOR_SIGNAL_LOSS;
-    CreateRowLR("C4_Thr", Col2X, cY, Lang("动态回撤阈值", "Drawdown Room"), FmtMoney(ddRemain), COLOR_TEXT_MUTED, thClr, true);
+    CreateRowLR("C4_Thr", Col2X, cY, Lang("本品种回撤余量", "Symbol Drawdown Room"), FmtMoney(ddRemain), COLOR_TEXT_MUTED, thClr, true);
     cY += Scale(24);
     // 4 周目标进度
     CreateRowLR("C4_WeekP", Col2X, cY, Lang("周目标进度", "Weekly Progress"), WeeklyProgress(), COLOR_TEXT_MUTED, PLColor(WeekRealized()), true);
     cY += Scale(24);
-    // 5 周目标提示
-    string wkHint = (WeekRealized() >= Inp_WeeklyProfitTarget) ? Lang("已完成", "DONE") : Lang("进行中", "In progress");
-    CreateRowLR("C4_Week", Col2X, cY, Lang("周目标提示", "Weekly Hint"), wkHint, COLOR_TEXT_MUTED, (WeekRealized() >= Inp_WeeklyProfitTarget ? COLOR_SIGNAL_PROFIT : COLOR_TEXT_BODY), true);
+    // 5 当前品种预计止损风险(含持仓、挂单、未落地开仓请求)
+    string symbolRisk = g_RiskSnapshotValid
+                      ? FmtMoneyPlain(g_SymbolProjectedRisk) + " / " + FmtMoneyPlain(TotalDrawdownLimit())
+                      : Lang("未知", "UNKNOWN");
+    CreateRowLR("C4_Week", Col2X, cY, Lang("当前品种预计风险", "Symbol Projected Risk"), symbolRisk,
+                COLOR_TEXT_MUTED, g_RiskSnapshotValid ? GapColor(g_SymbolProjectedRisk, TotalDrawdownLimit()) : COLOR_SIGNAL_LOSS, true);
     cY += Scale(24);
     // 6 系统安全状态(显示熔断原因)
     string secTxt; color secClr;
     string tradeStatus = TradeOperationStatusText(secClr);
-    if(tradeStatus != "")  { secTxt = tradeStatus; }
+    if(!g_RiskSnapshotValid) { secTxt = Lang("风险未知: ", "Risk unknown: ") + g_RiskSnapshotReason; secClr = COLOR_SIGNAL_LOSS; }
+    else if(tradeStatus != "")  { secTxt = tradeStatus; }
     else if(InCooldown())   { secTxt = Lang("连亏熔断-冷却中", "STREAK BREAKER"); secClr = COLOR_SIGNAL_LOSS; }
     else if(g_TotalBlocked) { secTxt = g_TotalReason;  secClr = COLOR_SIGNAL_LOSS; }
     else if(g_ScalpBlocked && g_TrendBlocked) { secTxt = Lang("双策略熔断", "Both blocked"); secClr = COLOR_SIGNAL_LOSS; }
     else if(g_ScalpBlocked) { secTxt = g_ScalpReason;  secClr = COLOR_SIGNAL_WARNING; }
     else if(g_TrendBlocked) { secTxt = g_TrendReason;  secClr = COLOR_SIGNAL_WARNING; }
     else                    { secTxt = Lang("运行正常 (STABLE)", "SECURED (STABLE)"); secClr = COLOR_SIGNAL_PROFIT; }
-    CreateRowLR("C4_Status", Col2X, cY, Lang("系统安全状态", "Global Security"), secTxt, COLOR_TEXT_MUTED, secClr, true);
+    CreateRowLR("C4_Status", Col2X, cY, Lang("当前品种风险状态", "Symbol Risk Status"), secTxt, COLOR_TEXT_MUTED, secClr, true);
     cY += Scale(28);
     // 4 平仓按钮:一键全平 / 平剥头皮 / 平趋势 / 平盈利
     int cbW = (CardW - LeftPad - RightPad - 3 * 6) / 4;
@@ -4979,6 +5394,7 @@ void SaveState()
     PVSet("TrendHi",    g_TrendHighProfit);   PVSet("TrHiInit", g_TrendHiInit ? 1 : 0);
     PVSet("GlobalHi",   g_GlobalRealHigh);    PVSet("GbHiInit", g_GlobalHiInit? 1 : 0);
     PVSet("MoatLiq",    g_MoatLiquidated ? 1 : 0);
+    PVSet("DailyLiq",   g_DailyLiquidationActive ? 1 : 0);
     GlobalVariablesFlush();
 }
 
@@ -5006,6 +5422,7 @@ bool LoadLegacyDailyState()
     g_GlobalRealHigh  = GlobalVariableGet(LegacyPVKey("GlobalHi"));
     g_GlobalHiInit    = (GlobalVariableGet(LegacyPVKey("GbHiInit")) > 0.5);
     g_MoatLiquidated  = (GlobalVariableGet(LegacyPVKey("MoatLiq")) > 0.5);
+    g_DailyLiquidationActive = false;
     Print("[State V2] 已迁移当前统计日的旧版全局状态");
     return true;
 }
@@ -5033,6 +5450,7 @@ bool LoadState()
     g_TrendHighProfit = PVGet("TrendHi");   g_TrendHiInit = (PVGet("TrHiInit") > 0.5);
     g_GlobalRealHigh  = PVGet("GlobalHi");  g_GlobalHiInit= (PVGet("GbHiInit") > 0.5);
     g_MoatLiquidated  = (PVGet("MoatLiq") > 0.5);
+    g_DailyLiquidationActive = PVHas("DailyLiq") && PVGet("DailyLiq") > 0.5;
     return true;
 }
 
@@ -5889,7 +6307,7 @@ bool AttemptStartupRecovery()
     {
         g_ResetTime = currentPeriod;
         g_HighInit = false; g_ScalpHiInit = false; g_TrendHiInit = false; g_GlobalHiInit = false;
-        g_MoatLiquidated = false; g_MoatDrawHit = false;
+        g_MoatLiquidated = false; g_MoatDrawHit = false; g_DailyLiquidationActive = false;
         g_ScalpBlocked = false; g_TrendBlocked = false; g_TotalBlocked = false;
         g_ScalpReason = ""; g_TrendReason = ""; g_TotalReason = "";
         g_ConsecLoss = 0; g_CooldownUntil = 0;
@@ -6038,7 +6456,12 @@ bool PublishInstanceManifest()
     settings += "\"consec_loss_limit\":" + (string)Inp_ConsecLossLimit + ",";
     settings += "\"cooldown_minutes\":" + (string)Inp_CooldownMinutes + ",";
     settings += "\"enable_circuit_breaker\":" + ManifestBool(Inp_EnableCircuitBreaker) + ",";
-    settings += "\"alert_on_breaker\":" + ManifestBool(Inp_AlertOnBreaker) + "},";
+    settings += "\"alert_on_breaker\":" + ManifestBool(Inp_AlertOnBreaker) + ",";
+    settings += "\"close_on_daily_drawdown\":" + ManifestBool(Inp_CloseOnDailyDrawdown) + ",";
+    settings += "\"risk_buffer_percent\":" + DoubleToString(Inp_RiskBufferPercent, 2) + ",";
+    settings += "\"max_entry_spread_points\":" + (string)Inp_MaxEntrySpreadPoints + ",";
+    settings += "\"max_quote_age_seconds\":" + (string)Inp_MaxQuoteAgeSeconds + ",";
+    settings += "\"min_projected_margin_level\":" + DoubleToString(Inp_MinProjectedMarginLevel, 2) + "},";
     settings += "\"scalp\":{";
     settings += "\"lots\":" + DoubleToString(Inp_ScalpLots, 2) + ",";
     settings += "\"max_positions\":" + (string)Inp_ScalpMaxPositions + ",";
@@ -6109,6 +6532,8 @@ int OnInit()
        Inp_RecoveryLookbackDays < 1 || Inp_RecoveryRetrySeconds < 5 ||
        Inp_ScalpSL_Points <= 0 || Inp_TrendSL_Points <= 0 || Inp_ScalpTP_Points < 0 ||
        Inp_ScalpBETrigger <= 0 || Inp_ScalpTrailStep <= 0 ||
+       Inp_RiskBufferPercent < 0.0 || Inp_MaxEntrySpreadPoints < 0 ||
+       Inp_MaxQuoteAgeSeconds < 1 || Inp_MinProjectedMarginLevel <= 0.0 ||
        (Inp_ScalpTimeLimitOn && Inp_ScalpMaxHoldSecs <= 0))
     {
         Print("[Init] 参数无效：重置/恢复参数越界，或策略保护、追踪、超时参数不符合要求");
@@ -6504,7 +6929,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
     if(sparam == Prefix + "Btn_Sc_LetRun")
     {
         ResetBtn(sparam);
-        if(IsScalpAllowed()) EnableScalpLetRun();
+        if(g_InstanceOwnsState && HasEligibleScalpLetRun()) EnableScalpLetRun();
         RenderPerfectUI();
         return;
     }
@@ -6608,6 +7033,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
         g_TrendBlocked    = false;
         g_TotalBlocked    = false;
         g_MoatLiquidated  = false;   // 手动重置基线:解除护城河清盘锁定
+        g_DailyLiquidationActive = false;
         g_MoatDrawHit     = false;
         g_ScalpReason     = "";
         g_TrendReason     = "";
