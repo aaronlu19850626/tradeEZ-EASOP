@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  最后修改时间：2026-09-19 00:53（北京时间）       |
+//|                  最后修改时间：2026-09-19 01:32（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -127,6 +127,8 @@ input group "===== 每日初始化 ====="
 input int      Inp_ResetHour         = 4;        // 每日重置-时(北京时间)
 input int      Inp_ResetMinute       = 50;       // 每日重置-分
 input bool     Inp_ExportOnReset     = true;     // 重置前导出当日统计到本地
+input int      Inp_RecoveryLookbackDays = 31;    // 启动时最多自动补做的统计周期数
+input int      Inp_RecoveryRetrySeconds = 30;    // 历史恢复失败后的重试间隔(秒)
 
 input group "===== 目标与回撤(核心)====="
 input double   Inp_DailyMaxDrawdown   = 500.0;   // 日最大回撤 ★核心
@@ -194,6 +196,14 @@ enum ENUM_SOP_ORDER
     SOP_TREND  = 2    // 趋势
 };
 
+enum ENUM_RECOVERY_STATUS
+{
+    RECOVERY_CHECKING     = 0,
+    RECOVERY_EXACT        = 1,
+    RECOVERY_CONSERVATIVE = 2,
+    RECOVERY_FAILED       = 3
+};
+
 //+------------------------------------------------------------------+
 //| 全局状态                                                          |
 //+------------------------------------------------------------------+
@@ -208,6 +218,15 @@ ENUM_SOP_ORDER g_DetailSide   = SOP_SCALP; // 明细舱当前展示策略
 bool           g_DetailAll    = false;  // 明细舱"全部"模式:显示今日所有平仓单(含手动),忽略 g_DetailSide
 datetime       g_ResetTime    = 0;      // 统计基线时间
 datetime       g_DayStart     = 0;      // 当日0点
+ENUM_RECOVERY_STATUS g_RecoveryStatus = RECOVERY_CHECKING;
+string         g_RecoveryReason = "";
+bool           g_RecoveryAcknowledged = false;
+datetime       g_LastRecoveryAttempt = 0;
+datetime       g_RecoveryStartedUtc = 0;
+datetime       g_RecoveryCompletedUtc = 0;
+datetime       g_LastStateCheckpointUtc = 0;
+datetime       g_LastCompletedPeriod = 0;
+datetime       g_LastReportedPeriod = 0;
 
 // 风控封锁标志(仅禁开)
 bool           g_ScalpBlocked = false;
@@ -222,6 +241,8 @@ string         g_TotalReason  = "";
 // 连续止损时间熔断
 int            g_ConsecLoss     = 0;      // 当前连续亏损笔数
 datetime       g_LastDealTime   = 0;      // 已统计到的最后一笔平仓成交时间
+long           g_LastDealTimeMsc = 0;     // 连亏重放游标：成交毫秒时间
+ulong          g_LastDealTicket  = 0;     // 连亏重放游标：同毫秒成交票号
 datetime       g_CooldownUntil  = 0;      // 冷却结束时刻(服务器时间);0=未冷却
 
 double         g_TodayHighProfit = 0.0;   // 今日最高净盈利(护城河高水位)
@@ -1390,11 +1411,14 @@ void ExportDailyReport()
 
 void CheckDayRollover()
 {
+    if(g_RecoveryStatus == RECOVERY_CHECKING || g_RecoveryStatus == RECOVERY_FAILED) return;
     datetime ds = TodayStart();
     if(g_DayStart != ds)
     {
+        datetime previousPeriod = g_DayStart;
         // 重置前先导出即将结束的交易日数据(首次初始化 g_DayStart=0 时跳过)
         if(g_DayStart != 0) ExportDailyReport();
+        if(previousPeriod != 0) g_LastReportedPeriod = previousPeriod;
 
         g_DayStart        = ds;
         g_ScalpBlocked    = false;
@@ -1416,11 +1440,15 @@ void CheckDayRollover()
         g_ConsecLoss      = 0;
         g_CooldownUntil   = 0;
         g_LastDealTime    = ds;   // 新的一天从当日起点开始计连亏
+        g_LastDealTimeMsc = (long)ds * 1000;
+        g_LastDealTicket  = 0;
         // 余额峰值基准归位到当前余额
         g_InitBalance     = AccountInfoDouble(ACCOUNT_BALANCE);
         g_PeakBalance     = g_InitBalance;
         // 新的一天:基线回到当日0点(除非用户当天又手动重置)
         if(g_ResetTime < ds) g_ResetTime = ds;
+        g_LastCompletedPeriod = ds;
+        SaveState(); // 最后提交新周期标志；中断时下次启动会幂等补做
     }
 }
 
@@ -1474,47 +1502,74 @@ double CheckProfitProtection(double netPL)
 void UpdateConsecutiveLoss()
 {
     datetime from = StatStart();
-    if(!HistorySelect(from, TimeCurrent() + 3600)) return;
+    if(!HistorySelect(from, RecoveryNowServer() + 1)) return;
 
+    ulong tickets[]; long timesMsc[]; double profits[];
     int deals = HistoryDealsTotal();
-    datetime newestSeen = g_LastDealTime;
-
     for(int i = 0; i < deals; i++)
     {
-        ulong dt = HistoryDealGetTicket(i);
-        if(dt == 0) continue;
-        if(HistoryDealGetString(dt, DEAL_SYMBOL) != _Symbol) continue;
-        if(HistoryDealGetInteger(dt, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
-
-        datetime dtime = (datetime)HistoryDealGetInteger(dt, DEAL_TIME);
-        if(dtime <= g_LastDealTime) continue; // 只处理新成交
-
-        double profit = HistoryDealGetDouble(dt, DEAL_PROFIT)
-                      + HistoryDealGetDouble(dt, DEAL_SWAP)
-                      + HistoryDealGetDouble(dt, DEAL_COMMISSION);
-        if(profit < 0.0) g_ConsecLoss++;   // 亏损累加
-        else             g_ConsecLoss = 0; // 盈利/保本清零
-
-        if(dtime > newestSeen) newestSeen = dtime;
+        ulong deal = HistoryDealGetTicket(i);
+        if(deal == 0 || HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) continue;
+        if(HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+        long dealMsc = HistoryDealGetInteger(deal, DEAL_TIME_MSC);
+        if(dealMsc < g_LastDealTimeMsc ||
+           (dealMsc == g_LastDealTimeMsc && deal <= g_LastDealTicket)) continue;
+        int n = ArraySize(tickets);
+        ArrayResize(tickets, n + 1); ArrayResize(timesMsc, n + 1); ArrayResize(profits, n + 1);
+        tickets[n] = deal; timesMsc[n] = dealMsc;
+        profits[n] = HistoryDealGetDouble(deal, DEAL_PROFIT)
+                   + HistoryDealGetDouble(deal, DEAL_SWAP)
+                   + HistoryDealGetDouble(deal, DEAL_COMMISSION);
     }
-    g_LastDealTime = newestSeen;
-
-    // 达连续亏损阈值 → 启动时间熔断
-    if(Inp_ConsecLossLimit > 0 && g_ConsecLoss >= Inp_ConsecLossLimit && g_CooldownUntil <= TimeCurrent())
+    for(int i = 1; i < ArraySize(tickets); i++)
     {
-        g_CooldownUntil = TimeCurrent() + Inp_CooldownMinutes * 60;
-        g_ConsecLoss = 0; // 重置计数,冷却期结束后重新累计
-        if(Inp_AlertOnBreaker)
-            Alert(Lang("【连亏熔断】连续亏损达上限,冷却 ", "[STREAK BREAKER] Consecutive losses — cooldown ")
-                  + (string)Inp_CooldownMinutes + Lang(" 分钟", " min"));
+        ulong tk = tickets[i]; long tm = timesMsc[i]; double pnl = profits[i]; int j = i - 1;
+        while(j >= 0 && (timesMsc[j] > tm || (timesMsc[j] == tm && tickets[j] > tk)))
+        {
+            tickets[j + 1] = tickets[j]; timesMsc[j + 1] = timesMsc[j]; profits[j + 1] = profits[j]; j--;
+        }
+        tickets[j + 1] = tk; timesMsc[j + 1] = tm; profits[j + 1] = pnl;
+    }
+    for(int i = 0; i < ArraySize(tickets); i++)
+    {
+        if(profits[i] < 0.0) g_ConsecLoss++;
+        else g_ConsecLoss = 0;
+        g_LastDealTimeMsc = timesMsc[i];
+        g_LastDealTicket = tickets[i];
+        g_LastDealTime = (datetime)(timesMsc[i] / 1000);
+
+        if(Inp_ConsecLossLimit > 0 && g_ConsecLoss >= Inp_ConsecLossLimit)
+        {
+            g_CooldownUntil = (datetime)(timesMsc[i] / 1000) + Inp_CooldownMinutes * 60;
+            g_ConsecLoss = 0;
+            if(Inp_AlertOnBreaker)
+                Alert(Lang("【连亏熔断】连续亏损达上限,冷却 ", "[STREAK BREAKER] Consecutive losses — cooldown ")
+                      + (string)Inp_CooldownMinutes + Lang(" 分钟", " min"));
+        }
     }
 }
 
 // 是否处于连亏冷却中
-bool InCooldown() { return (g_CooldownUntil > TimeCurrent()); }
+bool InCooldown() { return (g_CooldownUntil > RecoveryNowServer()); }
+
+bool EnsureRuntimeHistoryAvailable()
+{
+    if(HistorySelect(StatStart(), RecoveryNowServer() + 1)) return true;
+    if(g_RecoveryStatus != RECOVERY_FAILED)
+        PrintFormat("[Recovery] 运行中成交历史不可用，切换为只平不开，错误=%d", GetLastError());
+    g_RecoveryStatus = RECOVERY_FAILED;
+    g_RecoveryReason = Lang("成交历史暂不可用，已禁止开仓并等待自动重试", "Deal history unavailable; entries disabled pending retry");
+    g_LastRecoveryAttempt = TimeGMT();
+    g_RecoveryCompletedUtc = g_LastRecoveryAttempt;
+    PVSet("RecoveryCompletedUtc", (double)g_RecoveryCompletedUtc);
+    PVSet("RecoveryResult", (double)g_RecoveryStatus);
+    GlobalVariablesFlush();
+    return false;
+}
 
 void CheckAllRiskControl()
 {
+    if(!EnsureRuntimeHistoryAvailable()) return;
     CheckDayRollover();
     UpdateConsecutiveLoss();
 
@@ -1583,8 +1638,13 @@ void CheckAllRiskControl()
 }
 
 // 连亏冷却期间,所有开仓一律禁止
-bool IsScalpAllowed() { return g_InstanceOwnsState && !g_ScalpBlocked && !g_TotalBlocked && !InCooldown(); }
-bool IsTrendAllowed() { return g_InstanceOwnsState && !g_TrendBlocked && !g_TotalBlocked && !InCooldown(); }
+bool RecoveryAllowsNewRisk()
+{
+    return g_RecoveryStatus == RECOVERY_EXACT ||
+           (g_RecoveryStatus == RECOVERY_CONSERVATIVE && g_RecoveryAcknowledged);
+}
+bool IsScalpAllowed() { return g_InstanceOwnsState && RecoveryAllowsNewRisk() && !g_ScalpBlocked && !g_TotalBlocked && !InCooldown(); }
+bool IsTrendAllowed() { return g_InstanceOwnsState && RecoveryAllowsNewRisk() && !g_TrendBlocked && !g_TotalBlocked && !InCooldown(); }
 
 //+------------------------------------------------------------------+
 //| 周目标提示(仅建议,不自动改参数)                                 |
@@ -2140,7 +2200,10 @@ void CreateButton(string name, int x, int y, int w, int h, string text, color bg
     bool operationalAction = closeAction || name == "Btn_Reset_All" ||
                              StringFind(name, "Btn_Sc_") == 0 || StringFind(name, "Btn_Tr_") == 0 ||
                              StringFind(name, "Btn_SCDCancel_") == 0;
-    if(!g_InstanceOwnsState && operationalAction)
+    bool recoveryLocksManagement = g_RecoveryStatus == RECOVERY_CHECKING || g_RecoveryStatus == RECOVERY_FAILED ||
+                                   (g_RecoveryStatus == RECOVERY_CONSERVATIVE && !g_RecoveryAcknowledged);
+    if((!g_InstanceOwnsState && operationalAction) ||
+       (g_InstanceOwnsState && recoveryLocksManagement && operationalAction && !closeAction))
     {
         bg_color = COLOR_BTN_DISABLED_BG;
         border_color = COLOR_BTN_DISABLED_BG;
@@ -2969,6 +3032,21 @@ void RenderPerfectUI()
         CreateLabelAnchor("ReadOnlyWarning", versionX + versionW + Scale(8), titleBottomY,
                           Lang("实例冲突 · 只读", "INSTANCE CONFLICT · READ ONLY"),
                           COLOR_SIGNAL_LOSS, 8, true, ANCHOR_LEFT_LOWER);
+    else if(g_RecoveryStatus == RECOVERY_CONSERVATIVE && !g_RecoveryAcknowledged)
+    {
+        CreateButton("Btn_Recovery_Ack", versionX + versionW + Scale(8), currentY - Scale(1),
+                     Scale(92), Scale(22), Lang("确认恢复", "REVIEW"),
+                     COLOR_BTN_SYS_BG, COLOR_SIGNAL_WARNING, COLOR_SIGNAL_WARNING, 8, true);
+        ObjectSetString(0, Prefix + "Btn_Recovery_Ack", OBJPROP_TOOLTIP, g_RecoveryReason);
+    }
+    else if(g_RecoveryStatus == RECOVERY_FAILED || g_RecoveryStatus == RECOVERY_CHECKING)
+        CreateLabelAnchor("RecoveryWarning", versionX + versionW + Scale(8), titleBottomY,
+                          g_RecoveryStatus == RECOVERY_FAILED ? Lang("恢复失败 · 只平不开", "RECOVERY FAILED · EXIT ONLY")
+                                                              : Lang("状态恢复中", "RECOVERING"),
+                          COLOR_SIGNAL_LOSS, 8, true, ANCHOR_LEFT_LOWER);
+    else if(g_RecoveryStatus == RECOVERY_CONSERVATIVE)
+        CreateLabelAnchor("RecoveryWarning", versionX + versionW + Scale(8), titleBottomY,
+                          Lang("保守恢复", "CONSERVATIVE"), COLOR_SIGNAL_WARNING, 8, true, ANCHOR_LEFT_LOWER);
 
     int foldSize = Scale(44);
     int foldX    = StartX + displayWidth - Scale(14) - foldSize;
@@ -3523,14 +3601,39 @@ void PVSet(string k, double v)
 bool   PVHas(string k) { return GlobalVariableCheck(PVKey(k)); }
 double PVGet(string k) { return GlobalVariableGet(PVKey(k)); }
 
+void PVSetUlong(string k, ulong value)
+{
+    PVSet(k + "Hi", (double)(uint)(value >> 32));
+    PVSet(k + "Lo", (double)(uint)(value & 0xFFFFFFFF));
+}
+
+ulong PVGetUlong(string k)
+{
+    ulong hi = (ulong)(uint)PVGet(k + "Hi");
+    ulong lo = (ulong)(uint)PVGet(k + "Lo");
+    return (hi << 32) | lo;
+}
+
 void SaveState()
 {
     if(!g_InstanceOwnsState) return;
+    g_LastStateCheckpointUtc = 0; // 旧版没有可信检查点时间，交由恢复流程判定是否保守接管
     PVSet("StatDay",    (double)g_DayStart);
     PVSet("ResetTime",  (double)g_ResetTime);
     PVSet("Cooldown",   (double)g_CooldownUntil);
     PVSet("ConsecLoss", (double)g_ConsecLoss);
     PVSet("LastDeal",   (double)g_LastDealTime);
+    PVSet("LastDealMsc", (double)g_LastDealTimeMsc);
+    PVSetUlong("LastDealTicket", g_LastDealTicket);
+    PVSet("CheckpointUtc", (double)g_LastStateCheckpointUtc);
+    PVSet("RecoveryStartedUtc", (double)g_RecoveryStartedUtc);
+    PVSet("RecoveryCompletedUtc", (double)g_RecoveryCompletedUtc);
+    PVSet("RecoveryResult", (double)g_RecoveryStatus);
+    PVSet("RecoveryNeedsAck", (g_RecoveryStatus == RECOVERY_CONSERVATIVE && !g_RecoveryAcknowledged) ? 1.0 : 0.0);
+    PVSet("CompletedPeriod", (double)g_LastCompletedPeriod);
+    PVSet("ReportedPeriod", (double)g_LastReportedPeriod);
+    PVSet("InitBalance", g_InitBalance);
+    PVSet("PeakBalance", g_PeakBalance);
     PVSet("TodayHi",    g_TodayHighProfit);   PVSet("HiInit",   g_HighInit    ? 1 : 0);
     PVSet("ScalpHi",    g_ScalpHighProfit);   PVSet("ScHiInit", g_ScalpHiInit ? 1 : 0);
     PVSet("TrendHi",    g_TrendHighProfit);   PVSet("TrHiInit", g_TrendHiInit ? 1 : 0);
@@ -3549,6 +3652,11 @@ bool LoadLegacyDailyState()
     g_CooldownUntil   = (datetime)(long)GlobalVariableGet(LegacyPVKey("Cooldown"));
     g_ConsecLoss      = (int)GlobalVariableGet(LegacyPVKey("ConsecLoss"));
     g_LastDealTime    = (datetime)(long)GlobalVariableGet(LegacyPVKey("LastDeal"));
+    g_LastDealTimeMsc = (long)g_LastDealTime * 1000;
+    g_LastDealTicket  = 0;
+    g_LastStateCheckpointUtc = TimeGMT();
+    g_LastCompletedPeriod = g_DayStart;
+    g_LastReportedPeriod = 0;
     g_TodayHighProfit = GlobalVariableGet(LegacyPVKey("TodayHi"));
     g_HighInit        = (GlobalVariableGet(LegacyPVKey("HiInit")) > 0.5);
     g_ScalpHighProfit = GlobalVariableGet(LegacyPVKey("ScalpHi"));
@@ -3558,7 +3666,6 @@ bool LoadLegacyDailyState()
     g_GlobalRealHigh  = GlobalVariableGet(LegacyPVKey("GlobalHi"));
     g_GlobalHiInit    = (GlobalVariableGet(LegacyPVKey("GbHiInit")) > 0.5);
     g_MoatLiquidated  = (GlobalVariableGet(LegacyPVKey("MoatLiq")) > 0.5);
-    SaveState();
     Print("[State V2] 已迁移当前统计日的旧版全局状态");
     return true;
 }
@@ -3572,6 +3679,15 @@ bool LoadState()
     g_CooldownUntil   = (datetime)(long)PVGet("Cooldown");
     g_ConsecLoss      = (int)PVGet("ConsecLoss");
     g_LastDealTime    = (datetime)(long)PVGet("LastDeal");
+    g_LastDealTimeMsc = PVHas("LastDealMsc") ? (long)PVGet("LastDealMsc") : (long)g_LastDealTime * 1000;
+    g_LastDealTicket  = (PVHas("LastDealTicketHi") && PVHas("LastDealTicketLo")) ? PVGetUlong("LastDealTicket") : 0;
+    g_LastStateCheckpointUtc = PVHas("CheckpointUtc") ? (datetime)(long)PVGet("CheckpointUtc") : 0;
+    g_RecoveryStartedUtc = PVHas("RecoveryStartedUtc") ? (datetime)(long)PVGet("RecoveryStartedUtc") : 0;
+    g_RecoveryCompletedUtc = PVHas("RecoveryCompletedUtc") ? (datetime)(long)PVGet("RecoveryCompletedUtc") : 0;
+    g_LastCompletedPeriod = PVHas("CompletedPeriod") ? (datetime)(long)PVGet("CompletedPeriod") : g_DayStart;
+    g_LastReportedPeriod = PVHas("ReportedPeriod") ? (datetime)(long)PVGet("ReportedPeriod") : 0;
+    if(PVHas("InitBalance")) g_InitBalance = PVGet("InitBalance");
+    if(PVHas("PeakBalance")) g_PeakBalance = PVGet("PeakBalance");
     g_TodayHighProfit = PVGet("TodayHi");   g_HighInit    = (PVGet("HiInit")   > 0.5);
     g_ScalpHighProfit = PVGet("ScalpHi");   g_ScalpHiInit = (PVGet("ScHiInit") > 0.5);
     g_TrendHighProfit = PVGet("TrendHi");   g_TrendHiInit = (PVGet("TrHiInit") > 0.5);
@@ -3965,8 +4081,434 @@ void LoadArrays()
 {
     if(LoadTicketStateV2()) return;
     ClearRuntimeTicketArrays();
-    LoadLegacyArrays();
-    SaveArrays(); // 建立当前命名空间的 V2 文件；旧文件始终保留。
+    bool migrated = LoadLegacyArrays();
+    if(!migrated)
+    {
+        // 没有任何可验证来源时，不把空数组直接当作真实历史状态。
+        for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+            if(PosType() == SOP_IGNORE) continue;
+            BlockTicketStateRecovery(ticket, "未找到新版或可迁移的旧版逐票状态");
+        }
+    }
+    if(ArraySize(g_StateRecoveryBlockedTickets) == 0)
+        SaveArrays(); // 无在管票据缺口时建立当前命名空间 V2 文件；旧文件始终保留。
+}
+
+//+------------------------------------------------------------------+
+//| 启动恢复：成交历史精确重放与缺失逐票状态保守接管                |
+//+------------------------------------------------------------------+
+struct RecoverySnapshot
+{
+    bool   history_ok;
+    int    deal_count;
+    double all_realized;
+    double scalp_realized;
+    double trend_realized;
+    double all_high;
+    double scalp_high;
+    double trend_high;
+    bool   all_high_init;
+    bool   scalp_high_init;
+    bool   trend_high_init;
+    int    consec_loss;
+    datetime cooldown_until;
+    long   last_deal_msc;
+    ulong  last_deal_ticket;
+};
+
+datetime RecoveryNowServer()
+{
+    datetime now = TimeTradeServer();
+    if(now <= 0) now = TimeCurrent();
+    return now;
+}
+
+bool BuildRecoverySnapshot(datetime from, datetime to, RecoverySnapshot &snapshot)
+{
+    ZeroMemory(snapshot);
+    if(to <= from) to = from + 1;
+    datetime selectFrom = from - 365 * 86400;
+    if(selectFrom < 0) selectFrom = 0;
+    if(!HistorySelect(selectFrom, to))
+    {
+        PrintFormat("[Recovery] HistorySelect 失败：%s ~ %s，错误=%d",
+                    TimeToString(from, TIME_DATE|TIME_MINUTES),
+                    TimeToString(to, TIME_DATE|TIME_MINUTES), GetLastError());
+        return false;
+    }
+
+    ulong tickets[];
+    long timesMsc[];
+    double profits[];
+    int kinds[];
+    int total = HistoryDealsTotal();
+    for(int i = 0; i < total; i++)
+    {
+        ulong deal = HistoryDealGetTicket(i);
+        if(deal == 0) continue;
+        if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) continue;
+        if(HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+        long dealMsc = HistoryDealGetInteger(deal, DEAL_TIME_MSC);
+        datetime dealTime = (datetime)(dealMsc / 1000);
+        if(dealTime < from || dealTime >= to) continue;
+
+        int n = ArraySize(tickets);
+        ArrayResize(tickets, n + 1);
+        ArrayResize(timesMsc, n + 1);
+        ArrayResize(profits, n + 1);
+        ArrayResize(kinds, n + 1);
+        tickets[n] = deal;
+        timesMsc[n] = dealMsc;
+        profits[n] = HistoryDealGetDouble(deal, DEAL_PROFIT)
+                   + HistoryDealGetDouble(deal, DEAL_SWAP)
+                   + HistoryDealGetDouble(deal, DEAL_COMMISSION);
+        kinds[n] = (int)DealStrategyType(deal);
+    }
+
+    // 稳定排序：毫秒时间相同则按 deal ticket，保证重复重放结果一致。
+    for(int i = 1; i < ArraySize(tickets); i++)
+    {
+        ulong tk = tickets[i]; long tm = timesMsc[i]; double pnl = profits[i]; int kind = kinds[i];
+        int j = i - 1;
+        while(j >= 0 && (timesMsc[j] > tm || (timesMsc[j] == tm && tickets[j] > tk)))
+        {
+            tickets[j + 1] = tickets[j]; timesMsc[j + 1] = timesMsc[j];
+            profits[j + 1] = profits[j]; kinds[j + 1] = kinds[j]; j--;
+        }
+        tickets[j + 1] = tk; timesMsc[j + 1] = tm; profits[j + 1] = pnl; kinds[j + 1] = kind;
+    }
+
+    for(int i = 0; i < ArraySize(tickets); i++)
+    {
+        double pnl = profits[i];
+        snapshot.all_realized += pnl;
+        if(!snapshot.all_high_init) { snapshot.all_high = snapshot.all_realized; snapshot.all_high_init = true; }
+        else if(snapshot.all_realized > snapshot.all_high) snapshot.all_high = snapshot.all_realized;
+
+        if(kinds[i] == SOP_SCALP)
+        {
+            snapshot.scalp_realized += pnl;
+            if(!snapshot.scalp_high_init) { snapshot.scalp_high = snapshot.scalp_realized; snapshot.scalp_high_init = true; }
+            else if(snapshot.scalp_realized > snapshot.scalp_high) snapshot.scalp_high = snapshot.scalp_realized;
+        }
+        else if(kinds[i] == SOP_TREND)
+        {
+            snapshot.trend_realized += pnl;
+            if(!snapshot.trend_high_init) { snapshot.trend_high = snapshot.trend_realized; snapshot.trend_high_init = true; }
+            else if(snapshot.trend_realized > snapshot.trend_high) snapshot.trend_high = snapshot.trend_realized;
+        }
+
+        if(pnl < 0.0) snapshot.consec_loss++;
+        else snapshot.consec_loss = 0;
+        if(Inp_ConsecLossLimit > 0 && snapshot.consec_loss >= Inp_ConsecLossLimit)
+        {
+            snapshot.cooldown_until = (datetime)(timesMsc[i] / 1000) + Inp_CooldownMinutes * 60;
+            snapshot.consec_loss = 0;
+        }
+        snapshot.last_deal_msc = timesMsc[i];
+        snapshot.last_deal_ticket = tickets[i];
+    }
+    snapshot.deal_count = ArraySize(tickets);
+    snapshot.history_ok = true;
+    return true;
+}
+
+bool ExportRecoveredPeriod(datetime periodStart, datetime periodEnd)
+{
+    if(!Inp_ExportOnReset) return true;
+    RecoverySnapshot snapshot;
+    if(!BuildRecoverySnapshot(periodStart, periodEnd, snapshot)) return false;
+
+    string dayStr = TimeToString(ToBeijing(periodStart), TIME_DATE);
+    StringReplace(dayStr, ".", "");
+    string finalName = StringFormat("TradeEZ_%I64d_%s.md", AccountInfoInteger(ACCOUNT_LOGIN), dayStr);
+    string tempName = finalName + ".tmp";
+    int h = FileOpen(tempName, FILE_WRITE | FILE_TXT | FILE_ANSI);
+    if(h == INVALID_HANDLE)
+    {
+        PrintFormat("[Recovery] 无法写入补做报告 %s，错误=%d", tempName, GetLastError());
+        return false;
+    }
+    FileWrite(h, "# TradeEZ-SOP 日内交易报告（启动恢复补做）");
+    FileWrite(h, "");
+    FileWrite(h, "| 项目 | 值 |");
+    FileWrite(h, "|------|------|");
+    FileWrite(h, "| 交易日(北京) | " + TimeToString(ToBeijing(periodStart), TIME_DATE) + " |");
+    FileWrite(h, "| 统计区间 | " + TimeToString(ToBeijing(periodStart), TIME_DATE|TIME_MINUTES) + " ~ " + TimeToString(ToBeijing(periodEnd), TIME_DATE|TIME_MINUTES) + " |");
+    FileWrite(h, "| 平仓成交数 | " + (string)snapshot.deal_count + " |");
+    FileWrite(h, "| 全部已实现盈亏 | " + DoubleToString(snapshot.all_realized, 2) + " |");
+    FileWrite(h, "| 剥头皮已实现盈亏 | " + DoubleToString(snapshot.scalp_realized, 2) + " |");
+    FileWrite(h, "| 趋势已实现盈亏 | " + DoubleToString(snapshot.trend_realized, 2) + " |");
+    FileWrite(h, "| 已实现累计峰值 | " + DoubleToString(snapshot.all_high, 2) + " |");
+    FileWrite(h, "| 离线浮盈峰值 | 无法从成交历史精确还原 |");
+    FileWrite(h, "");
+    FileWrite(h, "> 本报告由启动恢复流程按成交历史幂等补做；不使用重启时的当前余额、净值或浮动盈亏冒充历史值。");
+    FileFlush(h);
+    FileClose(h);
+    if(!FileMove(tempName, 0, finalName, FILE_REWRITE))
+    {
+        PrintFormat("[Recovery] 补做报告原子替换失败 %s，错误=%d", finalName, GetLastError());
+        FileDelete(tempName);
+        return false;
+    }
+    Print("[Recovery] 已补做统计周期报告: ", finalName);
+    return true;
+}
+
+bool ReplayMissedPeriods(datetime savedPeriod, datetime savedStatStart, datetime currentPeriod)
+{
+    if(savedPeriod <= 0 || savedPeriod >= currentPeriod) return true;
+    int missed = (int)((currentPeriod - savedPeriod) / 86400);
+    int limit = MathMax(1, Inp_RecoveryLookbackDays);
+    datetime first = savedPeriod;
+    if(missed > limit)
+    {
+        first = currentPeriod - limit * 86400;
+        PrintFormat("[Recovery] 共错过 %d 个统计周期，仅自动补做最近 %d 个；更早周期保留审计缺口", missed, limit);
+    }
+    for(datetime period = first; period < currentPeriod; period += 86400)
+    {
+        if(period <= g_LastReportedPeriod) continue;
+        datetime reportFrom = (period == savedPeriod && savedStatStart > period && savedStatStart < period + 86400)
+                              ? savedStatStart : period;
+        if(!ExportRecoveredPeriod(reportFrom, period + 86400)) return false;
+        g_LastReportedPeriod = period;
+        PVSet("ReportedPeriod", (double)g_LastReportedPeriod);
+        GlobalVariablesFlush();
+    }
+    return true;
+}
+
+double CurrentPositionProfitPoints()
+{
+    double open = PositionGetDouble(POSITION_PRICE_OPEN);
+    ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double current = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                                                 : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double step = PointsToPrice(1.0);
+    if(step <= 0.0) return 0.0;
+    return (type == POSITION_TYPE_BUY) ? (current - open) / step : (open - current) / step;
+}
+
+bool AdoptMissingTicketStates()
+{
+    int blocked = ArraySize(g_StateRecoveryBlockedTickets);
+    if(blocked == 0) return false;
+    ulong tickets[];
+    ArrayCopy(tickets, g_StateRecoveryBlockedTickets);
+    ArrayResize(g_StateRecoveryBlockedTickets, 0);
+
+    for(int i = 0; i < ArraySize(tickets); i++)
+    {
+        ulong ticket = tickets[i];
+        if(!PositionSelectByTicket(ticket) || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        ENUM_SOP_ORDER kind = PosType();
+        double peak = MathMax(0.0, CurrentPositionProfitPoints());
+        if(kind == SOP_SCALP)
+        {
+            AddRuntimeTicket(g_TimeoutCancelled, ticket); // 避免恢复瞬间触发超时强平
+            if(peak >= Inp_ScalpBETrigger)
+            {
+                int n = ArraySize(g_ScalpTrackTicket);
+                ArrayResize(g_ScalpTrackTicket, n + 1); ArrayResize(g_ScalpTrackPeak, n + 1);
+                g_ScalpTrackTicket[n] = ticket; g_ScalpTrackPeak[n] = peak;
+            }
+        }
+        else if(kind == SOP_TREND)
+        {
+            int n = ArraySize(g_TrTicket);
+            ArrayResize(g_TrTicket, n + 1); ArrayResize(g_TrReduced, n + 1); ArrayResize(g_TrPeakPoints, n + 1);
+            double volume = PositionGetDouble(POSITION_VOLUME);
+            bool ambiguous = (volume > Inp_TrendLots + Inp_LotsTolerance);
+            g_TrTicket[n] = ticket;
+            g_TrReduced[n] = ambiguous || volume < Inp_TrendLots - Inp_LotsTolerance;
+            g_TrPeakPoints[n] = peak;
+        }
+        PrintFormat("[Recovery] Ticket=%I64u 已按当前可验证状态保守接管，历史峰值不作推断", ticket);
+    }
+    SaveArrays();
+    return true;
+}
+
+int CurrentSymbolPositionCount()
+{
+    int count = 0;
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        count++;
+    }
+    return count;
+}
+
+int UnverifiablePriorTicketCount()
+{
+    int count = 0;
+    for(int i = 0; i < ArraySize(g_TicketState); i++)
+    {
+        if(g_TicketState[i].closed_utc != 0) continue;
+        if(!PositionSelectByTicket(g_TicketState[i].ticket)) count++;
+    }
+    return count;
+}
+
+bool AttemptStartupRecovery()
+{
+    if(!g_InstanceOwnsState) return false;
+    g_LastRecoveryAttempt = TimeGMT();
+    g_RecoveryStartedUtc = g_LastRecoveryAttempt;
+    g_RecoveryCompletedUtc = 0;
+    g_RecoveryStatus = RECOVERY_CHECKING;
+    g_RecoveryReason = Lang("正在核对成交历史与状态检查点", "Checking deal history and state checkpoints");
+    PVSet("RecoveryStartedUtc", (double)g_RecoveryStartedUtc);
+    PVSet("RecoveryCompletedUtc", 0.0);
+    PVSet("RecoveryResult", (double)RECOVERY_CHECKING);
+    GlobalVariablesFlush();
+
+    datetime currentPeriod = TodayStart();
+    datetime savedPeriod = PVHas("StatDay") ? (datetime)(long)PVGet("StatDay") : 0;
+    datetime savedStatStart = PVHas("ResetTime") ? (datetime)(long)PVGet("ResetTime") : savedPeriod;
+    if(PVHas("ReportedPeriod")) g_LastReportedPeriod = (datetime)(long)PVGet("ReportedPeriod");
+    bool priorNeedsAck = PVHas("RecoveryNeedsAck") && PVGet("RecoveryNeedsAck") > 0.5;
+    bool scheduleChanged = savedPeriod > 0 &&
+                           ((savedPeriod > currentPeriod && savedPeriod - currentPeriod <= 86400) ||
+                            (currentPeriod >= savedPeriod && (currentPeriod - savedPeriod) % 86400 != 0));
+    bool loadedCurrent = (!scheduleChanged && savedPeriod == currentPeriod && LoadState());
+    // LoadState 会读取上一次审计时间；本轮恢复必须重新写入自己的起止时间。
+    g_RecoveryStartedUtc = g_LastRecoveryAttempt;
+    g_RecoveryCompletedUtc = 0;
+
+    int serverOffset = ServerGmtOffset();
+    if(currentPeriod <= 0 || MathAbs(serverOffset) > 14 * 3600 || savedPeriod > currentPeriod + 86400)
+    {
+        g_RecoveryStatus = RECOVERY_FAILED;
+        g_RecoveryReason = Lang("时间基准或重置参数发生异常，已禁止开仓", "Invalid time basis or reset configuration; entries disabled");
+        g_RecoveryCompletedUtc = TimeGMT();
+        PVSet("RecoveryCompletedUtc", (double)g_RecoveryCompletedUtc);
+        PVSet("RecoveryResult", (double)g_RecoveryStatus);
+        GlobalVariablesFlush();
+        return false;
+    }
+
+    if(scheduleChanged)
+    {
+        Print("[Recovery] 检测到每日重置时间配置变化；旧周期不自动补报，当前周期按成交历史重建并要求用户确认");
+        savedPeriod = 0;
+        savedStatStart = 0;
+    }
+
+    if(!ReplayMissedPeriods(savedPeriod, savedStatStart, currentPeriod))
+    {
+        g_RecoveryStatus = RECOVERY_FAILED;
+        g_RecoveryReason = Lang("历史报告补做失败，已禁止开仓", "Missed-period recovery failed; entries disabled");
+        g_RecoveryCompletedUtc = TimeGMT();
+        PVSet("RecoveryCompletedUtc", (double)g_RecoveryCompletedUtc);
+        PVSet("RecoveryResult", (double)g_RecoveryStatus);
+        GlobalVariablesFlush();
+        return false;
+    }
+
+    g_DayStart = currentPeriod;
+    if(!loadedCurrent)
+    {
+        g_ResetTime = currentPeriod;
+        g_HighInit = false; g_ScalpHiInit = false; g_TrendHiInit = false; g_GlobalHiInit = false;
+        g_MoatLiquidated = false; g_MoatDrawHit = false;
+        g_ScalpBlocked = false; g_TrendBlocked = false; g_TotalBlocked = false;
+        g_ScalpReason = ""; g_TrendReason = ""; g_TotalReason = "";
+        g_ConsecLoss = 0; g_CooldownUntil = 0;
+        g_LastDealTime = currentPeriod; g_LastDealTimeMsc = (long)currentPeriod * 1000; g_LastDealTicket = 0;
+        g_LastCompletedPeriod = currentPeriod;
+    }
+
+    RecoverySnapshot snapshot;
+    if(!BuildRecoverySnapshot(StatStart(), RecoveryNowServer() + 1, snapshot))
+    {
+        g_RecoveryStatus = RECOVERY_FAILED;
+        g_RecoveryReason = Lang("成交历史尚不可用，已禁止开仓并等待重试", "Deal history unavailable; entries disabled pending retry");
+        g_RecoveryCompletedUtc = TimeGMT();
+        PVSet("RecoveryCompletedUtc", (double)g_RecoveryCompletedUtc);
+        PVSet("RecoveryResult", (double)g_RecoveryStatus);
+        GlobalVariablesFlush();
+        return false;
+    }
+
+    double savedNetHigh = loadedCurrent && g_HighInit ? g_TodayHighProfit : -DBL_MAX;
+    double savedScalpHigh = loadedCurrent && g_ScalpHiInit ? g_ScalpHighProfit : -DBL_MAX;
+    double savedTrendHigh = loadedCurrent && g_TrendHiInit ? g_TrendHighProfit : -DBL_MAX;
+    double savedGlobalHigh = loadedCurrent && g_GlobalHiInit ? g_GlobalRealHigh : -DBL_MAX;
+    double savedPeakBalance = loadedCurrent ? g_PeakBalance : 0.0;
+
+    g_ConsecLoss = snapshot.consec_loss;
+    g_CooldownUntil = snapshot.cooldown_until > RecoveryNowServer() ? snapshot.cooldown_until : 0;
+    g_LastDealTimeMsc = snapshot.last_deal_msc > 0 ? snapshot.last_deal_msc : (long)StatStart() * 1000;
+    g_LastDealTicket = snapshot.last_deal_ticket;
+    g_LastDealTime = (datetime)(g_LastDealTimeMsc / 1000);
+
+    g_ScalpHighProfit = snapshot.scalp_high_init ? MathMax(snapshot.scalp_high, savedScalpHigh) : (savedScalpHigh > -DBL_MAX ? savedScalpHigh : 0.0);
+    g_TrendHighProfit = snapshot.trend_high_init ? MathMax(snapshot.trend_high, savedTrendHigh) : (savedTrendHigh > -DBL_MAX ? savedTrendHigh : 0.0);
+    g_GlobalRealHigh = snapshot.all_high_init ? MathMax(snapshot.all_high, savedGlobalHigh) : (savedGlobalHigh > -DBL_MAX ? savedGlobalHigh : 0.0);
+    g_ScalpHiInit = snapshot.scalp_high_init || savedScalpHigh > -DBL_MAX;
+    g_TrendHiInit = snapshot.trend_high_init || savedTrendHigh > -DBL_MAX;
+    g_GlobalHiInit = snapshot.all_high_init || savedGlobalHigh > -DBL_MAX;
+
+    g_InitBalance = AccountInfoDouble(ACCOUNT_BALANCE) - snapshot.all_realized;
+    g_PeakBalance = MathMax(MathMax(g_InitBalance, AccountInfoDouble(ACCOUNT_BALANCE)), savedPeakBalance);
+    double currentNet = snapshot.all_realized + AllFloatingPL();
+    double knownHigh = snapshot.all_high_init ? snapshot.all_high : currentNet;
+    knownHigh = MathMax(knownHigh, currentNet);
+    if(savedNetHigh > -DBL_MAX) knownHigh = MathMax(knownHigh, savedNetHigh);
+    g_TodayHighProfit = knownHigh;
+    g_HighInit = true;
+
+    LoadArrays();
+    if(g_StatePersistenceBlocked)
+    {
+        g_RecoveryStatus = RECOVERY_FAILED;
+        g_RecoveryReason = Lang("逐票状态文件异常，已保护原文件并禁止开仓", "Ticket-state file error; original protected and entries disabled");
+        g_RecoveryCompletedUtc = TimeGMT();
+        PVSet("RecoveryCompletedUtc", (double)g_RecoveryCompletedUtc);
+        PVSet("RecoveryResult", (double)g_RecoveryStatus);
+        GlobalVariablesFlush();
+        return false;
+    }
+    int priorOfflineTickets = UnverifiablePriorTicketCount();
+    bool adopted = AdoptMissingTicketStates();
+
+    datetime checkpointUtc = g_LastStateCheckpointUtc;
+    int gapSeconds = checkpointUtc > 0 ? (int)(TimeGMT() - checkpointUtc) : 0;
+    bool uncertainGap = (CurrentSymbolPositionCount() > 0 || priorOfflineTickets > 0) &&
+                        (!loadedCurrent || checkpointUtc == 0 || gapSeconds > MathMax(15, Inp_RefreshSeconds * 3));
+    if(adopted || uncertainGap || priorNeedsAck || scheduleChanged)
+    {
+        g_RecoveryStatus = RECOVERY_CONSERVATIVE;
+        g_RecoveryAcknowledged = false;
+        g_RecoveryReason = scheduleChanged
+            ? Lang("每日重置时间已变化，当前周期已重建；请确认恢复摘要", "Daily reset schedule changed; current period rebuilt, please confirm")
+            : (adopted
+            ? Lang("存在缺失逐票状态，已保守接管；请确认恢复摘要", "Missing ticket state adopted conservatively; review and confirm")
+            : (uncertainGap
+               ? Lang("离线期间存在持仓，浮盈峰值无法验证；请确认恢复摘要", "Positions existed while offline; peak profit is unverifiable; please confirm")
+               : Lang("上次保守恢复尚未确认；请检查持仓后确认", "Previous conservative recovery still requires confirmation")));
+    }
+    else
+    {
+        g_RecoveryStatus = RECOVERY_EXACT;
+        g_RecoveryAcknowledged = true;
+        g_RecoveryReason = Lang("恢复完成", "Recovery complete");
+    }
+    g_LastCompletedPeriod = currentPeriod;
+    g_RecoveryCompletedUtc = TimeGMT();
+    SaveState();
+    SaveArrays();
+    PrintFormat("[Recovery] 完成：status=%d deals=%d period=%s reason=%s",
+                (int)g_RecoveryStatus, snapshot.deal_count,
+                TimeToString(currentPeriod, TIME_DATE|TIME_MINUTES), g_RecoveryReason);
+    return true;
 }
 
 
@@ -4012,6 +4554,8 @@ bool PublishInstanceManifest()
     settings += "\"session_end\":" + (string)Inp_SessionEndHour + ",";
     settings += "\"reset_hour\":" + (string)Inp_ResetHour + ",";
     settings += "\"reset_minute\":" + (string)Inp_ResetMinute + ",";
+    settings += "\"recovery_lookback_days\":" + (string)Inp_RecoveryLookbackDays + ",";
+    settings += "\"recovery_retry_seconds\":" + (string)Inp_RecoveryRetrySeconds + ",";
     settings += "\"export_on_reset\":" + ManifestBool(Inp_ExportOnReset) + "},";
     settings += "\"risk\":{";
     settings += "\"daily_max_drawdown\":" + DoubleToString(Inp_DailyMaxDrawdown, 2) + ",";
@@ -4089,6 +4633,12 @@ bool PublishInstanceManifest()
 //+------------------------------------------------------------------+
 int OnInit()
 {
+    if(Inp_ResetHour < 0 || Inp_ResetHour > 23 || Inp_ResetMinute < 0 || Inp_ResetMinute > 59 ||
+       Inp_RecoveryLookbackDays < 1 || Inp_RecoveryRetrySeconds < 5)
+    {
+        Print("[Recovery] 参数无效：重置时间、补做天数或重试秒数超出允许范围");
+        return INIT_PARAMETERS_INCORRECT;
+    }
     g_Language_ZH = Inp_DefaultChinese;
     g_DayStart    = TodayStart();
     g_InstanceOwnsState = AcquireInstanceLease();
@@ -4098,29 +4648,12 @@ int OnInit()
         Print("[State V2] 检测到同账户/品种/Magic 的活动实例，本实例进入只读模式: ", ManagementScope());
         Alert(Lang("检测到另一套相同配置的 TradeEZ-SOP 正在运行。\n本图表已进入只读模式，不会开仓、平仓或管理持仓。",
                    "Another TradeEZ-SOP instance with the same account/symbol/magic is active.\nThis chart is read-only and will not trade or manage positions."));
+        g_RecoveryStatus = RECOVERY_FAILED;
+        g_RecoveryReason = Lang("重复实例只读", "Duplicate instance: read only");
     }
-
-    // 先尝试恢复今日存档(切周期/重载后保留连亏冷却等纪律状态)
-    if(!g_InstanceOwnsState || !LoadState())
-    {
-        // 无有效存档 → 纪律状态全新初始化
-        g_ResetTime    = TodayStart();
-        g_HighInit     = false;
-        g_ScalpHiInit  = false;
-        g_TrendHiInit  = false;
-        g_GlobalHiInit = false;
-        g_LastDealTime = TodayStart();
-        g_ConsecLoss   = 0;
-        g_CooldownUntil = 0;
-    }
-
-    // 今日初始金额/峰值:每次都重新推算,不用存档的旧值(自愈,过了重置点后正确)
-    // 今日起点余额 = 当前余额 - 今日已实现盈亏
-    g_InitBalance = AccountInfoDouble(ACCOUNT_BALANCE) - AllRealizedPL();
-    g_PeakBalance = MathMax(g_InitBalance, AccountInfoDouble(ACCOUNT_BALANCE));
 
     if(g_InstanceOwnsState)
-        LoadArrays();   // 恢复逐票状态(超时取消/趋势追踪/提升名单)，与统计日解耦
+        AttemptStartupRecovery();
 
     if(MathAbs(Inp_ScalpDrawdownRatio + Inp_TrendDrawdownRatio - 100.0) > 0.01)
         Print("提示:剥头皮+趋势回撤占比之和不等于100%,请确认参数。");
@@ -4133,7 +4666,7 @@ int OnInit()
     ChartSetInteger(0, CHART_EVENT_OBJECT_DELETE, true);
     ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, true);
 
-    if(g_InstanceOwnsState) CheckAllRiskControl();
+    if(g_InstanceOwnsState && g_RecoveryStatus != RECOVERY_FAILED) CheckAllRiskControl();
     RenderPerfectUI();
     if(g_InstanceOwnsState) PublishInstanceManifest();
 
@@ -4147,8 +4680,11 @@ void OnDeinit(const int reason)
     EventKillTimer();
     if(g_InstanceOwnsState)
     {
-        SaveArrays();
-        SaveState();
+        if(g_RecoveryStatus != RECOVERY_CHECKING && g_RecoveryStatus != RECOVERY_FAILED)
+        {
+            SaveArrays();
+            SaveState();
+        }
         ReleaseInstanceLease();
     }
     ObjectsDeleteAll(0, Prefix);
@@ -4157,14 +4693,18 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
-    if(!g_InstanceOwnsState)
+    if(!g_InstanceOwnsState || g_RecoveryStatus == RECOVERY_CHECKING || g_RecoveryStatus == RECOVERY_FAILED)
     {
         UpdateQuoteBar();
         return;
     }
-    CheckDayRollover();
-    ManageAllTrailingStops();
     CheckAllRiskControl();
+    if(g_RecoveryStatus == RECOVERY_FAILED)
+    {
+        UpdateQuoteBar();
+        return;
+    }
+    ManageAllTrailingStops();
 
     // 每tick更新报价条(不重建整个面板,避免打字被打断)
     UpdateQuoteBar(); // 紧凑面板也需要实时报价
@@ -4174,14 +4714,23 @@ void OnTimer()
 {
     static int manifestSeconds = 0;
     RenewInstanceLease();
+    if(g_InstanceOwnsState && g_RecoveryStatus == RECOVERY_FAILED && !g_StatePersistenceBlocked &&
+       (g_LastRecoveryAttempt == 0 || TimeGMT() - g_LastRecoveryAttempt >= MathMax(5, Inp_RecoveryRetrySeconds)))
+        AttemptStartupRecovery();
     if(g_InstanceOwnsState)
     {
-        CheckAllRiskControl();
-        g_StateCheckpointSeconds += MathMax(1, Inp_RefreshSeconds);
-        if(g_StateCheckpointSeconds >= 30)
+        if(g_RecoveryStatus != RECOVERY_CHECKING && g_RecoveryStatus != RECOVERY_FAILED)
         {
-            g_StateCheckpointSeconds = 0;
-            SaveArrays();
+            CheckAllRiskControl();
+            if(g_RecoveryStatus != RECOVERY_FAILED)
+            {
+                g_StateCheckpointSeconds += MathMax(1, Inp_RefreshSeconds);
+                if(g_StateCheckpointSeconds >= 30)
+                {
+                    g_StateCheckpointSeconds = 0;
+                    SaveArrays();
+                }
+            }
         }
     }
     RenderPerfectUI();
@@ -4195,7 +4744,7 @@ void OnTimer()
 
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
 {
-    if(g_InstanceOwnsState &&
+    if(g_InstanceOwnsState && g_RecoveryStatus != RECOVERY_CHECKING && g_RecoveryStatus != RECOVERY_FAILED &&
        (trans.type == TRADE_TRANSACTION_DEAL_ADD || trans.type == TRADE_TRANSACTION_POSITION))
     {
         SaveArrays(); // 新开仓、部分减仓或平仓后立即刷新逐票状态与剩余手数
@@ -4411,6 +4960,21 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
         return;
     }
 
+    if(sparam == Prefix + "Btn_Recovery_Ack")
+    {
+        ResetBtn(sparam);
+        string message = Lang("系统已根据成交历史和当前持仓完成保守恢复。\n\n无法精确还原终端关闭期间的浮盈最高点；缺失逐票状态已按防止重复减仓、避免启动瞬间强平的原则接管。\n\n确认后将恢复开仓功能。请先检查当前持仓、止损和止盈是否符合预期。",
+                              "The system completed a conservative recovery from deal history and current positions.\n\nPeak floating profit while the terminal was offline cannot be reconstructed exactly. Missing ticket state was adopted to avoid duplicate reductions or an immediate timeout close.\n\nConfirm to re-enable entries after checking current positions, stops and targets.");
+        if(MessageBox(message, Lang("确认恢复结果", "Confirm recovery result"), MB_OKCANCEL | MB_ICONWARNING) == IDOK)
+        {
+            g_RecoveryAcknowledged = true;
+            g_RecoveryReason = Lang("用户已确认保守恢复结果", "Conservative recovery acknowledged");
+            SaveState();
+        }
+        RenderPerfectUI();
+        return;
+    }
+
     // 同账户/品种/Magic 的第二实例只允许查看，禁止一切交易与状态变更。
     if(!g_InstanceOwnsState)
     {
@@ -4475,6 +5039,14 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
     if(sparam == Prefix + "Btn_Reset_All")
     {
         ResetBtn(sparam);
+        if(g_RecoveryStatus == RECOVERY_CHECKING || g_RecoveryStatus == RECOVERY_FAILED ||
+           (g_RecoveryStatus == RECOVERY_CONSERVATIVE && !g_RecoveryAcknowledged))
+        {
+            Alert(Lang("当前恢复尚未成功。为避免用不完整历史覆盖风控状态，暂时不能重置；平仓操作仍可使用。",
+                       "Recovery has not completed. Reset is disabled to avoid overwriting risk state with incomplete history; closing remains available."));
+            RenderPerfectUI();
+            return;
+        }
         string confirmation = Lang(
             "您想从现在开始，重新记录本轮交易表现吗？\n\n"
             "重置后，将以当前账户余额作为新的统计基准，重新累计本轮盈亏与盈利高点，并清除连亏计数、冷却时间及风控锁定。\n\n"
@@ -4511,6 +5083,12 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
         g_ConsecLoss      = 0;
         g_CooldownUntil   = 0;
         g_LastDealTime    = TimeCurrent();
+        g_LastDealTimeMsc = (long)g_LastDealTime * 1000;
+        g_LastDealTicket  = 0;
+        g_LastCompletedPeriod = g_DayStart;
+        g_RecoveryStatus = RECOVERY_EXACT;
+        g_RecoveryAcknowledged = true;
+        g_RecoveryReason = Lang("用户已手动重置统计", "Statistics manually reset by user");
         SaveState();      // 立即持久化重置后的状态
         Alert(Lang("【风控系统】今日统计已归零重置。", "[RISK ENGINE] Daily statistics reset."));
         ResetBtn(sparam);
