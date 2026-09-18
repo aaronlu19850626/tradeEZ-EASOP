@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  最后修改时间：2026-09-19 01:32（北京时间）       |
+//|                  最后修改时间：2026-09-19 02:06（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -204,6 +204,15 @@ enum ENUM_RECOVERY_STATUS
     RECOVERY_FAILED       = 3
 };
 
+enum ENUM_PROTECTION_STATUS
+{
+    PROTECTION_CHECKING       = 0,
+    PROTECTION_CONFIRMED      = 1,
+    PROTECTION_REPAIR_PENDING = 2,
+    PROTECTION_CLOSE_PENDING  = 3,
+    PROTECTION_FAILED         = 4
+};
+
 //+------------------------------------------------------------------+
 //| 全局状态                                                          |
 //+------------------------------------------------------------------+
@@ -227,6 +236,12 @@ datetime       g_RecoveryCompletedUtc = 0;
 datetime       g_LastStateCheckpointUtc = 0;
 datetime       g_LastCompletedPeriod = 0;
 datetime       g_LastReportedPeriod = 0;
+
+// 服务器保护闭环。任何受管仓位/挂单未确认最低保护时，全局禁止新增风险。
+bool           g_ProtectionBlocksNewRisk = true;
+string         g_ProtectionReason = "";
+int            g_ProtectionIssueCount = 0;
+bool           g_AccountModeSupported = true;
 
 // 风控封锁标志(仅禁开)
 bool           g_ScalpBlocked = false;
@@ -311,6 +326,14 @@ struct TicketStateRecord
     bool     trend_reduced;
     double   trend_peak_points;
     double   last_volume;
+    int      protection_status;
+    double   minimum_required_sl;
+    double   last_confirmed_sl;
+    double   last_confirmed_tp;
+    long     protection_first_failed_utc_msc;
+    long     protection_next_retry_utc_msc;
+    int      protection_retry_count;
+    uint     protection_last_retcode;
     datetime updated_utc;
     datetime closed_utc;
 };
@@ -321,7 +344,13 @@ bool              g_InstanceOwnsState = true;
 bool              g_StatePersistenceBlocked = false;
 double            g_InstanceLeaseOwner = 0.0;
 int               g_StateCheckpointSeconds = 0;
-const int         TICKET_STATE_SCHEMA = 2;
+const int         TICKET_STATE_SCHEMA = 3;
+
+// 挂单不进入持仓逐票文件；运行期每秒复核，重启后从服务器订单池重建。
+ulong             g_UnsafeOrderTicket[];
+long              g_UnsafeOrderFirstFailedMsc[];
+long              g_UnsafeOrderNextRetryMsc[];
+int               g_UnsafeOrderRetryCount[];
 
 // 明细舱历史缓存
 struct ClosedRow
@@ -371,7 +400,35 @@ double DollarToPoints(double dollars, double lots)
 
 double NormalizePrice(double price)
 {
-    return NormalizeDouble(price, _Digits);
+    if(price == 0.0) return 0.0;
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tickSize <= 0.0) tickSize = _Point;
+    if(tickSize <= 0.0) return NormalizeDouble(price, _Digits);
+    return NormalizeDouble(MathRound(price / tickSize) * tickSize, _Digits);
+}
+
+double NormalizeProtectionPrice(double price, ENUM_POSITION_TYPE type)
+{
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tickSize <= 0.0) tickSize = _Point;
+    if(tickSize <= 0.0) return NormalizeDouble(price, _Digits);
+    // 最低保护线只能向减小风险的方向取整：多单向上、空单向下。
+    double ticks = price / tickSize;
+    double aligned = (type == POSITION_TYPE_BUY)
+                   ? MathCeil(ticks - 1e-9) * tickSize
+                   : MathFloor(ticks + 1e-9) * tickSize;
+    return NormalizeDouble(aligned, _Digits);
+}
+
+long ProtectionNowMsc()
+{
+    return (long)TimeGMT() * 1000;
+}
+
+bool TradeRetcodeAccepted(uint retcode)
+{
+    return retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_DONE_PARTIAL ||
+           retcode == TRADE_RETCODE_PLACED || retcode == TRADE_RETCODE_NO_CHANGES;
 }
 
 double NormalizeLots(double lots)
@@ -919,6 +976,383 @@ void TimeoutCancelCleanup()
 }
 
 //+------------------------------------------------------------------+
+//| 服务器保护闭环                                                    |
+//+------------------------------------------------------------------+
+double MinimumProtectionSL(ENUM_SOP_ORDER kind, ENUM_POSITION_TYPE type, double openPrice)
+{
+    double slPoints = (kind == SOP_SCALP) ? Inp_ScalpSL_Points : Inp_TrendSL_Points;
+    double raw = (type == POSITION_TYPE_BUY)
+               ? openPrice - PointsToPrice(slPoints)
+               : openPrice + PointsToPrice(slPoints);
+    return NormalizeProtectionPrice(raw, type);
+}
+
+bool IsSLAtLeastAsSafe(ENUM_POSITION_TYPE type, double actualSL, double requiredSL)
+{
+    if(actualSL <= 0.0 || requiredSL <= 0.0) return false;
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tickSize <= 0.0) tickSize = _Point;
+    double tolerance = MathMax(_Point, tickSize) * 0.5;
+    return (type == POSITION_TYPE_BUY)
+           ? actualSL + tolerance >= requiredSL
+           : actualSL - tolerance <= requiredSL;
+}
+
+double StrongerSL(ENUM_POSITION_TYPE type, double a, double b)
+{
+    if(a <= 0.0) return b;
+    if(b <= 0.0) return a;
+    return (type == POSITION_TYPE_BUY) ? MathMax(a, b) : MathMin(a, b);
+}
+
+int ProtectionRetryDelaySeconds(int retryCount)
+{
+    if(retryCount <= 1) return 1;
+    if(retryCount == 2) return 2;
+    return 4;
+}
+
+bool IsPositionProtectionConfirmed(ulong ticket)
+{
+    if(!PositionSelectByTicket(ticket) || PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
+    ENUM_SOP_ORDER kind = PosType();
+    if(kind == SOP_IGNORE && !IsPromoted(ticket)) return false;
+    ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double baseline = MinimumProtectionSL(kind, type, PositionGetDouble(POSITION_PRICE_OPEN));
+    int idx = TicketStateIndex(ticket);
+    double required = baseline;
+    if(idx >= 0) required = StrongerSL(type, required, g_TicketState[idx].last_confirmed_sl);
+    return IsSLAtLeastAsSafe(type, PositionGetDouble(POSITION_SL), required);
+}
+
+bool TryRepairPositionProtection(ulong ticket, double requiredSL, double requiredTP, uint &retcode)
+{
+    retcode = 0;
+    if(!PositionSelectByTicket(ticket)) return true;
+    double curTP = PositionGetDouble(POSITION_TP);
+    double targetTP = (requiredTP > 0.0 && curTP <= 0.0) ? requiredTP : curTP;
+    ResetLastError();
+    bool sent = g_trade.PositionModify(ticket, NormalizePrice(requiredSL), NormalizePrice(targetTP));
+    retcode = g_trade.ResultRetcode();
+    if(!sent || !TradeRetcodeAccepted(retcode))
+    {
+        PrintFormat("[Protection] 修复提交失败 ticket=%I64u requiredSL=%.5f retcode=%u(%s) error=%d",
+                    ticket, requiredSL, retcode, g_trade.ResultRetcodeDescription(), GetLastError());
+        return false;
+    }
+    if(!PositionSelectByTicket(ticket)) return true;
+    ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double actualSL = PositionGetDouble(POSITION_SL);
+    bool slConfirmed = IsSLAtLeastAsSafe(type, actualSL, requiredSL);
+    bool tpConfirmed = requiredTP <= 0.0 || PositionGetDouble(POSITION_TP) > 0.0;
+    bool confirmed = slConfirmed && tpConfirmed;
+    PrintFormat("[Protection] 修复复核 ticket=%I64u requiredSL=%.5f actualSL=%.5f requiredTP=%.5f actualTP=%.5f confirmed=%s retcode=%u",
+                ticket, requiredSL, actualSL, requiredTP, PositionGetDouble(POSITION_TP), confirmed ? "true" : "false", retcode);
+    return confirmed;
+}
+
+bool TryEmergencyClosePosition(ulong ticket, uint &retcode)
+{
+    retcode = 0;
+    if(!PositionSelectByTicket(ticket)) return true;
+    ResetLastError();
+    bool sent = g_trade.PositionClose(ticket, (ulong)Inp_Slippage);
+    retcode = g_trade.ResultRetcode();
+    PrintFormat("[Protection] 安全退出 ticket=%I64u sent=%s retcode=%u(%s) error=%d",
+                ticket, sent ? "true" : "false", retcode, g_trade.ResultRetcodeDescription(), GetLastError());
+    return !PositionSelectByTicket(ticket);
+}
+
+int UnsafeOrderIndex(ulong ticket)
+{
+    for(int i = 0; i < ArraySize(g_UnsafeOrderTicket); i++)
+        if(g_UnsafeOrderTicket[i] == ticket) return i;
+    return -1;
+}
+
+int EnsureUnsafeOrder(ulong ticket, long nowMsc)
+{
+    int idx = UnsafeOrderIndex(ticket);
+    if(idx >= 0) return idx;
+    int n = ArraySize(g_UnsafeOrderTicket);
+    ArrayResize(g_UnsafeOrderTicket, n + 1);
+    ArrayResize(g_UnsafeOrderFirstFailedMsc, n + 1);
+    ArrayResize(g_UnsafeOrderNextRetryMsc, n + 1);
+    ArrayResize(g_UnsafeOrderRetryCount, n + 1);
+    g_UnsafeOrderTicket[n] = ticket;
+    g_UnsafeOrderFirstFailedMsc[n] = nowMsc;
+    g_UnsafeOrderNextRetryMsc[n] = 0;
+    g_UnsafeOrderRetryCount[n] = 0;
+    return n;
+}
+
+void RemoveUnsafeOrderAt(int idx)
+{
+    int last = ArraySize(g_UnsafeOrderTicket) - 1;
+    if(idx < 0 || idx > last) return;
+    g_UnsafeOrderTicket[idx] = g_UnsafeOrderTicket[last];
+    g_UnsafeOrderFirstFailedMsc[idx] = g_UnsafeOrderFirstFailedMsc[last];
+    g_UnsafeOrderNextRetryMsc[idx] = g_UnsafeOrderNextRetryMsc[last];
+    g_UnsafeOrderRetryCount[idx] = g_UnsafeOrderRetryCount[last];
+    ArrayResize(g_UnsafeOrderTicket, last);
+    ArrayResize(g_UnsafeOrderFirstFailedMsc, last);
+    ArrayResize(g_UnsafeOrderNextRetryMsc, last);
+    ArrayResize(g_UnsafeOrderRetryCount, last);
+}
+
+ENUM_SOP_ORDER SelectedOrderKind()
+{
+    long magic = OrderGetInteger(ORDER_MAGIC);
+    if(magic == Inp_MagicScalp) return SOP_SCALP;
+    if(magic == Inp_MagicTrend) return SOP_TREND;
+    return SOP_IGNORE;
+}
+
+bool SelectedOrderIsBuy()
+{
+    ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+    return type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_STOP_LIMIT;
+}
+
+bool SelectedOrderProtectionSafe(ENUM_SOP_ORDER kind, double &requiredSL, double &requiredTP)
+{
+    bool isBuy = SelectedOrderIsBuy();
+    ENUM_POSITION_TYPE posType = isBuy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+    double open = OrderGetDouble(ORDER_PRICE_OPEN);
+    requiredSL = MinimumProtectionSL(kind, posType, open);
+    requiredTP = 0.0;
+    if(kind == SOP_SCALP && Inp_ScalpTP_Points > 0)
+        requiredTP = NormalizePrice(isBuy ? open + PointsToPrice(Inp_ScalpTP_Points)
+                                          : open - PointsToPrice(Inp_ScalpTP_Points));
+    bool slSafe = IsSLAtLeastAsSafe(posType, OrderGetDouble(ORDER_SL), requiredSL);
+    bool tpSafe = requiredTP <= 0.0 || OrderGetDouble(ORDER_TP) > 0.0;
+    return slSafe && tpSafe;
+}
+
+bool TryRepairSelectedOrder(ulong ticket, double requiredSL, double requiredTP, uint &retcode)
+{
+    retcode = 0;
+    if(!OrderSelect(ticket)) return true;
+    double tp = requiredTP > 0.0 ? requiredTP : OrderGetDouble(ORDER_TP);
+    ResetLastError();
+    bool sent = g_trade.OrderModify(ticket,
+                                    OrderGetDouble(ORDER_PRICE_OPEN),
+                                    NormalizePrice(requiredSL), NormalizePrice(tp),
+                                    (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME),
+                                    (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION),
+                                    OrderGetDouble(ORDER_PRICE_STOPLIMIT));
+    retcode = g_trade.ResultRetcode();
+    if(!sent || !TradeRetcodeAccepted(retcode))
+    {
+        PrintFormat("[Protection] 挂单修复失败 ticket=%I64u retcode=%u(%s) error=%d",
+                    ticket, retcode, g_trade.ResultRetcodeDescription(), GetLastError());
+        return false;
+    }
+    if(!OrderSelect(ticket)) return true;
+    ENUM_SOP_ORDER kind = SelectedOrderKind();
+    double verifySL, verifyTP;
+    return kind != SOP_IGNORE && SelectedOrderProtectionSafe(kind, verifySL, verifyTP);
+}
+
+bool ValidateEntryProtection(ENUM_SOP_ORDER kind, bool isBuy, double entryPrice, bool pendingOrder)
+{
+    if(!g_AccountModeSupported)
+    {
+        Alert(Lang("【拒绝】当前版本仅支持对冲账户", "[REJECT] Hedging accounts only"));
+        return false;
+    }
+    int slPoints = (kind == SOP_SCALP) ? Inp_ScalpSL_Points : Inp_TrendSL_Points;
+    if(slPoints <= 0)
+    {
+        Alert(Lang("【拒绝】初始止损必须大于0", "[REJECT] Initial SL must be greater than zero"));
+        return false;
+    }
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(entryPrice <= 0.0 || tickSize <= 0.0)
+    {
+        Alert(Lang("【拒绝】报价或品种最小变动单位无效", "[REJECT] Invalid quote or tick size"));
+        return false;
+    }
+    double minDistance = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+    double configured = PointsToPrice(slPoints);
+    if(configured + tickSize * 0.5 < minDistance)
+    {
+        Alert(StringFormat(Lang("【拒绝】配置止损距离 %.2f 小于券商最小距离 %.2f",
+                                "[REJECT] Configured SL distance %.2f is below broker minimum %.2f"),
+                           configured, minDistance));
+        return false;
+    }
+    if(!pendingOrder)
+    {
+        double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        ENUM_POSITION_TYPE type = isBuy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+        double sl = MinimumProtectionSL(kind, type, entryPrice);
+        double distance = isBuy ? bid - sl : sl - ask;
+        if(bid <= 0.0 || ask <= 0.0 || distance + tickSize * 0.5 < minDistance)
+        {
+            Alert(Lang("【拒绝】当前报价下初始止损不满足券商最小距离", "[REJECT] Initial SL violates broker stop distance"));
+            return false;
+        }
+    }
+    return true;
+}
+
+void AuditServerProtection()
+{
+    if(!g_InstanceOwnsState) return;
+    long nowMsc = ProtectionNowMsc();
+    int issues = 0;
+    bool stateChanged = false;
+
+    g_AccountModeSupported = ((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+    if(!g_AccountModeSupported) issues++;
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        ENUM_SOP_ORDER kind = PosType();
+        if(kind == SOP_IGNORE && !IsPromoted(ticket)) continue;
+
+        int idx = EnsureTicketStateRecord(ticket);
+        ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        double actualSL = PositionGetDouble(POSITION_SL);
+        double actualTP = PositionGetDouble(POSITION_TP);
+        double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+        double baseline = MinimumProtectionSL(kind, type, openPrice);
+        double required = StrongerSL(type, baseline, g_TicketState[idx].last_confirmed_sl);
+        // 若SL已经更优、但只是TP缺失，修复TP时也绝不能把现有SL放宽回初始线。
+        if(IsSLAtLeastAsSafe(type, actualSL, required))
+            required = StrongerSL(type, required, actualSL);
+        bool tpRequired = kind == SOP_SCALP && Inp_ScalpTP_Points > 0 &&
+                          !IsPromoted(ticket) && ScalpTrackIndex(ticket) < 0;
+        double requiredTP = tpRequired
+                          ? NormalizePrice(type == POSITION_TYPE_BUY
+                              ? openPrice + PointsToPrice(Inp_ScalpTP_Points)
+                              : openPrice - PointsToPrice(Inp_ScalpTP_Points))
+                          : 0.0;
+        g_TicketState[idx].minimum_required_sl = required;
+
+        if(IsSLAtLeastAsSafe(type, actualSL, required) && (!tpRequired || actualTP > 0.0))
+        {
+            double confirmed = StrongerSL(type, g_TicketState[idx].last_confirmed_sl, actualSL);
+            if(g_TicketState[idx].protection_status != PROTECTION_CONFIRMED ||
+               MathAbs(g_TicketState[idx].last_confirmed_sl - confirmed) > _Point * 0.5)
+                stateChanged = true;
+            g_TicketState[idx].protection_status = PROTECTION_CONFIRMED;
+            g_TicketState[idx].last_confirmed_sl = confirmed;
+            g_TicketState[idx].last_confirmed_tp = actualTP;
+            g_TicketState[idx].protection_first_failed_utc_msc = 0;
+            g_TicketState[idx].protection_next_retry_utc_msc = 0;
+            g_TicketState[idx].protection_retry_count = 0;
+            g_TicketState[idx].protection_last_retcode = 0;
+            continue;
+        }
+
+        issues++;
+        if(g_TicketState[idx].protection_first_failed_utc_msc <= 0)
+        {
+            g_TicketState[idx].protection_first_failed_utc_msc = nowMsc;
+            g_TicketState[idx].protection_next_retry_utc_msc = 0;
+            g_TicketState[idx].protection_retry_count = 0;
+            g_TicketState[idx].protection_status = PROTECTION_REPAIR_PENDING;
+            stateChanged = true;
+            PrintFormat("[Protection] 检测到保护缺失 ticket=%I64u requiredSL=%.5f actualSL=%.5f requiredTP=%.5f actualTP=%.5f",
+                        ticket, required, actualSL, requiredTP, actualTP);
+        }
+
+        long elapsed = nowMsc - g_TicketState[idx].protection_first_failed_utc_msc;
+        if(elapsed < 8000 && nowMsc >= g_TicketState[idx].protection_next_retry_utc_msc)
+        {
+            uint retcode = 0;
+            g_TicketState[idx].protection_retry_count++;
+            bool repaired = TryRepairPositionProtection(ticket, required, requiredTP, retcode);
+            g_TicketState[idx].protection_last_retcode = retcode;
+            g_TicketState[idx].protection_next_retry_utc_msc = nowMsc +
+                (long)ProtectionRetryDelaySeconds(g_TicketState[idx].protection_retry_count) * 1000;
+            stateChanged = true;
+            if(repaired) continue;
+        }
+
+        bool firstCloseDue = elapsed >= 8000 &&
+                             g_TicketState[idx].protection_status == PROTECTION_REPAIR_PENDING;
+        if(elapsed >= 8000 && (firstCloseDue || nowMsc >= g_TicketState[idx].protection_next_retry_utc_msc))
+        {
+            bool firstClose = g_TicketState[idx].protection_status != PROTECTION_CLOSE_PENDING &&
+                              g_TicketState[idx].protection_status != PROTECTION_FAILED;
+            g_TicketState[idx].protection_status = (elapsed >= 16000) ? PROTECTION_FAILED : PROTECTION_CLOSE_PENDING;
+            uint retcode = 0;
+            TryEmergencyClosePosition(ticket, retcode);
+            g_TicketState[idx].protection_last_retcode = retcode;
+            g_TicketState[idx].protection_next_retry_utc_msc = nowMsc + 4000;
+            stateChanged = true;
+            if(firstClose)
+                Alert(StringFormat(Lang("【保护异常】Ticket %I64u 无法确认止损，正在强制退出",
+                                        "[PROTECTION] Ticket %I64u has no confirmed SL; forcing exit"), ticket));
+        }
+    }
+
+    // 审计本实例策略挂单；不安全挂单修复超时后撤销。
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = OrderGetTicket(i);
+        if(ticket == 0 || OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+        ENUM_SOP_ORDER kind = SelectedOrderKind();
+        if(kind == SOP_IGNORE) continue;
+        double requiredSL, requiredTP;
+        if(SelectedOrderProtectionSafe(kind, requiredSL, requiredTP))
+        {
+            int safeIdx = UnsafeOrderIndex(ticket);
+            if(safeIdx >= 0) RemoveUnsafeOrderAt(safeIdx);
+            continue;
+        }
+
+        issues++;
+        int unsafeIdx = EnsureUnsafeOrder(ticket, nowMsc);
+        long elapsed = nowMsc - g_UnsafeOrderFirstFailedMsc[unsafeIdx];
+        if(elapsed < 8000 && nowMsc >= g_UnsafeOrderNextRetryMsc[unsafeIdx])
+        {
+            uint retcode = 0;
+            g_UnsafeOrderRetryCount[unsafeIdx]++;
+            TryRepairSelectedOrder(ticket, requiredSL, requiredTP, retcode);
+            g_UnsafeOrderNextRetryMsc[unsafeIdx] = nowMsc +
+                (long)ProtectionRetryDelaySeconds(g_UnsafeOrderRetryCount[unsafeIdx]) * 1000;
+        }
+        else if(elapsed >= 8000 &&
+                (g_UnsafeOrderRetryCount[unsafeIdx] >= 0 || nowMsc >= g_UnsafeOrderNextRetryMsc[unsafeIdx]))
+        {
+            ResetLastError();
+            bool deleted = g_trade.OrderDelete(ticket);
+            uint retcode = g_trade.ResultRetcode();
+            PrintFormat("[Protection] 不安全挂单撤销 ticket=%I64u sent=%s retcode=%u(%s) error=%d",
+                        ticket, deleted ? "true" : "false", retcode, g_trade.ResultRetcodeDescription(), GetLastError());
+            g_UnsafeOrderRetryCount[unsafeIdx] = -1; // 标记已进入撤单阶段，后续按4秒节流核对
+            g_UnsafeOrderNextRetryMsc[unsafeIdx] = nowMsc + 4000;
+        }
+    }
+
+    // 清理已经不存在的挂单故障记录。
+    for(int i = ArraySize(g_UnsafeOrderTicket) - 1; i >= 0; i--)
+        if(!OrderSelect(g_UnsafeOrderTicket[i])) RemoveUnsafeOrderAt(i);
+
+    g_ProtectionIssueCount = issues;
+    g_ProtectionBlocksNewRisk = (issues > 0);
+    if(!g_AccountModeSupported)
+        g_ProtectionReason = Lang("仅支持对冲账户", "Hedging account required");
+    else if(issues > 0)
+        g_ProtectionReason = Lang("服务器保护异常", "Protection pending");
+    else
+        g_ProtectionReason = "";
+
+    if(stateChanged)
+    {
+        g_ArraysDirty = true;
+        if(!g_StatePersistenceBlocked) SaveArrays();
+    }
+}
+
+//+------------------------------------------------------------------+
 //| 修改止损                                                          |
 //+------------------------------------------------------------------+
 bool ModifyPositionSL(ulong ticket, double newSL)
@@ -930,7 +1364,24 @@ bool ModifyPositionSL(ulong ticket, double newSL)
     if(MathAbs(curSL - newSL) < _Point) return true; // 无变化
     for(int attempt = 0; attempt < 3; attempt++)
     {
-        if(g_trade.PositionModify(ticket, newSL, curTP)) return true;
+        bool sent = g_trade.PositionModify(ticket, newSL, curTP);
+        uint retcode = g_trade.ResultRetcode();
+        if(sent && TradeRetcodeAccepted(retcode) && PositionSelectByTicket(ticket))
+        {
+            ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            double actualSL = PositionGetDouble(POSITION_SL);
+            if(IsSLAtLeastAsSafe(type, actualSL, newSL))
+            {
+                int idx = TicketStateIndex(ticket);
+                if(idx >= 0)
+                {
+                    g_TicketState[idx].last_confirmed_sl = StrongerSL(type, g_TicketState[idx].last_confirmed_sl, actualSL);
+                    g_TicketState[idx].protection_status = PROTECTION_CONFIRMED;
+                    MarkTicketStateDirty(false);
+                }
+                return true;
+            }
+        }
     }
     return false;
 }
@@ -969,8 +1420,16 @@ void ClearScalpTP()
         double curTP = PositionGetDouble(POSITION_TP);
         if(curTP == 0.0) continue;  // 已无止盈,跳过
 
+        if(!IsPositionProtectionConfirmed(tk))
+        {
+            Alert(StringFormat(Lang("Ticket %I64u 的服务器止损尚未确认，暂不能撤止盈",
+                                    "Ticket %I64u has no confirmed server SL; TP cannot be removed"), tk));
+            continue;
+        }
+
         // 清除止盈,保留止损
-        if(g_trade.PositionModify(tk, curSL, 0.0))
+        if(g_trade.PositionModify(tk, curSL, 0.0) && TradeRetcodeAccepted(g_trade.ResultRetcode()) &&
+           PositionSelectByTicket(tk) && PositionGetDouble(POSITION_TP) == 0.0 && IsPositionProtectionConfirmed(tk))
             cleared++;
     }
 
@@ -1014,7 +1473,13 @@ void ConvertScalpToTrend()
 
         // 取消止盈(保留原止损不动)
         double curSL = PositionGetDouble(POSITION_SL);
-        if(g_trade.PositionModify(tk, curSL, 0.0))
+        if(!IsPositionProtectionConfirmed(tk))
+        {
+            skipped++;
+            continue;
+        }
+        if(g_trade.PositionModify(tk, curSL, 0.0) && TradeRetcodeAccepted(g_trade.ResultRetcode()) &&
+           PositionSelectByTicket(tk) && PositionGetDouble(POSITION_TP) == 0.0 && IsPositionProtectionConfirmed(tk))
         {
             AddPromoted(tk);  // 纳入趋势逻辑管理
             converted++;
@@ -1127,7 +1592,7 @@ void ManageScalpTrailingStop(ulong ticket)
     {
         PrintFormat("[止损推进] Ticket=%I64u 类型=%s 旧止损=%.5f → 新止损=%.5f (保护点数=%.1f)",
                     ticket, (type==POSITION_TYPE_BUY?"多":"空"), curSL, targetSL, protectedPoints);
-        g_trade.PositionModify(ticket, NormalizePrice(targetSL), curTP);  // 保留止盈
+        ModifyPositionSL(ticket, targetSL);  // 保留止盈，并复核服务器实际SL
     }
     else
     {
@@ -1643,8 +2108,8 @@ bool RecoveryAllowsNewRisk()
     return g_RecoveryStatus == RECOVERY_EXACT ||
            (g_RecoveryStatus == RECOVERY_CONSERVATIVE && g_RecoveryAcknowledged);
 }
-bool IsScalpAllowed() { return g_InstanceOwnsState && RecoveryAllowsNewRisk() && !g_ScalpBlocked && !g_TotalBlocked && !InCooldown(); }
-bool IsTrendAllowed() { return g_InstanceOwnsState && RecoveryAllowsNewRisk() && !g_TrendBlocked && !g_TotalBlocked && !InCooldown(); }
+bool IsScalpAllowed() { return g_InstanceOwnsState && g_AccountModeSupported && !g_ProtectionBlocksNewRisk && RecoveryAllowsNewRisk() && !g_ScalpBlocked && !g_TotalBlocked && !InCooldown(); }
+bool IsTrendAllowed() { return g_InstanceOwnsState && g_AccountModeSupported && !g_ProtectionBlocksNewRisk && RecoveryAllowsNewRisk() && !g_TrendBlocked && !g_TotalBlocked && !InCooldown(); }
 
 //+------------------------------------------------------------------+
 //| 周目标提示(仅建议,不自动改参数)                                 |
@@ -1734,6 +2199,17 @@ double DrawdownBase()
 //+------------------------------------------------------------------+
 bool ValidateOpenConditions(ENUM_SOP_ORDER kind)
 {
+    if(!g_AccountModeSupported)
+    {
+        Alert(Lang("【拒绝】当前版本仅支持对冲账户", "[REJECT] Hedging accounts only"));
+        return false;
+    }
+    if(g_ProtectionBlocksNewRisk)
+    {
+        Alert(Lang("【拒绝】服务器保护尚未全部确认，请先处理保护异常",
+                   "[REJECT] Server protection is not fully confirmed"));
+        return false;
+    }
     if(IsMarketClosed())
     {
         Alert(Lang("【拒绝】当前休市,无法建仓", "[REJECT] Market closed"));
@@ -1923,10 +2399,11 @@ void OpenMarket(ENUM_SOP_ORDER kind, bool isBuy)
     double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
     double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     double price = isBuy ? ask : bid;
+    if(!ValidateEntryProtection(kind, isBuy, price, false)) return;
 
     double sl = 0.0, tp = 0.0;
     if(slPts > 0.0)
-        sl = isBuy ? price - PointsToPrice(slPts) : price + PointsToPrice(slPts);
+        sl = MinimumProtectionSL(kind, isBuy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL, price);
     if(tpPts > 0.0)
         tp = isBuy ? price + PointsToPrice(tpPts) : price - PointsToPrice(tpPts);
 
@@ -1938,8 +2415,11 @@ void OpenMarket(ENUM_SOP_ORDER kind, bool isBuy)
             ? g_trade.Buy(lots, _Symbol, 0.0, NormalizePrice(sl), NormalizePrice(tp), cmt)
             : g_trade.Sell(lots, _Symbol, 0.0, NormalizePrice(sl), NormalizePrice(tp), cmt);
 
-    if(!ok)
-        Alert(Lang("下单失败: ", "Order failed: ") + (string)g_trade.ResultRetcode());
+    uint retcode = g_trade.ResultRetcode();
+    if(!ok || !TradeRetcodeAccepted(retcode))
+        Alert(Lang("下单失败: ", "Order failed: ") + (string)retcode + " " + g_trade.ResultRetcodeDescription());
+    else
+        AuditServerProtection();
 }
 
 //+------------------------------------------------------------------+
@@ -1967,6 +2447,7 @@ void OpenLimit(ENUM_SOP_ORDER kind, bool isBuy, double limitPrice)
     double slPts = (kind == SOP_SCALP) ? Inp_ScalpSL_Points : Inp_TrendSL_Points;
     double tpPts = (kind == SOP_SCALP) ? Inp_ScalpTP_Points : 0.0;
     limitPrice = NormalizePrice(limitPrice);
+    if(!ValidateEntryProtection(kind, isBuy, limitPrice, true)) return;
 
     // 方向 + 最小挂单距离校验(避免 10015 INVALID_PRICE)
     double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -2001,7 +2482,7 @@ void OpenLimit(ENUM_SOP_ORDER kind, bool isBuy, double limitPrice)
 
     double sl = 0.0, tp = 0.0;
     if(slPts > 0.0)
-        sl = isBuy ? limitPrice - PointsToPrice(slPts) : limitPrice + PointsToPrice(slPts);
+        sl = MinimumProtectionSL(kind, isBuy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL, limitPrice);
     if(tpPts > 0.0)
         tp = isBuy ? limitPrice + PointsToPrice(tpPts) : limitPrice - PointsToPrice(tpPts);
 
@@ -2016,9 +2497,11 @@ void OpenLimit(ENUM_SOP_ORDER kind, bool isBuy, double limitPrice)
                 dir, limitPrice, sl, tp, (ok ? "是" : "否"),
                 g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
 
-    if(!ok)
+    if(!ok || !TradeRetcodeAccepted(g_trade.ResultRetcode()))
         Alert(Lang("挂单失败: ", "Limit order failed: ") + (string)g_trade.ResultRetcode()
               + " " + g_trade.ResultRetcodeDescription());
+    else
+        AuditServerProtection();
 }
 
 // 现价偏移挂单:在当前价基础上 ± offsetUSD 美金处挂多/空(限价单)
@@ -2856,7 +3339,9 @@ void RenderStrategyCard(string tag, int cardX, int currentY, int cardH, color ac
     string stTxt; color stClr;
     // 熔断原因(优先级:连亏冷却 > 全局 > 本策略)
     string blkReason = "";
-    if(InCooldown())       blkReason = Lang("连亏熔断", "Streak breaker");
+    if(g_ProtectionBlocksNewRisk) blkReason = g_ProtectionReason +
+        (g_ProtectionIssueCount > 0 ? " (" + (string)g_ProtectionIssueCount + ")" : "");
+    else if(InCooldown())       blkReason = Lang("连亏熔断", "Streak breaker");
     else if(g_TotalBlocked) blkReason = g_TotalReason;
     else if(kind == SOP_SCALP && g_ScalpBlocked) blkReason = g_ScalpReason;
     else if(kind == SOP_TREND && g_TrendBlocked) blkReason = g_TrendReason;
@@ -3521,12 +4006,15 @@ uint StableTextHash(string value)
     return hash;
 }
 
-string StateNamespace()
+string StateNamespaceForSchema(int schema)
 {
-    return IntegerToString(TICKET_STATE_SCHEMA) + "|" + AccountInfoString(ACCOUNT_SERVER) + "|" +
+    return IntegerToString(schema) + "|" + AccountInfoString(ACCOUNT_SERVER) + "|" +
            (string)AccountInfoInteger(ACCOUNT_LOGIN) + "|" + _Symbol + "|" +
            NormalizeNamespacePart(Inp_InstanceId);
 }
+// 每日风控全局变量继续沿用 V2 命名空间，逐票文件升级不得导致风控检查点失联。
+string StateNamespace() { return StateNamespaceForSchema(2); }
+string TicketStateNamespace() { return StateNamespaceForSchema(TICKET_STATE_SCHEMA); }
 
 string StateNamespaceHash() { return (string)StableTextHash(StateNamespace()); }
 string ManagementScope()
@@ -3697,21 +4185,23 @@ bool LoadState()
 }
 
 //+------------------------------------------------------------------+
-//| 逐票状态 V2：与统计日解耦、原子保存、身份校验                    |
+//| 逐票状态 V3：增加服务器保护状态；兼容迁移 V2                     |
 //+------------------------------------------------------------------+
-string StateFolder()
+string StateFolderForSchema(int schema)
 {
-    return "TradeEZ\\state\\v" + IntegerToString(TICKET_STATE_SCHEMA);
+    return "TradeEZ\\state\\v" + IntegerToString(schema);
 }
+string StateFolder() { return StateFolderForSchema(TICKET_STATE_SCHEMA); }
 
-string StateFileName()
+string StateFileNameForSchema(int schema)
 {
     string serverHash = (string)StableTextHash(AccountInfoString(ACCOUNT_SERVER));
-    return StateFolder() + "\\" + serverHash + "_" +
+    return StateFolderForSchema(schema) + "\\" + serverHash + "_" +
            (string)AccountInfoInteger(ACCOUNT_LOGIN) + "_" +
            NormalizeNamespacePart(_Symbol) + "_" +
            NormalizeNamespacePart(Inp_InstanceId) + ".csv";
 }
+string StateFileName() { return StateFileNameForSchema(TICKET_STATE_SCHEMA); }
 
 string LegacyStateFileName()
 {
@@ -3755,6 +4245,14 @@ int EnsureTicketStateRecord(ulong ticket)
     int n = ArraySize(g_TicketState);
     ArrayResize(g_TicketState, n + 1);
     g_TicketState[n].ticket = ticket;
+    g_TicketState[n].protection_status = PROTECTION_CHECKING;
+    g_TicketState[n].minimum_required_sl = 0.0;
+    g_TicketState[n].last_confirmed_sl = 0.0;
+    g_TicketState[n].last_confirmed_tp = 0.0;
+    g_TicketState[n].protection_first_failed_utc_msc = 0;
+    g_TicketState[n].protection_next_retry_utc_msc = 0;
+    g_TicketState[n].protection_retry_count = 0;
+    g_TicketState[n].protection_last_retcode = 0;
     g_TicketState[n].closed_utc = 0;
     return n;
 }
@@ -3796,6 +4294,11 @@ bool ValidateTicketStateValues(const TicketStateRecord &record)
     if(!MathIsValidNumber(record.scalp_peak_points) || record.scalp_peak_points < 0.0) return false;
     if(!MathIsValidNumber(record.trend_peak_points) || record.trend_peak_points < 0.0) return false;
     if(!MathIsValidNumber(record.last_volume) || record.last_volume < 0.0) return false;
+    if(record.protection_status < PROTECTION_CHECKING || record.protection_status > PROTECTION_FAILED) return false;
+    if(!MathIsValidNumber(record.minimum_required_sl) || record.minimum_required_sl < 0.0) return false;
+    if(!MathIsValidNumber(record.last_confirmed_sl) || record.last_confirmed_sl < 0.0) return false;
+    if(!MathIsValidNumber(record.last_confirmed_tp) || record.last_confirmed_tp < 0.0) return false;
+    if(record.protection_retry_count < 0) return false;
     return true;
 }
 
@@ -3894,7 +4397,7 @@ void SaveArrays()
         return;
     }
 
-    FileWrite(h, "META", TICKET_STATE_SCHEMA, StateNamespace(), (long)TimeGMT(),
+    FileWrite(h, "META", TICKET_STATE_SCHEMA, TicketStateNamespace(), (long)TimeGMT(),
               g_LegacyStateMigrated ? 1 : 0);
     for(int i = 0; i < ArraySize(g_TicketState); i++)
     {
@@ -3903,6 +4406,9 @@ void SaveArrays()
                   r.open_time_msc, r.management_mode, r.timeout_cancelled ? 1 : 0,
                   r.scalp_track_active ? 1 : 0, r.scalp_peak_points,
                   r.trend_reduced ? 1 : 0, r.trend_peak_points, r.last_volume,
+                  r.protection_status, r.minimum_required_sl, r.last_confirmed_sl, r.last_confirmed_tp,
+                  r.protection_first_failed_utc_msc, r.protection_next_retry_utc_msc,
+                  r.protection_retry_count, (long)r.protection_last_retcode,
                   (long)r.updated_utc, (long)r.closed_utc);
     }
     FileFlush(h);
@@ -3984,12 +4490,19 @@ bool LoadLegacyArrays()
 
 bool LoadTicketStateV2()
 {
-    if(!FileIsExist(StateFileName())) return false;
-    int h = FileOpen(StateFileName(), FILE_READ | FILE_CSV | FILE_ANSI, ',');
+    string loadPath = StateFileName();
+    bool migratingV2 = false;
+    if(!FileIsExist(loadPath))
+    {
+        loadPath = StateFileNameForSchema(2);
+        migratingV2 = FileIsExist(loadPath);
+    }
+    if(!FileIsExist(loadPath)) return false;
+    int h = FileOpen(loadPath, FILE_READ | FILE_CSV | FILE_ANSI, ',');
     if(h == INVALID_HANDLE)
     {
         g_StatePersistenceBlocked = true;
-        PrintFormat("[State V2] 状态文件存在但无法读取；为保护原文件，本次运行禁止覆盖，错误=%d", GetLastError());
+        PrintFormat("[State V3] 状态文件存在但无法读取；为保护原文件，本次运行禁止覆盖，错误=%d", GetLastError());
         return true;
     }
 
@@ -3998,9 +4511,10 @@ bool LoadTicketStateV2()
     string storedNamespace = FileReadString(h);
     FileReadNumber(h); // saved_utc
     g_LegacyStateMigrated = ((int)FileReadNumber(h) != 0);
-    if(meta != "META" || schema != TICKET_STATE_SCHEMA || storedNamespace != StateNamespace())
+    if(meta != "META" || (schema != TICKET_STATE_SCHEMA && schema != 2) ||
+       storedNamespace != StateNamespaceForSchema(schema))
     {
-        Print("[State V2] 文件头或命名空间不匹配，拒绝恢复: ", StateFileName());
+        Print("[State V3] 文件头或命名空间不匹配，拒绝恢复: ", loadPath);
         FileClose(h);
         g_StatePersistenceBlocked = true;
         return true;
@@ -4019,7 +4533,7 @@ bool LoadTicketStateV2()
         {
             rejected++;
             g_StatePersistenceBlocked = true;
-            Print("[State V2] 检测到无法识别的记录；为保护原文件，本次运行禁止覆盖: ", StateFileName());
+            Print("[State V3] 检测到无法识别的记录；为保护原文件，本次运行禁止覆盖: ", loadPath);
             break;
         }
 
@@ -4036,6 +4550,25 @@ bool LoadTicketStateV2()
         r.trend_reduced = ((int)FileReadNumber(h) != 0);
         r.trend_peak_points = FileReadNumber(h);
         r.last_volume = FileReadNumber(h);
+        r.protection_status = PROTECTION_CHECKING;
+        r.minimum_required_sl = 0.0;
+        r.last_confirmed_sl = 0.0;
+        r.last_confirmed_tp = 0.0;
+        r.protection_first_failed_utc_msc = 0;
+        r.protection_next_retry_utc_msc = 0;
+        r.protection_retry_count = 0;
+        r.protection_last_retcode = 0;
+        if(schema >= 3)
+        {
+            r.protection_status = (int)FileReadNumber(h);
+            r.minimum_required_sl = FileReadNumber(h);
+            r.last_confirmed_sl = FileReadNumber(h);
+            r.last_confirmed_tp = FileReadNumber(h);
+            r.protection_first_failed_utc_msc = (long)FileReadNumber(h);
+            r.protection_next_retry_utc_msc = (long)FileReadNumber(h);
+            r.protection_retry_count = (int)FileReadNumber(h);
+            r.protection_last_retcode = (uint)(long)FileReadNumber(h);
+        }
         r.updated_utc = (datetime)(long)FileReadNumber(h);
         r.closed_utc = (datetime)(long)FileReadNumber(h);
 
@@ -4055,7 +4588,7 @@ bool LoadTicketStateV2()
                 rejected++;
                 if(PositionSelectByTicket(r.ticket))
                     BlockTicketStateRecovery(r.ticket, "状态字段无效或身份与当前持仓不匹配");
-                PrintFormat("[State V2] 拒绝恢复无效或身份不匹配记录 Ticket=%I64u", r.ticket);
+                PrintFormat("[State V3] 拒绝恢复无效或身份不匹配记录 Ticket=%I64u", r.ticket);
             }
         }
     }
@@ -4073,7 +4606,10 @@ bool LoadTicketStateV2()
             BlockTicketStateRecovery(ticket, "新版状态文件缺少该持仓记录");
         }
     }
-    PrintFormat("[State V2] 恢复完成，有效持仓=%d，拒绝=%d", restored, rejected);
+    PrintFormat("[State V3] 恢复完成，有效持仓=%d，拒绝=%d，V2迁移=%s", restored, rejected,
+                migratingV2 ? "是" : "否");
+    if(migratingV2 && !g_StatePersistenceBlocked && rejected == 0)
+        SaveArrays(); // 原 V2 文件保留，只在新 v3 目录写入迁移后的原子文件。
     return true;
 }
 
@@ -4634,13 +5170,15 @@ bool PublishInstanceManifest()
 int OnInit()
 {
     if(Inp_ResetHour < 0 || Inp_ResetHour > 23 || Inp_ResetMinute < 0 || Inp_ResetMinute > 59 ||
-       Inp_RecoveryLookbackDays < 1 || Inp_RecoveryRetrySeconds < 5)
+       Inp_RecoveryLookbackDays < 1 || Inp_RecoveryRetrySeconds < 5 ||
+       Inp_ScalpSL_Points <= 0 || Inp_TrendSL_Points <= 0 || Inp_ScalpTP_Points < 0)
     {
-        Print("[Recovery] 参数无效：重置时间、补做天数或重试秒数超出允许范围");
+        Print("[Init] 参数无效：重置/恢复参数越界，或策略初始SL未设置为正数");
         return INIT_PARAMETERS_INCORRECT;
     }
     g_Language_ZH = Inp_DefaultChinese;
     g_DayStart    = TodayStart();
+    g_AccountModeSupported = ((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
     g_InstanceOwnsState = AcquireInstanceLease();
 
     if(!g_InstanceOwnsState)
@@ -4661,6 +5199,16 @@ int OnInit()
     g_trade.SetExpertMagicNumber(Inp_Magic);
     g_trade.SetDeviationInPoints((ulong)Inp_Slippage);
     g_trade.SetTypeFillingBySymbol(_Symbol);
+
+    if(!g_AccountModeSupported)
+    {
+        g_ProtectionBlocksNewRisk = true;
+        g_ProtectionReason = Lang("仅支持对冲账户", "Hedging account required");
+        Alert(Lang("当前版本仅支持对冲账户。本图表将保留查看和平仓能力，但禁止新增交易。",
+                   "This version supports hedging accounts only. Viewing and closing remain available; new entries are disabled."));
+    }
+
+    if(g_InstanceOwnsState) AuditServerProtection();
 
     ChartSetInteger(0, CHART_EVENT_OBJECT_CREATE, true);
     ChartSetInteger(0, CHART_EVENT_OBJECT_DELETE, true);
@@ -4719,6 +5267,7 @@ void OnTimer()
         AttemptStartupRecovery();
     if(g_InstanceOwnsState)
     {
+        AuditServerProtection();
         if(g_RecoveryStatus != RECOVERY_CHECKING && g_RecoveryStatus != RECOVERY_FAILED)
         {
             CheckAllRiskControl();
@@ -4744,6 +5293,8 @@ void OnTimer()
 
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
 {
+    if(g_InstanceOwnsState)
+        AuditServerProtection();
     if(g_InstanceOwnsState && g_RecoveryStatus != RECOVERY_CHECKING && g_RecoveryStatus != RECOVERY_FAILED &&
        (trans.type == TRADE_TRANSACTION_DEAL_ADD || trans.type == TRADE_TRANSACTION_POSITION))
     {
