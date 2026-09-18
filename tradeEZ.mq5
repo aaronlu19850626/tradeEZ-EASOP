@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  最后修改时间：2026-09-19 02:06（北京时间）       |
+//|                  最后修改时间：2026-09-19 02:38（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -213,6 +213,21 @@ enum ENUM_PROTECTION_STATUS
     PROTECTION_FAILED         = 4
 };
 
+enum ENUM_SCALP_PHASE
+{
+    SCALP_INITIAL       = 0,
+    SCALP_TRAIL_ACTIVE  = 1,
+    SCALP_EXIT_PENDING  = 2,
+    SCALP_CLOSED        = 3
+};
+
+enum ENUM_SCALP_EXIT_REASON
+{
+    SCALP_EXIT_NONE     = 0,
+    SCALP_EXIT_TIMEOUT  = 1,
+    SCALP_EXIT_PULLBACK = 2
+};
+
 //+------------------------------------------------------------------+
 //| 全局状态                                                          |
 //+------------------------------------------------------------------+
@@ -307,6 +322,7 @@ ulong          g_PromotedTickets[];
 // 剥头皮追踪状态(类似趋势追踪,但保留止盈)
 ulong          g_ScalpTrackTicket[];      // ticket
 double         g_ScalpTrackPeak[];        // 峰值浮盈点数
+double         g_ScalpTrackLoggedPeak[];  // 仅用于日志限频，不参与交易判断
 
 // 数组状态变化标记(脏则下次落盘,避免每 tick 写文件)
 bool           g_ArraysDirty = false;
@@ -326,6 +342,12 @@ struct TicketStateRecord
     bool     trend_reduced;
     double   trend_peak_points;
     double   last_volume;
+    int      scalp_phase;
+    int      scalp_exit_reason;
+    long     scalp_exit_requested_utc_msc;
+    long     scalp_exit_next_retry_utc_msc;
+    int      scalp_exit_retry_count;
+    uint     scalp_exit_last_retcode;
     int      protection_status;
     double   minimum_required_sl;
     double   last_confirmed_sl;
@@ -344,7 +366,7 @@ bool              g_InstanceOwnsState = true;
 bool              g_StatePersistenceBlocked = false;
 double            g_InstanceLeaseOwner = 0.0;
 int               g_StateCheckpointSeconds = 0;
-const int         TICKET_STATE_SCHEMA = 3;
+const int         TICKET_STATE_SCHEMA = 4;
 
 // 挂单不进入持仓逐票文件；运行期每秒复核，重启后从服务器订单池重建。
 ulong             g_UnsafeOrderTicket[];
@@ -888,9 +910,11 @@ int ScalpTrackEnsure(ulong ticket)
     int n = ArraySize(g_ScalpTrackTicket);
     ArrayResize(g_ScalpTrackTicket, n + 1);
     ArrayResize(g_ScalpTrackPeak, n + 1);
+    ArrayResize(g_ScalpTrackLoggedPeak, n + 1);
     g_ScalpTrackTicket[n] = ticket;
     g_ScalpTrackPeak[n]   = 0.0;
-    MarkTicketStateDirty();
+    g_ScalpTrackLoggedPeak[n] = 0.0;
+    MarkTicketStateDirty(false);
     return n;
 }
 
@@ -903,8 +927,10 @@ void ScalpTrackCleanup()
             int last = ArraySize(g_ScalpTrackTicket) - 1;
             g_ScalpTrackTicket[i] = g_ScalpTrackTicket[last];
             g_ScalpTrackPeak[i]   = g_ScalpTrackPeak[last];
+            g_ScalpTrackLoggedPeak[i] = g_ScalpTrackLoggedPeak[last];
             ArrayResize(g_ScalpTrackTicket, last);
             ArrayResize(g_ScalpTrackPeak, last);
+            ArrayResize(g_ScalpTrackLoggedPeak, last);
             MarkTicketStateDirty(false);
         }
     }
@@ -973,6 +999,36 @@ void TimeoutCancelCleanup()
             MarkTicketStateDirty(false);
         }
     }
+}
+
+ENUM_SCALP_PHASE ScalpPhaseForTicket(ulong ticket)
+{
+    int idx = TicketStateIndex(ticket);
+    if(idx < 0) return SCALP_INITIAL;
+    return (ENUM_SCALP_PHASE)g_TicketState[idx].scalp_phase;
+}
+
+bool IsScalpTrailActive(ulong ticket)
+{
+    return ScalpPhaseForTicket(ticket) == SCALP_TRAIL_ACTIVE;
+}
+
+bool HasScalpExitPending()
+{
+    for(int i = 0; i < ArraySize(g_TicketState); i++)
+    {
+        if(g_TicketState[i].closed_utc != 0 || g_TicketState[i].scalp_phase != SCALP_EXIT_PENDING) continue;
+        if(PositionSelectByTicket(g_TicketState[i].ticket) && PositionGetString(POSITION_SYMBOL) == _Symbol)
+            return true;
+    }
+    return false;
+}
+
+string ScalpExitReasonText(int reason)
+{
+    if(reason == SCALP_EXIT_TIMEOUT) return Lang("超时", "timeout");
+    if(reason == SCALP_EXIT_PULLBACK) return Lang("峰值回撤", "peak pullback");
+    return Lang("未知", "unknown");
 }
 
 //+------------------------------------------------------------------+
@@ -1226,7 +1282,7 @@ void AuditServerProtection()
         if(IsSLAtLeastAsSafe(type, actualSL, required))
             required = StrongerSL(type, required, actualSL);
         bool tpRequired = kind == SOP_SCALP && Inp_ScalpTP_Points > 0 &&
-                          !IsPromoted(ticket) && ScalpTrackIndex(ticket) < 0;
+                          !IsPromoted(ticket) && ScalpPhaseForTicket(ticket) == SCALP_INITIAL;
         double requiredTP = tpRequired
                           ? NormalizePrice(type == POSITION_TYPE_BUY
                               ? openPrice + PointsToPrice(Inp_ScalpTP_Points)
@@ -1410,9 +1466,8 @@ void ClearScalpTP()
         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
         if(PosType() != SOP_SCALP) continue;
 
-        // 必须已进入峰值追踪(在 g_ScalpTrackTicket 名单中)
-        int idx = ScalpTrackIndex(tk);
-        if(idx < 0) continue;  // 未进入峰值追踪,跳过
+        // 必须处于显式 TRAIL_ACTIVE；EXIT_PENDING 不允许再改变退出条件。
+        if(!IsScalpTrailActive(tk)) continue;
 
         found++;
 
@@ -1494,111 +1549,174 @@ void ConvertScalpToTrend()
         Alert(StringFormat(Lang("已转换 %d 单为趋势单", "Converted %d positions to trend"), converted));
 }
 
+void ActivateScalpTrail(ulong ticket, double profitPoints)
+{
+    int trackIdx = ScalpTrackEnsure(ticket);
+    g_ScalpTrackPeak[trackIdx] = MathMax(g_ScalpTrackPeak[trackIdx], profitPoints);
+    g_ScalpTrackLoggedPeak[trackIdx] = g_ScalpTrackPeak[trackIdx];
+
+    int stateIdx = EnsureTicketStateRecord(ticket);
+    g_TicketState[stateIdx].scalp_phase = SCALP_TRAIL_ACTIVE;
+    g_TicketState[stateIdx].scalp_track_active = true;
+    g_TicketState[stateIdx].scalp_peak_points = g_ScalpTrackPeak[trackIdx];
+    g_TicketState[stateIdx].scalp_exit_reason = SCALP_EXIT_NONE;
+    g_TicketState[stateIdx].scalp_exit_requested_utc_msc = 0;
+    g_TicketState[stateIdx].scalp_exit_next_retry_utc_msc = 0;
+    g_TicketState[stateIdx].scalp_exit_retry_count = 0;
+    g_TicketState[stateIdx].scalp_exit_last_retcode = 0;
+    PrintFormat("[Scalp State] Ticket=%I64u INITIAL -> TRAIL_ACTIVE，首次峰值=%.1f点",
+                ticket, g_ScalpTrackPeak[trackIdx]);
+    MarkTicketStateDirty(); // 阶段与首次峰值一次原子保存
+}
+
+void ProcessScalpExit(ulong ticket)
+{
+    int idx = TicketStateIndex(ticket);
+    if(idx < 0 || g_TicketState[idx].scalp_phase != SCALP_EXIT_PENDING) return;
+    if(!PositionSelectByTicket(ticket))
+    {
+        g_TicketState[idx].scalp_phase = SCALP_CLOSED;
+        g_TicketState[idx].closed_utc = TimeGMT();
+        PrintFormat("[Scalp State] Ticket=%I64u EXIT_PENDING -> CLOSED，原因=%s",
+                    ticket, ScalpExitReasonText(g_TicketState[idx].scalp_exit_reason));
+        MarkTicketStateDirty();
+        return;
+    }
+
+    long nowMsc = ProtectionNowMsc();
+    if(nowMsc < g_TicketState[idx].scalp_exit_next_retry_utc_msc) return;
+    ResetLastError();
+    bool sent = g_trade.PositionClose(ticket, (ulong)Inp_Slippage);
+    uint retcode = g_trade.ResultRetcode();
+    g_TicketState[idx].scalp_exit_retry_count++;
+    g_TicketState[idx].scalp_exit_last_retcode = retcode;
+    g_TicketState[idx].scalp_exit_next_retry_utc_msc = nowMsc + 1000;
+    PrintFormat("[Scalp Exit] Ticket=%I64u reason=%s attempt=%d sent=%s retcode=%u(%s) error=%d",
+                ticket, ScalpExitReasonText(g_TicketState[idx].scalp_exit_reason),
+                g_TicketState[idx].scalp_exit_retry_count, sent ? "true" : "false",
+                retcode, g_trade.ResultRetcodeDescription(), GetLastError());
+    if(!PositionSelectByTicket(ticket))
+    {
+        g_TicketState[idx].scalp_phase = SCALP_CLOSED;
+        g_TicketState[idx].closed_utc = TimeGMT();
+    }
+    MarkTicketStateDirty();
+}
+
+// 即使行情暂时没有新 Tick，也由定时器持续推进已经进入退出阶段的订单。
+void ProcessPendingScalpExits()
+{
+    ulong pendingTickets[];
+    for(int i = 0; i < ArraySize(g_TicketState); i++)
+    {
+        if(g_TicketState[i].closed_utc != 0 ||
+           g_TicketState[i].scalp_phase != SCALP_EXIT_PENDING)
+            continue;
+        int n = ArraySize(pendingTickets);
+        ArrayResize(pendingTickets, n + 1);
+        pendingTickets[n] = g_TicketState[i].ticket;
+    }
+
+    // 使用快照，避免成交回调刷新状态数组时影响当前遍历。
+    for(int i = 0; i < ArraySize(pendingTickets); i++)
+        ProcessScalpExit(pendingTickets[i]);
+}
+
+void BeginScalpExit(ulong ticket, ENUM_SCALP_EXIT_REASON reason, double peakPoints, double profitPoints)
+{
+    int idx = EnsureTicketStateRecord(ticket);
+    if(g_TicketState[idx].scalp_phase == SCALP_CLOSED) return;
+    if(g_TicketState[idx].scalp_phase != SCALP_EXIT_PENDING)
+    {
+        g_TicketState[idx].scalp_phase = SCALP_EXIT_PENDING;
+        g_TicketState[idx].scalp_exit_reason = reason;
+        g_TicketState[idx].scalp_exit_requested_utc_msc = ProtectionNowMsc();
+        g_TicketState[idx].scalp_exit_next_retry_utc_msc = 0;
+        g_TicketState[idx].scalp_exit_retry_count = 0;
+        g_TicketState[idx].scalp_exit_last_retcode = 0;
+        PrintFormat("[Scalp State] Ticket=%I64u -> EXIT_PENDING，原因=%s 峰值=%.1f 当前=%.1f 回撤=%.1f",
+                    ticket, ScalpExitReasonText(reason), peakPoints, profitPoints,
+                    MathMax(0.0, peakPoints - profitPoints));
+        MarkTicketStateDirty();
+    }
+    ProcessScalpExit(ticket);
+}
+
 //+------------------------------------------------------------------+
-//| 剥头皮移动止损:达第一目标后改用峰值回撤逻辑(保留止盈)            |
+//| 剥头皮单向状态机：INITIAL -> TRAIL_ACTIVE -> EXIT_PENDING        |
 //+------------------------------------------------------------------+
 void ManageScalpTrailingStop(ulong ticket)
 {
     if(!PositionSelectByTicket(ticket)) return;
-    long type   = PositionGetInteger(POSITION_TYPE);
-    double open = PositionGetDouble(POSITION_PRICE_OPEN);
-    double vol  = PositionGetDouble(POSITION_VOLUME);
-    double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    double ask  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-    // 超时强平:持仓超过阈值秒数且未止盈/止损,强制平仓(用户可取消)
-    if(Inp_ScalpTimeLimitOn && !IsTimeoutCancelled(ticket))
+    int stateIdx = EnsureTicketStateRecord(ticket);
+    ENUM_SCALP_PHASE phase = (ENUM_SCALP_PHASE)g_TicketState[stateIdx].scalp_phase;
+    if(phase == SCALP_CLOSED) return;
+    if(phase == SCALP_EXIT_PENDING)
     {
-        datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
-        if((int)(TimeCurrent() - openTime) >= Inp_ScalpMaxHoldSecs)
-        {
-            g_trade.PositionClose(ticket);
-            return;
-        }
-    }
-
-    // 实际浮盈点数判断(有向计算:多单=bid-open,空单=open-ask)
-    double profitPoints = (type == POSITION_TYPE_BUY)
-                        ? (bid - open) / 0.01
-                        : (open - ask) / 0.01;
-
-    // 【调试日志】记录每次计算的浮盈点数（仅在接近触发点时打印，避免刷屏）
-    if(profitPoints >= 250.0 || profitPoints < -100.0)  // 接近300点或明显亏损时才打印
-    {
-        PrintFormat("[剥头皮追踪] Ticket=%I64u 方向=%s 开仓价=%.2f 当前Ask=%.5f Bid=%.5f 浮盈点数=%.1f 触发阈值=%d",
-                    ticket, (type==POSITION_TYPE_BUY?"多":"空"), open, ask, bid, profitPoints, Inp_ScalpBETrigger);
-    }
-
-    // ---- 阶段1:未达第一目标,使用保本锁定逻辑 ----
-    if(profitPoints < (double)Inp_ScalpBETrigger - 0.5)  // 减0.5容错,避免恰好300点不触发
-        return;  // 亏损或浮盈不足不触发
-
-    // ---- 阶段2:达到或接近第一目标,改用峰值回撤逻辑(保留止盈) ----
-    int idx = ScalpTrackEnsure(ticket);
-
-    // 【调试日志】触发峰值追踪时打印
-    PrintFormat("[剥头皮峰值追踪启动] Ticket=%I64u 浮盈=%.1f点 当前峰值=%.1f点",
-                ticket, profitPoints, g_ScalpTrackPeak[idx]);
-
-    // 记录峰值
-    if(profitPoints > g_ScalpTrackPeak[idx])
-    {
-        PrintFormat("[峰值更新] Ticket=%I64u 旧峰值=%.1f点 → 新峰值=%.1f点",
-                    ticket, g_ScalpTrackPeak[idx], profitPoints);
-        g_ScalpTrackPeak[idx] = profitPoints;
-        MarkTicketStateDirty();
-    }
-
-    // 回撤达阈值 → 平仓离场
-    double pullback = g_ScalpTrackPeak[idx] - profitPoints;
-    if(pullback >= Inp_ScalpTrailStep)  // 使用剥头皮专用回撤阈值
-    {
-        g_trade.PositionClose(ticket);
+        ProcessScalpExit(ticket);
         return;
     }
 
-    // 动态推止损:基于峰值的保护性止损（跟涨不跟跌）
-    // 止损位 = 开仓价 + (峰值 - 回撤阈值) 的距离
-    // 例：多单开仓价2342.21，峰值350点，阈值150点 → 止损 = 2342.21 + (350-150)*0.01 = 2344.21
-    // 例：空单开仓价2348.76，峰值350点，阈值150点 → 止损 = 2348.76 - (350-150)*0.01 = 2346.76
-    double protectedPoints = g_ScalpTrackPeak[idx] - Inp_ScalpTrailStep;  // 峰值 - 回撤阈值
-    if(protectedPoints < 0.0) protectedPoints = 0.0;  // 最低保护0点（不低于/高于开仓价）
+    ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double open = PositionGetDouble(POSITION_PRICE_OPEN);
+    double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double ask  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double profitPoints = (type == POSITION_TYPE_BUY) ? (bid - open) / 0.01 : (open - ask) / 0.01;
 
+    if(phase == SCALP_INITIAL)
+    {
+        // 超时只约束尚未进入盈利追踪的订单；截止时间基于服务器开仓时间，重启不重置。
+        if(Inp_ScalpTimeLimitOn && !IsTimeoutCancelled(ticket))
+        {
+            datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
+            if((int)(TimeCurrent() - openTime) >= Inp_ScalpMaxHoldSecs)
+            {
+                BeginScalpExit(ticket, SCALP_EXIT_TIMEOUT, 0.0, profitPoints);
+                return;
+            }
+        }
+        if(profitPoints < (double)Inp_ScalpBETrigger - 0.5) return;
+        ActivateScalpTrail(ticket, profitPoints);
+        stateIdx = TicketStateIndex(ticket); // 原子保存可能清理旧记录，重新取得稳定索引
+        if(stateIdx < 0) return;
+        phase = SCALP_TRAIL_ACTIVE;
+    }
+
+    // 激活后不再检查启动阈值；即使当前浮盈跌回阈值以下也继续使用历史峰值。
+    if(phase != SCALP_TRAIL_ACTIVE) return;
+    int trackIdx = ScalpTrackEnsure(ticket);
+    g_ScalpTrackPeak[trackIdx] = MathMax(g_ScalpTrackPeak[trackIdx],
+                                         g_TicketState[stateIdx].scalp_peak_points);
+    if(profitPoints > g_ScalpTrackPeak[trackIdx])
+    {
+        double oldPeak = g_ScalpTrackPeak[trackIdx];
+        g_ScalpTrackPeak[trackIdx] = profitPoints;
+        g_TicketState[stateIdx].scalp_peak_points = profitPoints;
+        if(profitPoints - g_ScalpTrackLoggedPeak[trackIdx] >= 10.0)
+        {
+            PrintFormat("[Scalp Peak] Ticket=%I64u %.1f -> %.1f点", ticket, oldPeak, profitPoints);
+            g_ScalpTrackLoggedPeak[trackIdx] = profitPoints;
+        }
+        MarkTicketStateDirty();
+    }
+
+    double peak = g_ScalpTrackPeak[trackIdx];
+    double pullback = peak - profitPoints;
+    if(pullback >= Inp_ScalpTrailStep)
+    {
+        BeginScalpExit(ticket, SCALP_EXIT_PULLBACK, peak, profitPoints);
+        return;
+    }
+
+    double protectedPoints = MathMax(0.0, peak - Inp_ScalpTrailStep);
     double targetSL = (type == POSITION_TYPE_BUY)
-                    ? open + PointsToPrice(protectedPoints)  // 多单：开仓价 + 保护距离
-                    : open - PointsToPrice(protectedPoints); // 空单：开仓价 - 保护距离
-
+                    ? open + PointsToPrice(protectedPoints)
+                    : open - PointsToPrice(protectedPoints);
     double curSL = PositionGetDouble(POSITION_SL);
-    double curTP = PositionGetDouble(POSITION_TP);  // 保留原止盈
-
-    // 只有新止损"更优"才修改（只推进不回撤）
-    // 多单：新止损必须比旧止损高（向上推，锁更多利润）
-    // 空单：新止损必须比旧止损低（向下推，锁更多利润）—— 修复：第一次推损或新止损确实更低时才推
-    bool better = false;
-    if(type == POSITION_TYPE_BUY)
-    {
-        // 多单：新止损更高才推
-        better = (targetSL > curSL + _Point);
-    }
-    else
-    {
-        // 空单：新止损更低才推（修复：初次推损curSL==0时也推；之后只有targetSL确实更低才推）
-        if(curSL == 0.0) better = true;  // 初次推损
-        else better = (targetSL < curSL - _Point);  // 新止损确实更低（更接近开仓价方向=锁更多利润）
-    }
-
-    // 【调试日志】止损推进决策
-    if(better)
-    {
-        PrintFormat("[止损推进] Ticket=%I64u 类型=%s 旧止损=%.5f → 新止损=%.5f (保护点数=%.1f)",
-                    ticket, (type==POSITION_TYPE_BUY?"多":"空"), curSL, targetSL, protectedPoints);
-        ModifyPositionSL(ticket, targetSL);  // 保留止盈，并复核服务器实际SL
-    }
-    else
-    {
-        PrintFormat("[止损不推进] Ticket=%I64u 类型=%s 当前止损=%.5f 计算止损=%.5f (不满足推进条件)",
-                    ticket, (type==POSITION_TYPE_BUY?"多":"空"), curSL, targetSL);
-    }
+    bool better = (type == POSITION_TYPE_BUY)
+                ? targetSL > curSL + _Point
+                : (curSL == 0.0 || targetSL < curSL - _Point);
+    if(better) ModifyPositionSL(ticket, targetSL);
 }
 
 //+------------------------------------------------------------------+
@@ -2108,7 +2226,7 @@ bool RecoveryAllowsNewRisk()
     return g_RecoveryStatus == RECOVERY_EXACT ||
            (g_RecoveryStatus == RECOVERY_CONSERVATIVE && g_RecoveryAcknowledged);
 }
-bool IsScalpAllowed() { return g_InstanceOwnsState && g_AccountModeSupported && !g_ProtectionBlocksNewRisk && RecoveryAllowsNewRisk() && !g_ScalpBlocked && !g_TotalBlocked && !InCooldown(); }
+bool IsScalpAllowed() { return g_InstanceOwnsState && g_AccountModeSupported && !g_ProtectionBlocksNewRisk && !HasScalpExitPending() && RecoveryAllowsNewRisk() && !g_ScalpBlocked && !g_TotalBlocked && !InCooldown(); }
 bool IsTrendAllowed() { return g_InstanceOwnsState && g_AccountModeSupported && !g_ProtectionBlocksNewRisk && RecoveryAllowsNewRisk() && !g_TrendBlocked && !g_TotalBlocked && !InCooldown(); }
 
 //+------------------------------------------------------------------+
@@ -3339,7 +3457,8 @@ void RenderStrategyCard(string tag, int cardX, int currentY, int cardH, color ac
     string stTxt; color stClr;
     // 熔断原因(优先级:连亏冷却 > 全局 > 本策略)
     string blkReason = "";
-    if(g_ProtectionBlocksNewRisk) blkReason = g_ProtectionReason +
+    if(kind == SOP_SCALP && HasScalpExitPending()) blkReason = Lang("剥头皮退出处理中", "Scalp exit pending");
+    else if(g_ProtectionBlocksNewRisk) blkReason = g_ProtectionReason +
         (g_ProtectionIssueCount > 0 ? " (" + (string)g_ProtectionIssueCount + ")" : "");
     else if(InCooldown())       blkReason = Lang("连亏熔断", "Streak breaker");
     else if(g_TotalBlocked) blkReason = g_TotalReason;
@@ -4185,7 +4304,7 @@ bool LoadState()
 }
 
 //+------------------------------------------------------------------+
-//| 逐票状态 V3：增加服务器保护状态；兼容迁移 V2                     |
+//| 逐票状态 V4：增加剥头皮阶段与退出事务；兼容迁移 V2/V3            |
 //+------------------------------------------------------------------+
 string StateFolderForSchema(int schema)
 {
@@ -4245,6 +4364,12 @@ int EnsureTicketStateRecord(ulong ticket)
     int n = ArraySize(g_TicketState);
     ArrayResize(g_TicketState, n + 1);
     g_TicketState[n].ticket = ticket;
+    g_TicketState[n].scalp_phase = SCALP_INITIAL;
+    g_TicketState[n].scalp_exit_reason = SCALP_EXIT_NONE;
+    g_TicketState[n].scalp_exit_requested_utc_msc = 0;
+    g_TicketState[n].scalp_exit_next_retry_utc_msc = 0;
+    g_TicketState[n].scalp_exit_retry_count = 0;
+    g_TicketState[n].scalp_exit_last_retcode = 0;
     g_TicketState[n].protection_status = PROTECTION_CHECKING;
     g_TicketState[n].minimum_required_sl = 0.0;
     g_TicketState[n].last_confirmed_sl = 0.0;
@@ -4266,6 +4391,7 @@ void ClearRuntimeTicketArrays()
     ArrayResize(g_TrPeakPoints, 0);
     ArrayResize(g_ScalpTrackTicket, 0);
     ArrayResize(g_ScalpTrackPeak, 0);
+    ArrayResize(g_ScalpTrackLoggedPeak, 0);
 }
 
 void AddRuntimeTicket(ulong &tickets[], ulong ticket)
@@ -4294,6 +4420,9 @@ bool ValidateTicketStateValues(const TicketStateRecord &record)
     if(!MathIsValidNumber(record.scalp_peak_points) || record.scalp_peak_points < 0.0) return false;
     if(!MathIsValidNumber(record.trend_peak_points) || record.trend_peak_points < 0.0) return false;
     if(!MathIsValidNumber(record.last_volume) || record.last_volume < 0.0) return false;
+    if(record.scalp_phase < SCALP_INITIAL || record.scalp_phase > SCALP_CLOSED) return false;
+    if(record.scalp_exit_reason < SCALP_EXIT_NONE || record.scalp_exit_reason > SCALP_EXIT_PULLBACK) return false;
+    if(record.scalp_exit_retry_count < 0) return false;
     if(record.protection_status < PROTECTION_CHECKING || record.protection_status > PROTECTION_FAILED) return false;
     if(!MathIsValidNumber(record.minimum_required_sl) || record.minimum_required_sl < 0.0) return false;
     if(!MathIsValidNumber(record.last_confirmed_sl) || record.last_confirmed_sl < 0.0) return false;
@@ -4307,13 +4436,15 @@ void HydrateRuntimeFromRecord(const TicketStateRecord &record)
     if(record.timeout_cancelled) AddRuntimeTicket(g_TimeoutCancelled, record.ticket);
     if(record.management_mode == 3) AddRuntimeTicket(g_PromotedTickets, record.ticket);
 
-    if(record.scalp_track_active)
+    if(record.scalp_phase == SCALP_TRAIL_ACTIVE)
     {
         int n = ArraySize(g_ScalpTrackTicket);
         ArrayResize(g_ScalpTrackTicket, n + 1);
         ArrayResize(g_ScalpTrackPeak, n + 1);
+        ArrayResize(g_ScalpTrackLoggedPeak, n + 1);
         g_ScalpTrackTicket[n] = record.ticket;
         g_ScalpTrackPeak[n] = MathMax(0.0, record.scalp_peak_points);
+        g_ScalpTrackLoggedPeak[n] = g_ScalpTrackPeak[n];
     }
 
     if(record.management_mode == 2 || record.trend_reduced || record.trend_peak_points > 0.0)
@@ -4340,6 +4471,7 @@ void RefreshTicketStateRecords()
            (ulong)PositionGetInteger(POSITION_IDENTIFIER) != g_TicketState[i].position_id)
         {
             g_TicketState[i].closed_utc = nowUtc;
+            g_TicketState[i].scalp_phase = SCALP_CLOSED;
             g_TicketState[i].updated_utc = nowUtc;
         }
     }
@@ -4361,8 +4493,14 @@ void RefreshTicketStateRecords()
         g_TicketState[idx].management_mode = IsPromoted(ticket) ? 3 : (int)kind;
         g_TicketState[idx].timeout_cancelled = IsTimeoutCancelled(ticket);
         int scIdx = ScalpTrackIndex(ticket);
-        g_TicketState[idx].scalp_track_active = (scIdx >= 0);
-        g_TicketState[idx].scalp_peak_points = (scIdx >= 0 ? g_ScalpTrackPeak[scIdx] : 0.0);
+        if(scIdx >= 0)
+        {
+            g_TicketState[idx].scalp_track_active = true;
+            g_TicketState[idx].scalp_peak_points = MathMax(g_TicketState[idx].scalp_peak_points,
+                                                            g_ScalpTrackPeak[scIdx]);
+            if(g_TicketState[idx].scalp_phase == SCALP_INITIAL)
+                g_TicketState[idx].scalp_phase = SCALP_TRAIL_ACTIVE;
+        }
         int trIdx = TrIndex(ticket);
         g_TicketState[idx].trend_reduced = (trIdx >= 0 ? g_TrReduced[trIdx] : false);
         g_TicketState[idx].trend_peak_points = (trIdx >= 0 ? g_TrPeakPoints[trIdx] : 0.0);
@@ -4406,6 +4544,9 @@ void SaveArrays()
                   r.open_time_msc, r.management_mode, r.timeout_cancelled ? 1 : 0,
                   r.scalp_track_active ? 1 : 0, r.scalp_peak_points,
                   r.trend_reduced ? 1 : 0, r.trend_peak_points, r.last_volume,
+                  r.scalp_phase, r.scalp_exit_reason,
+                  r.scalp_exit_requested_utc_msc, r.scalp_exit_next_retry_utc_msc,
+                  r.scalp_exit_retry_count, (long)r.scalp_exit_last_retcode,
                   r.protection_status, r.minimum_required_sl, r.last_confirmed_sl, r.last_confirmed_tp,
                   r.protection_first_failed_utc_msc, r.protection_next_retry_utc_msc,
                   r.protection_retry_count, (long)r.protection_last_retcode,
@@ -4476,8 +4617,10 @@ bool LoadLegacyArrays()
                 int n = ArraySize(g_ScalpTrackTicket);
                 ArrayResize(g_ScalpTrackTicket, n + 1);
                 ArrayResize(g_ScalpTrackPeak, n + 1);
+                ArrayResize(g_ScalpTrackLoggedPeak, n + 1);
                 g_ScalpTrackTicket[n] = ticket;
                 g_ScalpTrackPeak[n] = MathMax(0.0, peak);
+                g_ScalpTrackLoggedPeak[n] = g_ScalpTrackPeak[n];
                 loaded++;
             }
         }
@@ -4491,18 +4634,23 @@ bool LoadLegacyArrays()
 bool LoadTicketStateV2()
 {
     string loadPath = StateFileName();
-    bool migratingV2 = false;
+    int migratingFrom = 0;
     if(!FileIsExist(loadPath))
     {
-        loadPath = StateFileNameForSchema(2);
-        migratingV2 = FileIsExist(loadPath);
+        loadPath = StateFileNameForSchema(3);
+        if(FileIsExist(loadPath)) migratingFrom = 3;
+        else
+        {
+            loadPath = StateFileNameForSchema(2);
+            if(FileIsExist(loadPath)) migratingFrom = 2;
+        }
     }
     if(!FileIsExist(loadPath)) return false;
     int h = FileOpen(loadPath, FILE_READ | FILE_CSV | FILE_ANSI, ',');
     if(h == INVALID_HANDLE)
     {
         g_StatePersistenceBlocked = true;
-        PrintFormat("[State V3] 状态文件存在但无法读取；为保护原文件，本次运行禁止覆盖，错误=%d", GetLastError());
+        PrintFormat("[State V4] 状态文件存在但无法读取；为保护原文件，本次运行禁止覆盖，错误=%d", GetLastError());
         return true;
     }
 
@@ -4511,10 +4659,10 @@ bool LoadTicketStateV2()
     string storedNamespace = FileReadString(h);
     FileReadNumber(h); // saved_utc
     g_LegacyStateMigrated = ((int)FileReadNumber(h) != 0);
-    if(meta != "META" || (schema != TICKET_STATE_SCHEMA && schema != 2) ||
+    if(meta != "META" || (schema != TICKET_STATE_SCHEMA && schema != 3 && schema != 2) ||
        storedNamespace != StateNamespaceForSchema(schema))
     {
-        Print("[State V3] 文件头或命名空间不匹配，拒绝恢复: ", loadPath);
+        Print("[State V4] 文件头或命名空间不匹配，拒绝恢复: ", loadPath);
         FileClose(h);
         g_StatePersistenceBlocked = true;
         return true;
@@ -4533,7 +4681,7 @@ bool LoadTicketStateV2()
         {
             rejected++;
             g_StatePersistenceBlocked = true;
-            Print("[State V3] 检测到无法识别的记录；为保护原文件，本次运行禁止覆盖: ", loadPath);
+            Print("[State V4] 检测到无法识别的记录；为保护原文件，本次运行禁止覆盖: ", loadPath);
             break;
         }
 
@@ -4550,6 +4698,21 @@ bool LoadTicketStateV2()
         r.trend_reduced = ((int)FileReadNumber(h) != 0);
         r.trend_peak_points = FileReadNumber(h);
         r.last_volume = FileReadNumber(h);
+        r.scalp_phase = r.scalp_track_active ? SCALP_TRAIL_ACTIVE : SCALP_INITIAL;
+        r.scalp_exit_reason = SCALP_EXIT_NONE;
+        r.scalp_exit_requested_utc_msc = 0;
+        r.scalp_exit_next_retry_utc_msc = 0;
+        r.scalp_exit_retry_count = 0;
+        r.scalp_exit_last_retcode = 0;
+        if(schema >= 4)
+        {
+            r.scalp_phase = (int)FileReadNumber(h);
+            r.scalp_exit_reason = (int)FileReadNumber(h);
+            r.scalp_exit_requested_utc_msc = (long)FileReadNumber(h);
+            r.scalp_exit_next_retry_utc_msc = (long)FileReadNumber(h);
+            r.scalp_exit_retry_count = (int)FileReadNumber(h);
+            r.scalp_exit_last_retcode = (uint)(long)FileReadNumber(h);
+        }
         r.protection_status = PROTECTION_CHECKING;
         r.minimum_required_sl = 0.0;
         r.last_confirmed_sl = 0.0;
@@ -4571,6 +4734,7 @@ bool LoadTicketStateV2()
         }
         r.updated_utc = (datetime)(long)FileReadNumber(h);
         r.closed_utc = (datetime)(long)FileReadNumber(h);
+        if(r.closed_utc != 0) r.scalp_phase = SCALP_CLOSED;
 
         int n = ArraySize(g_TicketState);
         ArrayResize(g_TicketState, n + 1);
@@ -4588,13 +4752,13 @@ bool LoadTicketStateV2()
                 rejected++;
                 if(PositionSelectByTicket(r.ticket))
                     BlockTicketStateRecovery(r.ticket, "状态字段无效或身份与当前持仓不匹配");
-                PrintFormat("[State V3] 拒绝恢复无效或身份不匹配记录 Ticket=%I64u", r.ticket);
+                PrintFormat("[State V4] 拒绝恢复无效或身份不匹配记录 Ticket=%I64u", r.ticket);
             }
         }
     }
     FileClose(h);
 
-    // V2 文件理应覆盖所有在管持仓；缺失时不猜测历史阶段，暂停该票自动管理。
+    // 版本化逐票文件理应覆盖所有在管持仓；缺失时不猜测历史阶段。
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
         ulong ticket = PositionGetTicket(i);
@@ -4606,10 +4770,9 @@ bool LoadTicketStateV2()
             BlockTicketStateRecovery(ticket, "新版状态文件缺少该持仓记录");
         }
     }
-    PrintFormat("[State V3] 恢复完成，有效持仓=%d，拒绝=%d，V2迁移=%s", restored, rejected,
-                migratingV2 ? "是" : "否");
-    if(migratingV2 && !g_StatePersistenceBlocked && rejected == 0)
-        SaveArrays(); // 原 V2 文件保留，只在新 v3 目录写入迁移后的原子文件。
+    PrintFormat("[State V4] 恢复完成，有效持仓=%d，拒绝=%d，迁移来源V%d", restored, rejected, migratingFrom);
+    if(migratingFrom > 0 && !g_StatePersistenceBlocked && rejected == 0)
+        SaveArrays(); // 原文件保留，只在新 v4 目录写入迁移后的原子文件。
     return true;
 }
 
@@ -4630,7 +4793,7 @@ void LoadArrays()
         }
     }
     if(ArraySize(g_StateRecoveryBlockedTickets) == 0)
-        SaveArrays(); // 无在管票据缺口时建立当前命名空间 V2 文件；旧文件始终保留。
+        SaveArrays(); // 无在管票据缺口时建立当前命名空间 V4 文件；旧文件始终保留。
 }
 
 //+------------------------------------------------------------------+
@@ -4849,8 +5012,12 @@ bool AdoptMissingTicketStates()
             if(peak >= Inp_ScalpBETrigger)
             {
                 int n = ArraySize(g_ScalpTrackTicket);
-                ArrayResize(g_ScalpTrackTicket, n + 1); ArrayResize(g_ScalpTrackPeak, n + 1);
-                g_ScalpTrackTicket[n] = ticket; g_ScalpTrackPeak[n] = peak;
+                ArrayResize(g_ScalpTrackTicket, n + 1);
+                ArrayResize(g_ScalpTrackPeak, n + 1);
+                ArrayResize(g_ScalpTrackLoggedPeak, n + 1);
+                g_ScalpTrackTicket[n] = ticket;
+                g_ScalpTrackPeak[n] = peak;
+                g_ScalpTrackLoggedPeak[n] = peak;
             }
         }
         else if(kind == SOP_TREND)
@@ -5171,9 +5338,11 @@ int OnInit()
 {
     if(Inp_ResetHour < 0 || Inp_ResetHour > 23 || Inp_ResetMinute < 0 || Inp_ResetMinute > 59 ||
        Inp_RecoveryLookbackDays < 1 || Inp_RecoveryRetrySeconds < 5 ||
-       Inp_ScalpSL_Points <= 0 || Inp_TrendSL_Points <= 0 || Inp_ScalpTP_Points < 0)
+       Inp_ScalpSL_Points <= 0 || Inp_TrendSL_Points <= 0 || Inp_ScalpTP_Points < 0 ||
+       Inp_ScalpBETrigger <= 0 || Inp_ScalpTrailStep <= 0 ||
+       (Inp_ScalpTimeLimitOn && Inp_ScalpMaxHoldSecs <= 0))
     {
-        Print("[Init] 参数无效：重置/恢复参数越界，或策略初始SL未设置为正数");
+        Print("[Init] 参数无效：重置/恢复参数越界，或策略保护、追踪、超时参数不符合要求");
         return INIT_PARAMETERS_INCORRECT;
     }
     g_Language_ZH = Inp_DefaultChinese;
@@ -5218,7 +5387,8 @@ int OnInit()
     RenderPerfectUI();
     if(g_InstanceOwnsState) PublishInstanceManifest();
 
-    EventSetTimer(MathMax(1, Inp_RefreshSeconds));
+    // 交易保护与退出重试固定由 1 秒安全时钟驱动；面板仍按 Inp_RefreshSeconds 节流刷新。
+    EventSetTimer(1);
 
     return INIT_SUCCEEDED;
 }
@@ -5261,6 +5431,7 @@ void OnTick()
 void OnTimer()
 {
     static int manifestSeconds = 0;
+    static int uiSeconds = 0;
     RenewInstanceLease();
     if(g_InstanceOwnsState && g_RecoveryStatus == RECOVERY_FAILED && !g_StatePersistenceBlocked &&
        (g_LastRecoveryAttempt == 0 || TimeGMT() - g_LastRecoveryAttempt >= MathMax(5, Inp_RecoveryRetrySeconds)))
@@ -5268,12 +5439,13 @@ void OnTimer()
     if(g_InstanceOwnsState)
     {
         AuditServerProtection();
+        ProcessPendingScalpExits();
         if(g_RecoveryStatus != RECOVERY_CHECKING && g_RecoveryStatus != RECOVERY_FAILED)
         {
             CheckAllRiskControl();
             if(g_RecoveryStatus != RECOVERY_FAILED)
             {
-                g_StateCheckpointSeconds += MathMax(1, Inp_RefreshSeconds);
+                g_StateCheckpointSeconds++;
                 if(g_StateCheckpointSeconds >= 30)
                 {
                     g_StateCheckpointSeconds = 0;
@@ -5282,8 +5454,13 @@ void OnTimer()
             }
         }
     }
-    RenderPerfectUI();
-    manifestSeconds += MathMax(1, Inp_RefreshSeconds);
+    uiSeconds++;
+    if(uiSeconds >= MathMax(1, Inp_RefreshSeconds))
+    {
+        uiSeconds = 0;
+        RenderPerfectUI();
+    }
+    manifestSeconds++;
     if(g_InstanceOwnsState && manifestSeconds >= 60)
     {
         manifestSeconds = 0;
