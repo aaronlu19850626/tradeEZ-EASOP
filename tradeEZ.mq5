@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  最后修改时间：2026-09-19 04:29（北京时间）       |
+//|                  最后修改时间：2026-09-19 05:48（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -129,6 +129,7 @@ input int      Inp_ResetMinute       = 50;       // 每日重置-分
 input bool     Inp_ExportOnReset     = true;     // 重置前导出当日统计到本地
 input int      Inp_RecoveryLookbackDays = 31;    // 启动时最多自动补做的统计周期数
 input int      Inp_RecoveryRetrySeconds = 30;    // 历史恢复失败后的重试间隔(秒)
+input int      Inp_TesterServerUtcOffsetHours = 0; // 回测服务器UTC偏移(小时,测试器必须显式设置)
 
 input group "===== 目标与回撤(核心)====="
 input double   Inp_DailyMaxDrawdown   = 500.0;   // 日最大回撤 ★核心
@@ -289,6 +290,11 @@ datetime       g_RecoveryCompletedUtc = 0;
 datetime       g_LastStateCheckpointUtc = 0;
 datetime       g_LastCompletedPeriod = 0;
 datetime       g_LastReportedPeriod = 0;
+datetime       g_PendingReportPeriod = 0;
+datetime       g_LastReportRetryUtc = 0;
+double         g_WeeklyCachedPL = 0.0;
+datetime       g_WeeklyCacheSecond = 0;
+bool           g_TimeBoundaryUncertain = false;
 
 // 服务器保护闭环。任何受管仓位/挂单未确认最低保护时，全局禁止新增风险。
 bool           g_ProtectionBlocksNewRisk = true;
@@ -613,6 +619,52 @@ ENUM_SOP_ORDER DealStrategyType(ulong dealTicket)
     return TypeByComment(HistoryDealGetString(dealTicket, DEAL_COMMENT));
 }
 
+double DealCashValue(ulong dealTicket)
+{
+    return HistoryDealGetDouble(dealTicket, DEAL_PROFIT)
+         + HistoryDealGetDouble(dealTicket, DEAL_SWAP)
+         + HistoryDealGetDouble(dealTicket, DEAL_COMMISSION)
+         + HistoryDealGetDouble(dealTicket, DEAL_FEE);
+}
+
+bool DealIsExit(ulong dealTicket)
+{
+    ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+    return entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY || entry == DEAL_ENTRY_INOUT;
+}
+
+// 出场成交的完整交易结果：出场现金流 + 按本次出场手数分摊的入场佣金/费用。
+// 调用方必须已经选择包含对应入场成交的历史区间。
+double ExitTradeCashValue(ulong dealTicket)
+{
+    double result = DealCashValue(dealTicket);
+    if(!DealIsExit(dealTicket)) return result;
+    long positionId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+    double entryVolume = 0.0, entryCosts = 0.0;
+    for(int i = 0; i < HistoryDealsTotal(); i++)
+    {
+        ulong entryDeal = HistoryDealGetTicket(i);
+        if(entryDeal == 0 || HistoryDealGetInteger(entryDeal, DEAL_POSITION_ID) != positionId) continue;
+        if(HistoryDealGetInteger(entryDeal, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
+        entryVolume += HistoryDealGetDouble(entryDeal, DEAL_VOLUME);
+        entryCosts += HistoryDealGetDouble(entryDeal, DEAL_COMMISSION) + HistoryDealGetDouble(entryDeal, DEAL_FEE);
+    }
+    double exitVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+    if(entryVolume > 0.0) result += entryCosts * MathMin(1.0, exitVolume / entryVolume);
+    return result;
+}
+
+ENUM_SOP_ORDER DealCashStrategy(ulong dealTicket)
+{
+    ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+    if(entry == DEAL_ENTRY_IN)
+    {
+        ENUM_SOP_ORDER byMagic = TypeByMagic(HistoryDealGetInteger(dealTicket, DEAL_MAGIC));
+        return byMagic != SOP_IGNORE ? byMagic : TypeByComment(HistoryDealGetString(dealTicket, DEAL_COMMENT));
+    }
+    return DealStrategyType(dealTicket);
+}
+
 // 兼容旧签名:仅用于极少数仍按手数的场景(现已不用于识别)
 ENUM_SOP_ORDER GetOrderType(double lots)
 {
@@ -627,6 +679,8 @@ ENUM_SOP_ORDER GetOrderType(double lots)
 // 服务器时间相对 GMT 的偏移(秒),四舍五入到整小时避免抖动
 int ServerGmtOffset()
 {
+    if((bool)MQLInfoInteger(MQL_TESTER))
+        return Inp_TesterServerUtcOffsetHours * 3600;
     // TimeCurrent 在休市时停在最后一个 tick；TimeTradeServer 会继续前进，
     // 因而用它计算 UTC 偏移可避免周末/盘间得到异常偏移。
     datetime serverNow = TimeTradeServer();
@@ -645,7 +699,10 @@ datetime ToBeijing(datetime serverTime)
 // 当前北京时间(用于标题栏实时显示)
 datetime BeijingNow()
 {
-    return TimeGMT() + 8 * 3600;
+    // 统一从服务器时钟换算；测试器使用显式服务器UTC偏移，不能依赖 TimeGMT() 的模拟语义。
+    datetime serverNow = TimeTradeServer();
+    if(serverNow <= 0) serverNow = TimeCurrent();
+    return serverNow - ServerGmtOffset() + 8 * 3600;
 }
 
 // 北京时间当日0点,返回对应的服务器 epoch(供 HistorySelect / 跨日判断用)
@@ -665,6 +722,21 @@ datetime TodayStart()
 datetime NextResetTime()
 {
     return TodayStart() + 86400;
+}
+
+// 下一次重置的剩余秒数。界面倒计时必须完全在北京时间域内计算，
+// 避免休市时交易服务器 epoch 与持续推进的界面时钟出现偏差。
+int SecondsUntilNextResetBeijing()
+{
+    datetime bjNow = BeijingNow();
+    MqlDateTime resetParts;
+    TimeToStruct(bjNow, resetParts);
+    resetParts.hour = Inp_ResetHour;
+    resetParts.min  = Inp_ResetMinute;
+    resetParts.sec  = 0;
+    datetime nextResetBj = StructToTime(resetParts);
+    if(nextResetBj <= bjNow) nextResetBj += 86400;
+    return MathMax(0, (int)(nextResetBj - bjNow));
 }
 
 // 统计起点 = max(当日0点, 手动重置时间)
@@ -764,18 +836,16 @@ double RealizedPL(ENUM_SOP_ORDER kind, double &lossOut, int &winCnt, int &lossCn
         ulong dt = HistoryDealGetTicket(i);
         if(dt == 0) continue;
         if(HistoryDealGetString(dt, DEAL_SYMBOL) != _Symbol) continue;
-        if(HistoryDealGetInteger(dt, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue; // 只统计平仓成交
-
-        ENUM_SOP_ORDER dk = DealStrategyType(dt);        // 回溯开仓magic,兼容手工平仓
+        ENUM_SOP_ORDER dk = DealCashStrategy(dt);
         if(kind != SOP_IGNORE && dk != kind) continue;   // 指定策略
         if(kind == SOP_IGNORE && dk == SOP_IGNORE) continue; // 全部系统单口径:排除手动单
 
-        double profit = HistoryDealGetDouble(dt, DEAL_PROFIT)
-                      + HistoryDealGetDouble(dt, DEAL_SWAP)
-                      + HistoryDealGetDouble(dt, DEAL_COMMISSION);
+        double profit = DealCashValue(dt);
         net += profit;
-        if(profit < 0.0) { lossOut += -profit; lossCnt++; }
-        else if(profit > 0.0) winCnt++;
+        if(!DealIsExit(dt)) continue;
+        double tradeResult = ExitTradeCashValue(dt);
+        if(tradeResult < 0.0) { lossOut += -tradeResult; lossCnt++; }
+        else if(tradeResult > 0.0) winCnt++;
     }
     return net;
 }
@@ -826,10 +896,7 @@ double AllRealizedPL()
         ulong dt = HistoryDealGetTicket(i);
         if(dt == 0) continue;
         if(HistoryDealGetString(dt, DEAL_SYMBOL) != _Symbol) continue;
-        if(HistoryDealGetInteger(dt, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
-        net += HistoryDealGetDouble(dt, DEAL_PROFIT)
-             + HistoryDealGetDouble(dt, DEAL_SWAP)
-             + HistoryDealGetDouble(dt, DEAL_COMMISSION);
+        net += DealCashValue(dt);
     }
     return net;
 }
@@ -854,14 +921,34 @@ struct DailyStats
     double avgHoldSec;
 };
 
-void ComputeDailyStats(ENUM_SOP_ORDER kind, DailyStats &s)
+struct RecoverySnapshot
+{
+    bool   history_ok;
+    int    deal_count;
+    double all_realized;
+    double scalp_realized;
+    double trend_realized;
+    double all_high;
+    double scalp_high;
+    double trend_high;
+    bool   all_high_init;
+    bool   scalp_high_init;
+    bool   trend_high_init;
+    int    consec_loss;
+    datetime cooldown_until;
+    long   last_deal_msc;
+    ulong  last_deal_ticket;
+};
+
+void ComputeDailyStatsRange(ENUM_SOP_ORDER kind, datetime statFrom, datetime statTo, DailyStats &s)
 {
     s.trades=0; s.wins=0; s.losses=0; s.evens=0;
     s.grossProfit=0; s.grossLoss=0; s.net=0; s.maxWin=0; s.maxLoss=0; s.avgHoldSec=0;
 
-    datetime statFrom = StatStart();
+    if(statTo <= statFrom) statTo = statFrom + 1;
     datetime selFrom  = statFrom - 30 * 86400;
-    if(!HistorySelect(selFrom, TimeCurrent() + 3600)) return;
+    if(selFrom < 0) selFrom = 0;
+    if(!HistorySelect(selFrom, statTo)) return;
 
     int deals = HistoryDealsTotal();
     double holdSum = 0.0; int holdCnt = 0;
@@ -871,34 +958,38 @@ void ComputeDailyStats(ENUM_SOP_ORDER kind, DailyStats &s)
         ulong dt = HistoryDealGetTicket(i);
         if(dt == 0) continue;
         if(HistoryDealGetString(dt, DEAL_SYMBOL) != _Symbol) continue;
-        if(HistoryDealGetInteger(dt, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
-        datetime closeT = (datetime)HistoryDealGetInteger(dt, DEAL_TIME);
-        if(closeT < statFrom) continue;
-
-        ENUM_SOP_ORDER dk = DealStrategyType(dt);        // 回溯开仓magic,兼容手工平仓
-        // SOP_IGNORE = 全部订单口径(含手动单);指定策略则只统计该策略
+        datetime dealT = (datetime)HistoryDealGetInteger(dt, DEAL_TIME);
+        if(dealT < statFrom || dealT >= statTo) continue;
+        ENUM_SOP_ORDER cashKind = DealCashStrategy(dt);
+        if(kind == SOP_IGNORE || cashKind == kind) s.net += DealCashValue(dt);
+        if(!DealIsExit(dt)) continue;
+        ENUM_SOP_ORDER dk = DealStrategyType(dt);
         if(kind != SOP_IGNORE && dk != kind) continue;
 
-        double p = HistoryDealGetDouble(dt, DEAL_PROFIT)
-                 + HistoryDealGetDouble(dt, DEAL_SWAP)
-                 + HistoryDealGetDouble(dt, DEAL_COMMISSION);
+        double p = DealCashValue(dt);
+        datetime closeT = dealT;
+        long posId = HistoryDealGetInteger(dt, DEAL_POSITION_ID);
+        double entryCosts = 0.0, entryVolume = 0.0;
+        datetime openT = closeT;
+        for(int j = 0; j < deals; j++)
+        {
+            ulong dj = HistoryDealGetTicket(j);
+            if(dj == 0 || HistoryDealGetInteger(dj, DEAL_POSITION_ID) != posId) continue;
+            if(HistoryDealGetInteger(dj, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
+            entryCosts += HistoryDealGetDouble(dj, DEAL_COMMISSION) + HistoryDealGetDouble(dj, DEAL_FEE);
+            entryVolume += HistoryDealGetDouble(dj, DEAL_VOLUME);
+            datetime candidateOpen = (datetime)HistoryDealGetInteger(dj, DEAL_TIME);
+            if(openT == closeT || candidateOpen < openT) openT = candidateOpen;
+        }
+        double exitVolume = HistoryDealGetDouble(dt, DEAL_VOLUME);
+        if(entryVolume > 0.0) p += entryCosts * MathMin(1.0, exitVolume / entryVolume);
         s.trades++;
-        s.net += p;
         if(p > 0.01)       { s.wins++;   s.grossProfit += p;  if(p > s.maxWin)  s.maxWin = p; }
         else if(p < -0.01) { s.losses++; s.grossLoss  += -p; if(p < s.maxLoss) s.maxLoss = p; }
         else                 s.evens++;
 
-        long posId = HistoryDealGetInteger(dt, DEAL_POSITION_ID);
-        for(int j = 0; j < deals; j++)
-        {
-            ulong dj = HistoryDealGetTicket(j);
-            if(dj == 0) continue;
-            if(HistoryDealGetInteger(dj, DEAL_POSITION_ID) != posId) continue;
-            if(HistoryDealGetInteger(dj, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
-            int secs = (int)(closeT - (datetime)HistoryDealGetInteger(dj, DEAL_TIME));
-            if(secs >= 0) { holdSum += secs; holdCnt++; }
-            break;
-        }
+        int secs = (int)(closeT - openT);
+        if(secs >= 0) { holdSum += secs; holdCnt++; }
     }
     if(holdCnt > 0) s.avgHoldSec = holdSum / holdCnt;
 }
@@ -933,6 +1024,53 @@ double BufferedRiskPL(double profitAtStop)
 {
     if(profitAtStop >= 0.0) return profitAtStop;
     return profitAtStop * (1.0 + MathMax(0.0, Inp_RiskBufferPercent) / 100.0);
+}
+
+void ComputeDailyStats(ENUM_SOP_ORDER kind, DailyStats &s)
+{
+    ComputeDailyStatsRange(kind, StatStart(), RecoveryNowServer() + 1, s);
+}
+
+bool ReconstructAccountBalance(datetime from, datetime to, double &startBalance, double &endBalance, double &peakBalance)
+{
+    datetime now = RecoveryNowServer() + 1;
+    if(to <= from) to = from + 1;
+    if(!HistorySelect(from, now)) return false;
+    double deltaAfterStart = 0.0;
+    long times[]; ulong tickets[]; double amounts[];
+    for(int i = 0; i < HistoryDealsTotal(); i++)
+    {
+        ulong deal = HistoryDealGetTicket(i);
+        if(deal == 0) continue;
+        datetime dealTime = (datetime)HistoryDealGetInteger(deal, DEAL_TIME);
+        double amount = DealCashValue(deal);
+        deltaAfterStart += amount;
+        if(dealTime >= to) continue;
+        int n = ArraySize(times);
+        ArrayResize(times, n + 1); ArrayResize(tickets, n + 1); ArrayResize(amounts, n + 1);
+        times[n] = HistoryDealGetInteger(deal, DEAL_TIME_MSC);
+        tickets[n] = deal;
+        amounts[n] = amount;
+    }
+    for(int i = 1; i < ArraySize(times); i++)
+    {
+        long tm = times[i]; ulong tk = tickets[i]; double amount = amounts[i]; int j = i - 1;
+        while(j >= 0 && (times[j] > tm || (times[j] == tm && tickets[j] > tk)))
+        {
+            times[j + 1] = times[j]; tickets[j + 1] = tickets[j]; amounts[j + 1] = amounts[j]; j--;
+        }
+        times[j + 1] = tm; tickets[j + 1] = tk; amounts[j + 1] = amount;
+    }
+    startBalance = AccountInfoDouble(ACCOUNT_BALANCE) - deltaAfterStart;
+    double running = startBalance;
+    peakBalance = startBalance;
+    for(int i = 0; i < ArraySize(amounts); i++)
+    {
+        running += amounts[i];
+        if(running > peakBalance) peakBalance = running;
+    }
+    endBalance = running;
+    return true;
 }
 
 ENUM_ORDER_TYPE PositionOrderType(ENUM_POSITION_TYPE type)
@@ -1010,14 +1148,9 @@ double RealizedCashByScope(ENUM_SOP_ORDER kind)
     {
         ulong deal = HistoryDealGetTicket(i);
         if(deal == 0 || HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) continue;
-        ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY);
-        ENUM_SOP_ORDER dealKind = (entry == DEAL_ENTRY_IN)
-                                ? TypeByMagic(HistoryDealGetInteger(deal, DEAL_MAGIC))
-                                : DealStrategyType(deal);
+        ENUM_SOP_ORDER dealKind = DealCashStrategy(deal);
         if(kind != SOP_IGNORE && dealKind != kind) continue;
-        result += HistoryDealGetDouble(deal, DEAL_PROFIT)
-                + HistoryDealGetDouble(deal, DEAL_SWAP)
-                + HistoryDealGetDouble(deal, DEAL_COMMISSION);
+        result += DealCashValue(deal);
     }
     return result;
 }
@@ -2128,7 +2261,7 @@ void ManageAllTrailingStops()
 //+------------------------------------------------------------------+
 //| 导出全部已平仓订单明细(表格)到已打开的文件句柄                   |
 //+------------------------------------------------------------------+
-void ExportDealTable(int h, datetime statFrom)
+void ExportDealTable(int h, datetime statFrom, datetime statTo)
 {
     FileWrite(h, "## 全部订单明细(今日已平仓)");
     FileWrite(h, "");
@@ -2136,7 +2269,7 @@ void ExportDealTable(int h, datetime statFrom)
     FileWrite(h, "|----------|------|------|------|--------|--------|------|------|");
 
     datetime selFrom = statFrom - 30 * 86400;
-    if(!HistorySelect(selFrom, TimeCurrent() + 3600)) { FileWrite(h, "| (无数据) | | | | | | | |"); return; }
+    if(!HistorySelect(selFrom, statTo)) { FileWrite(h, "| (无数据) | | | | | | | |"); return; }
 
     int deals = HistoryDealsTotal();
     int rows = 0;
@@ -2145,9 +2278,9 @@ void ExportDealTable(int h, datetime statFrom)
         ulong dt = HistoryDealGetTicket(i);
         if(dt == 0) continue;
         if(HistoryDealGetString(dt, DEAL_SYMBOL) != _Symbol) continue;
-        if(HistoryDealGetInteger(dt, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+        if(!DealIsExit(dt)) continue;
         datetime closeT = (datetime)HistoryDealGetInteger(dt, DEAL_TIME);
-        if(closeT < statFrom) continue;
+        if(closeT < statFrom || closeT >= statTo) continue;
 
         double vol = HistoryDealGetDouble(dt, DEAL_VOLUME);
         ENUM_SOP_ORDER k = DealStrategyType(dt);         // 回溯开仓magic,兼容手工平仓
@@ -2155,11 +2288,12 @@ void ExportDealTable(int h, datetime statFrom)
         long dtype  = HistoryDealGetInteger(dt, DEAL_TYPE);
         string dir  = (dtype == DEAL_TYPE_SELL) ? "BUY" : "SELL"; // 平仓成交反向 = 原持仓方向
         double closePx = HistoryDealGetDouble(dt, DEAL_PRICE);
-        double pnl  = HistoryDealGetDouble(dt, DEAL_PROFIT) + HistoryDealGetDouble(dt, DEAL_SWAP) + HistoryDealGetDouble(dt, DEAL_COMMISSION);
+        double pnl  = DealCashValue(dt);
 
         // 配对 IN 成交拿开仓价与持时
         long posId = HistoryDealGetInteger(dt, DEAL_POSITION_ID);
         double openPx = closePx; datetime openT = closeT;
+        double entryCosts = 0.0, entryVolume = 0.0;
         for(int j = 0; j < deals; j++)
         {
             ulong dj = HistoryDealGetTicket(j);
@@ -2167,9 +2301,12 @@ void ExportDealTable(int h, datetime statFrom)
             if(HistoryDealGetInteger(dj, DEAL_POSITION_ID) != posId) continue;
             if(HistoryDealGetInteger(dj, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
             openPx = HistoryDealGetDouble(dj, DEAL_PRICE);
-            openT  = (datetime)HistoryDealGetInteger(dj, DEAL_TIME);
-            break;
+            datetime candidateOpen = (datetime)HistoryDealGetInteger(dj, DEAL_TIME);
+            if(openT == closeT || candidateOpen < openT) openT = candidateOpen;
+            entryCosts += HistoryDealGetDouble(dj, DEAL_COMMISSION) + HistoryDealGetDouble(dj, DEAL_FEE);
+            entryVolume += HistoryDealGetDouble(dj, DEAL_VOLUME);
         }
+        if(entryVolume > 0.0) pnl += entryCosts * MathMin(1.0, vol / entryVolume);
         int secs = (int)(closeT - openT); if(secs < 0) secs = 0;
 
         FileWrite(h, "| " + TimeToString(ToBeijing(closeT), TIME_MINUTES|TIME_SECONDS)
@@ -2191,40 +2328,53 @@ void ExportDealTable(int h, datetime statFrom)
 //| 导出当日统计 + 全部订单明细到本地 Markdown 文件                    |
 //| 在每日重置动作之前调用(此时 StatStart 仍指向将结束的交易日)       |
 //+------------------------------------------------------------------+
-void ExportDailyReport()
+bool ExportDailyReport(datetime statFrom, datetime statTo, string trigger)
 {
-    if(!Inp_ExportOnReset) return;
+    if(!Inp_ExportOnReset) return true;
 
-    datetime statFrom = StatStart();
     // 报告归属日期:用统计起点的北京日期命名
     string dayStr = TimeToString(ToBeijing(statFrom), TIME_DATE); // yyyy.mm.dd
     StringReplace(dayStr, ".", "");
     long   acct = AccountInfoInteger(ACCOUNT_LOGIN);
-    string fname = StringFormat("TradeEZ_%I64d_%s.md", acct, dayStr);
+    string serverHash = (string)StableTextHash(AccountInfoString(ACCOUNT_SERVER));
+    string periodId = dayStr + StringFormat("_%02d%02d", Inp_ResetHour, Inp_ResetMinute);
+    string fname = "TradeEZ_" + serverHash + "_" + (string)acct + "_" + NormalizeNamespacePart(_Symbol) + "_" +
+                   NormalizeNamespacePart(Inp_InstanceId) + "_" + periodId + ".md";
+    string tempName = fname + ".tmp";
 
-    int h = FileOpen(fname, FILE_WRITE | FILE_TXT | FILE_ANSI);
-    if(h == INVALID_HANDLE) { Print("导出失败,无法创建文件: ", fname); return; }
+    double periodStartBalance = 0.0, periodEndBalance = 0.0, periodPeakBalance = 0.0;
+    if(!ReconstructAccountBalance(statFrom, statTo, periodStartBalance, periodEndBalance, periodPeakBalance))
+    {
+        PrintFormat("[Period] 无法重建报告余额 %s ~ %s", TimeToString(statFrom), TimeToString(statTo));
+        return false;
+    }
+
+    int h = FileOpen(tempName, FILE_WRITE | FILE_TXT | FILE_ANSI);
+    if(h == INVALID_HANDLE) { Print("导出失败,无法创建临时文件: ", tempName); return false; }
 
     // ---- 统计汇总 ----
     DailyStats all, sc, tr;
-    ComputeDailyStats(SOP_IGNORE, all);
-    ComputeDailyStats(SOP_SCALP,  sc);
-    ComputeDailyStats(SOP_TREND,  tr);
+    ComputeDailyStatsRange(SOP_IGNORE, statFrom, statTo, all);
+    ComputeDailyStatsRange(SOP_SCALP,  statFrom, statTo, sc);
+    ComputeDailyStatsRange(SOP_TREND,  statFrom, statTo, tr);
     double manNet = all.net - sc.net - tr.net;
     int    manCnt = all.trades - sc.trades - tr.trades;
-    double peakProfit = g_PeakBalance - g_InitBalance;
+    double peakProfit = periodPeakBalance - periodStartBalance;
 
     FileWrite(h, "# TradeEZ-SOP 日内交易报告");
     FileWrite(h, "");
     FileWrite(h, "| 项目 | 值 |");
     FileWrite(h, "|------|------|");
     FileWrite(h, "| 交易日(北京) | " + TimeToString(ToBeijing(statFrom), TIME_DATE) + " |");
-    FileWrite(h, "| 导出时间(北京) | " + TimeToString(BeijingNow(), TIME_DATE|TIME_MINUTES) + " |");
+    FileWrite(h, "| 统计区间(北京) | " + TimeToString(ToBeijing(statFrom), TIME_DATE|TIME_MINUTES) + " ~ " + TimeToString(ToBeijing(statTo), TIME_DATE|TIME_MINUTES) + " |");
+    FileWrite(h, "| 生成原因 | " + trigger + " |");
+    FileWrite(h, "| 时间边界完整性 | " + (g_TimeBoundaryUncertain ? "保守：离线期间服务器UTC偏移发生变化" : "已验证") + " |");
     FileWrite(h, "| 账户 | " + (string)acct + " |");
     FileWrite(h, "| 品种 | " + _Symbol + " |");
-    FileWrite(h, "| 今日初始金额 | $" + DoubleToString(g_InitBalance, 2) + " |");
-    FileWrite(h, "| 当前余额 | $" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + " |");
-    FileWrite(h, "| 当前净值 | $" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + " |");
+    FileWrite(h, "| 周期初账户余额 | $" + DoubleToString(periodStartBalance, 2) + " |");
+    FileWrite(h, "| 周期末账户余额 | $" + DoubleToString(periodEndBalance, 2) + " |");
+    if(g_ResetTime > statFrom && g_ResetTime < statTo)
+        FileWrite(h, "| 当期手动风控重置 | " + TimeToString(ToBeijing(g_ResetTime), TIME_DATE|TIME_MINUTES|TIME_SECONDS) + " |");
     FileWrite(h, "");
 
     FileWrite(h, "## 盈亏概览");
@@ -2234,8 +2384,8 @@ void ExportDailyReport()
     FileWrite(h, "| 已实现净盈亏 | " + DoubleToString(all.net, 2) + " |");
     FileWrite(h, "| 毛盈利 | " + DoubleToString(all.grossProfit, 2) + " |");
     FileWrite(h, "| 毛亏损 | " + DoubleToString(all.grossLoss, 2) + " |");
-    FileWrite(h, "| 当前浮动盈亏 | " + DoubleToString(AllFloatingPL(), 2) + " |");
-    FileWrite(h, "| 今日最高盈利 | " + DoubleToString(peakProfit, 2) + " |");
+    FileWrite(h, "| 周期末浮动盈亏 | 历史无法精确还原 |");
+    FileWrite(h, "| 账户余额峰值增量 | " + DoubleToString(peakProfit, 2) + " |");
     FileWrite(h, "| 日盈利目标 | " + DoubleToString(Inp_DailyProfitTarget, 0) + " |");
     FileWrite(h, "");
 
@@ -2274,54 +2424,116 @@ void ExportDailyReport()
     FileWrite(h, "| 日回撤上限 | " + DoubleToString(Inp_DailyMaxDrawdown, 0) + " |");
     FileWrite(h, "");
 
-    ExportDealTable(h, statFrom);   // 全部订单明细
+    ExportDealTable(h, statFrom, statTo);   // 全部订单明细
 
+    FileFlush(h);
     FileClose(h);
-    Print("已导出当日报告: ", fname);
+    if(!FileMove(tempName, 0, fname, FILE_REWRITE))
+    {
+        PrintFormat("[Period] 日报原子替换失败 %s error=%d", fname, GetLastError());
+        FileDelete(tempName);
+        return false;
+    }
+    Print("[Period] 已导出当日报告: ", fname);
+    return true;
+}
+
+void SchedulePendingReports(datetime firstPeriod, datetime currentPeriod)
+{
+    if(firstPeriod <= 0 || firstPeriod >= currentPeriod) return;
+    // 已成功落盘的周期不重复排队；中断恢复时从下一周期继续。
+    if(g_LastReportedPeriod >= firstPeriod)
+        firstPeriod = g_LastReportedPeriod + 86400;
+    if(firstPeriod >= currentPeriod) return;
+    int limit = MathMax(1, Inp_RecoveryLookbackDays);
+    datetime earliest = currentPeriod - limit * 86400;
+    if(firstPeriod < earliest)
+    {
+        PrintFormat("[Period] 补报区间超过 %d 天，仅保留最近范围；更早周期记录为审计缺口", limit);
+        firstPeriod = earliest;
+    }
+    if(g_PendingReportPeriod == 0 || firstPeriod < g_PendingReportPeriod)
+        g_PendingReportPeriod = firstPeriod;
+}
+
+bool RetryPendingReports(datetime currentPeriod, bool force = false)
+{
+    if(g_PendingReportPeriod <= 0 || g_PendingReportPeriod >= currentPeriod) return true;
+    datetime nowUtc = TimeGMT();
+    if(!force && g_LastReportRetryUtc > 0 && nowUtc - g_LastReportRetryUtc < MathMax(5, Inp_RecoveryRetrySeconds))
+        return false;
+    g_LastReportRetryUtc = nowUtc;
+    while(g_PendingReportPeriod > 0 && g_PendingReportPeriod < currentPeriod)
+    {
+        datetime period = g_PendingReportPeriod;
+        if(!ExportDailyReport(period, period + 86400, "幂等周期补报"))
+        {
+            Print("[Period] 日报仍待补：", TimeToString(ToBeijing(period), TIME_DATE|TIME_MINUTES));
+            return false;
+        }
+        g_LastReportedPeriod = period;
+        g_PendingReportPeriod = period + 86400;
+        if(g_PendingReportPeriod >= currentPeriod) g_PendingReportPeriod = 0;
+        // 恢复阶段不得用尚未完成重建的内存值覆盖完整状态，只提交报告游标。
+        PVSet("ReportedPeriod", (double)g_LastReportedPeriod);
+        PVSet("PendingReportPeriod", (double)g_PendingReportPeriod);
+        GlobalVariablesFlush();
+    }
+    return true;
+}
+
+bool RebuildCurrentPeriod(datetime periodStart)
+{
+    RecoverySnapshot snapshot;
+    datetime now = RecoveryNowServer() + 1;
+    if(!BuildRecoverySnapshot(periodStart, now, snapshot)) return false;
+    double startBalance = 0.0, endBalance = 0.0, peakBalance = 0.0;
+    if(!ReconstructAccountBalance(periodStart, now, startBalance, endBalance, peakBalance)) return false;
+
+    g_DayStart = periodStart;
+    g_ResetTime = periodStart;
+    g_ScalpBlocked = false; g_TrendBlocked = false; g_TotalBlocked = false;
+    g_MoatLiquidated = false; g_DailyLiquidationActive = false; g_MoatDrawHit = false;
+    g_ScalpReason = ""; g_TrendReason = ""; g_TotalReason = "";
+    g_InitBalance = startBalance;
+    g_PeakBalance = peakBalance;
+    g_ScalpHighProfit = snapshot.scalp_high;
+    g_TrendHighProfit = snapshot.trend_high;
+    g_GlobalRealHigh = snapshot.all_high;
+    g_ScalpHiInit = snapshot.scalp_high_init;
+    g_TrendHiInit = snapshot.trend_high_init;
+    g_GlobalHiInit = snapshot.all_high_init;
+    double currentNet = snapshot.all_realized + AllFloatingPL();
+    g_TodayHighProfit = snapshot.all_high_init ? MathMax(snapshot.all_high, currentNet) : currentNet;
+    g_HighInit = true;
+    g_ConsecLoss = snapshot.consec_loss;
+    g_CooldownUntil = snapshot.cooldown_until > RecoveryNowServer() ? snapshot.cooldown_until : 0;
+    g_LastDealTimeMsc = snapshot.last_deal_msc > 0 ? snapshot.last_deal_msc : (long)periodStart * 1000;
+    g_LastDealTicket = snapshot.last_deal_ticket;
+    g_LastDealTime = (datetime)(g_LastDealTimeMsc / 1000);
+    g_LastCompletedPeriod = periodStart;
+    g_WeeklyCacheSecond = 0;
+    SaveState(); // 最后提交周期完成标志；逐票持仓管理状态不清零。
+    return true;
 }
 
 void CheckDayRollover()
 {
     if(g_RecoveryStatus == RECOVERY_CHECKING || g_RecoveryStatus == RECOVERY_FAILED) return;
-    datetime ds = TodayStart();
-    if(g_DayStart != ds)
+    datetime currentPeriod = TodayStart();
+    if(g_DayStart != currentPeriod)
     {
         datetime previousPeriod = g_DayStart;
-        // 重置前先导出即将结束的交易日数据(首次初始化 g_DayStart=0 时跳过)
-        if(g_DayStart != 0) ExportDailyReport();
-        if(previousPeriod != 0) g_LastReportedPeriod = previousPeriod;
-
-        g_DayStart        = ds;
-        g_ScalpBlocked    = false;
-        g_TrendBlocked    = false;
-        g_TotalBlocked    = false;
-        g_MoatLiquidated  = false;   // 新的一天解除护城河清盘锁定
-        g_DailyLiquidationActive = false;
-        g_MoatDrawHit     = false;
-        g_TodayHighProfit = 0.0;
-        g_HighInit        = false;
-        g_ScalpHighProfit = 0.0;
-        g_TrendHighProfit = 0.0;
-        g_ScalpHiInit     = false;
-        g_TrendHiInit     = false;
-        g_GlobalRealHigh  = 0.0;
-        g_GlobalHiInit    = false;
-        g_ScalpReason     = "";
-        g_TrendReason     = "";
-        g_TotalReason     = "";
-        g_ConsecLoss      = 0;
-        g_CooldownUntil   = 0;
-        g_LastDealTime    = ds;   // 新的一天从当日起点开始计连亏
-        g_LastDealTimeMsc = (long)ds * 1000;
-        g_LastDealTicket  = 0;
-        // 余额峰值基准归位到当前余额
-        g_InitBalance     = AccountInfoDouble(ACCOUNT_BALANCE);
-        g_PeakBalance     = g_InitBalance;
-        // 新的一天:基线回到当日0点(除非用户当天又手动重置)
-        if(g_ResetTime < ds) g_ResetTime = ds;
-        g_LastCompletedPeriod = ds;
-        SaveState(); // 最后提交新周期标志；中断时下次启动会幂等补做
+        if(previousPeriod > 0) SchedulePendingReports(previousPeriod, currentPeriod);
+        if(!RebuildCurrentPeriod(currentPeriod))
+        {
+            g_RecoveryStatus = RECOVERY_FAILED;
+            g_RecoveryReason = Lang("跨日历史重建失败，已只平不开并等待重试", "Period rebuild failed; exit-only pending retry");
+            g_LastRecoveryAttempt = TimeGMT();
+            return;
+        }
     }
+    RetryPendingReports(currentPeriod);
 }
 
 //+------------------------------------------------------------------+
@@ -2382,16 +2594,14 @@ void UpdateConsecutiveLoss()
     {
         ulong deal = HistoryDealGetTicket(i);
         if(deal == 0 || HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) continue;
-        if(HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+        if(!DealIsExit(deal)) continue;
         long dealMsc = HistoryDealGetInteger(deal, DEAL_TIME_MSC);
         if(dealMsc < g_LastDealTimeMsc ||
            (dealMsc == g_LastDealTimeMsc && deal <= g_LastDealTicket)) continue;
         int n = ArraySize(tickets);
         ArrayResize(tickets, n + 1); ArrayResize(timesMsc, n + 1); ArrayResize(profits, n + 1);
         tickets[n] = deal; timesMsc[n] = dealMsc;
-        profits[n] = HistoryDealGetDouble(deal, DEAL_PROFIT)
-                   + HistoryDealGetDouble(deal, DEAL_SWAP)
-                   + HistoryDealGetDouble(deal, DEAL_COMMISSION);
+        profits[n] = ExitTradeCashValue(deal);
     }
     for(int i = 1; i < ArraySize(tickets); i++)
     {
@@ -2560,8 +2770,10 @@ datetime WeekStart()
 // 返回自然周(周一起)全部订单已实现净盈亏(不限手数,含手动单)
 double WeekRealized()
 {
+    datetime cacheSecond = RecoveryNowServer();
+    if(g_WeeklyCacheSecond == cacheSecond) return g_WeeklyCachedPL;
     datetime weekStart = WeekStart();
-    if(!HistorySelect(weekStart, TimeCurrent() + 3600)) return 0.0;
+    if(!HistorySelect(weekStart, RecoveryNowServer() + 1)) return g_WeeklyCachedPL;
     double net = 0.0;
     int deals = HistoryDealsTotal();
     for(int i = 0; i < deals; i++)
@@ -2569,12 +2781,11 @@ double WeekRealized()
         ulong dt = HistoryDealGetTicket(i);
         if(dt == 0) continue;
         if(HistoryDealGetString(dt, DEAL_SYMBOL) != _Symbol) continue;
-        if(HistoryDealGetInteger(dt, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
-        net += HistoryDealGetDouble(dt, DEAL_PROFIT)
-             + HistoryDealGetDouble(dt, DEAL_SWAP)
-             + HistoryDealGetDouble(dt, DEAL_COMMISSION);
+        net += DealCashValue(dt);
     }
-    return net;
+    g_WeeklyCachedPL = net;
+    g_WeeklyCacheSecond = cacheSecond;
+    return g_WeeklyCachedPL;
 }
 
 string WeeklyHint()
@@ -2703,6 +2914,11 @@ bool TradeOpIsFinal(int state)
 {
     return state == TRADE_OP_CONFIRMED || state == TRADE_OP_FAILED ||
            state == TRADE_OP_CANCELLED;
+}
+
+string WeeklySummary()
+{
+    return WeeklyProgress() + " · " + WeeklyHint();
 }
 
 string NewTradeOperationId(string prefix)
@@ -4401,7 +4617,7 @@ void BuildClosedRows(ENUM_SOP_ORDER kind)
         ulong dt = HistoryDealGetTicket(i);
         if(dt == 0) continue;
         if(HistoryDealGetString(dt, DEAL_SYMBOL) != _Symbol) continue;
-        if(HistoryDealGetInteger(dt, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+        if(!DealIsExit(dt)) continue;
         // 仅统计"今日起点之后平仓"的成交
         if((datetime)HistoryDealGetInteger(dt, DEAL_TIME) < statFrom) continue;
         ENUM_SOP_ORDER dk = DealStrategyType(dt);        // 回溯开仓magic,兼容手工平仓
@@ -4419,23 +4635,32 @@ void BuildClosedRows(ENUM_SOP_ORDER kind)
                               : (dk == SOP_TREND ? Lang("趋势","TR") : Lang("手动","MAN"));
         g_Rows[n].close_price = HistoryDealGetDouble(dt, DEAL_PRICE);
         g_Rows[n].open_price  = HistoryDealGetDouble(dt, DEAL_PRICE); // 无入场价时退化显示
-        g_Rows[n].pnl         = HistoryDealGetDouble(dt, DEAL_PROFIT)
-                              + HistoryDealGetDouble(dt, DEAL_SWAP)
-                              + HistoryDealGetDouble(dt, DEAL_COMMISSION);
+        g_Rows[n].pnl         = DealCashValue(dt);
         g_Rows[n].time        = TimeToString(ToBeijing(closeT), TIME_MINUTES | TIME_SECONDS); // 北京时间
 
         // 尝试用 position id 找入场价与持时
         long posId = HistoryDealGetInteger(dt, DEAL_POSITION_ID);
         datetime openT = closeT;
+        double entryVolume = 0.0;
+        double entryPriceVolume = 0.0;
+        double entryCosts = 0.0;
         for(int j = 0; j < deals; j++)
         {
             ulong dj = HistoryDealGetTicket(j);
             if(dj == 0) continue;
             if(HistoryDealGetInteger(dj, DEAL_POSITION_ID) != posId) continue;
             if(HistoryDealGetInteger(dj, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
-            g_Rows[n].open_price = HistoryDealGetDouble(dj, DEAL_PRICE);
-            openT = (datetime)HistoryDealGetInteger(dj, DEAL_TIME);
-            break;
+            double entryDealVolume = HistoryDealGetDouble(dj, DEAL_VOLUME);
+            entryVolume += entryDealVolume;
+            entryPriceVolume += HistoryDealGetDouble(dj, DEAL_PRICE) * entryDealVolume;
+            entryCosts += HistoryDealGetDouble(dj, DEAL_COMMISSION) + HistoryDealGetDouble(dj, DEAL_FEE);
+            datetime entryT = (datetime)HistoryDealGetInteger(dj, DEAL_TIME);
+            if(openT == closeT || entryT < openT) openT = entryT;
+        }
+        if(entryVolume > 0.0)
+        {
+            g_Rows[n].open_price = entryPriceVolume / entryVolume;
+            g_Rows[n].pnl += entryCosts * MathMin(1.0, g_Rows[n].lots / entryVolume);
         }
         int secs = (int)(closeT - openT);
         if(secs < 0) secs = 0;
@@ -4906,9 +5131,7 @@ void RenderPerfectUI()
     CreateRowLR("C1_Time", Col1X, cY, Lang("系统激活时段", "Active Session"), sess, COLOR_TEXT_MUTED, (InSession() ? COLOR_SIGNAL_PROFIT : COLOR_TEXT_MUTED));
     cY += Scale(26);
     // 7 重置倒计时
-    datetime nextDay = NextResetTime();
-    int remain = (int)(nextDay - TimeCurrent());
-    if(remain < 0) remain = 0;
+    int remain = SecondsUntilNextResetBeijing();
     string cd = (string)(remain / 3600) + Lang(" 小时 ", " Hrs ") + (string)((remain % 3600) / 60) + Lang(" 分钟", " Mins");
     CreateRowLR("C1_Reset", Col1X, cY, Lang("重置倒计时", "Reset Countdown"), cd, COLOR_TEXT_MUTED, COLOR_SIGNAL_WARNING, true);
     if(Inp_ShowResetBtn)
@@ -4944,7 +5167,8 @@ void RenderPerfectUI()
     CreateRowLR("C4_Thr", Col2X, cY, Lang("本品种回撤余量", "Symbol Drawdown Room"), FmtMoney(ddRemain), COLOR_TEXT_MUTED, thClr, true);
     cY += Scale(24);
     // 4 周目标进度
-    CreateRowLR("C4_WeekP", Col2X, cY, Lang("周目标进度", "Weekly Progress"), WeeklyProgress(), COLOR_TEXT_MUTED, PLColor(WeekRealized()), true);
+    double weeklyPL = WeekRealized();
+    CreateRowLR("C4_WeekP", Col2X, cY, Lang("周计划", "Weekly Plan"), WeeklySummary(), COLOR_TEXT_MUTED, PLColor(weeklyPL), true);
     cY += Scale(24);
     // 5 当前品种预计止损风险(含持仓、挂单、未落地开仓请求)
     string symbolRisk = g_RiskSnapshotValid
@@ -5387,6 +5611,8 @@ void SaveState()
     PVSet("RecoveryNeedsAck", (g_RecoveryStatus == RECOVERY_CONSERVATIVE && !g_RecoveryAcknowledged) ? 1.0 : 0.0);
     PVSet("CompletedPeriod", (double)g_LastCompletedPeriod);
     PVSet("ReportedPeriod", (double)g_LastReportedPeriod);
+    PVSet("PendingReportPeriod", (double)g_PendingReportPeriod);
+    PVSet("PeriodServerOffset", (double)ServerGmtOffset());
     PVSet("InitBalance", g_InitBalance);
     PVSet("PeakBalance", g_PeakBalance);
     PVSet("TodayHi",    g_TodayHighProfit);   PVSet("HiInit",   g_HighInit    ? 1 : 0);
@@ -5413,6 +5639,7 @@ bool LoadLegacyDailyState()
     g_LastStateCheckpointUtc = TimeGMT();
     g_LastCompletedPeriod = g_DayStart;
     g_LastReportedPeriod = 0;
+    g_PendingReportPeriod = 0;
     g_TodayHighProfit = GlobalVariableGet(LegacyPVKey("TodayHi"));
     g_HighInit        = (GlobalVariableGet(LegacyPVKey("HiInit")) > 0.5);
     g_ScalpHighProfit = GlobalVariableGet(LegacyPVKey("ScalpHi"));
@@ -5443,6 +5670,7 @@ bool LoadState()
     g_RecoveryCompletedUtc = PVHas("RecoveryCompletedUtc") ? (datetime)(long)PVGet("RecoveryCompletedUtc") : 0;
     g_LastCompletedPeriod = PVHas("CompletedPeriod") ? (datetime)(long)PVGet("CompletedPeriod") : g_DayStart;
     g_LastReportedPeriod = PVHas("ReportedPeriod") ? (datetime)(long)PVGet("ReportedPeriod") : 0;
+    g_PendingReportPeriod = PVHas("PendingReportPeriod") ? (datetime)(long)PVGet("PendingReportPeriod") : 0;
     if(PVHas("InitBalance")) g_InitBalance = PVGet("InitBalance");
     if(PVHas("PeakBalance")) g_PeakBalance = PVGet("PeakBalance");
     g_TodayHighProfit = PVGet("TodayHi");   g_HighInit    = (PVGet("HiInit")   > 0.5);
@@ -5986,25 +6214,6 @@ void LoadArrays()
 //+------------------------------------------------------------------+
 //| 启动恢复：成交历史精确重放与缺失逐票状态保守接管                |
 //+------------------------------------------------------------------+
-struct RecoverySnapshot
-{
-    bool   history_ok;
-    int    deal_count;
-    double all_realized;
-    double scalp_realized;
-    double trend_realized;
-    double all_high;
-    double scalp_high;
-    double trend_high;
-    bool   all_high_init;
-    bool   scalp_high_init;
-    bool   trend_high_init;
-    int    consec_loss;
-    datetime cooldown_until;
-    long   last_deal_msc;
-    ulong  last_deal_ticket;
-};
-
 datetime RecoveryNowServer()
 {
     datetime now = TimeTradeServer();
@@ -6029,14 +6238,15 @@ bool BuildRecoverySnapshot(datetime from, datetime to, RecoverySnapshot &snapsho
     ulong tickets[];
     long timesMsc[];
     double profits[];
+    double exitTradeProfits[];
     int kinds[];
+    bool exits[];
     int total = HistoryDealsTotal();
     for(int i = 0; i < total; i++)
     {
         ulong deal = HistoryDealGetTicket(i);
         if(deal == 0) continue;
         if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) continue;
-        if(HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
         long dealMsc = HistoryDealGetInteger(deal, DEAL_TIME_MSC);
         datetime dealTime = (datetime)(dealMsc / 1000);
         if(dealTime < from || dealTime >= to) continue;
@@ -6045,28 +6255,31 @@ bool BuildRecoverySnapshot(datetime from, datetime to, RecoverySnapshot &snapsho
         ArrayResize(tickets, n + 1);
         ArrayResize(timesMsc, n + 1);
         ArrayResize(profits, n + 1);
+        ArrayResize(exitTradeProfits, n + 1);
         ArrayResize(kinds, n + 1);
+        ArrayResize(exits, n + 1);
         tickets[n] = deal;
         timesMsc[n] = dealMsc;
-        profits[n] = HistoryDealGetDouble(deal, DEAL_PROFIT)
-                   + HistoryDealGetDouble(deal, DEAL_SWAP)
-                   + HistoryDealGetDouble(deal, DEAL_COMMISSION);
-        kinds[n] = (int)DealStrategyType(deal);
+        profits[n] = DealCashValue(deal);
+        exitTradeProfits[n] = DealIsExit(deal) ? ExitTradeCashValue(deal) : profits[n];
+        kinds[n] = (int)DealCashStrategy(deal);
+        exits[n] = DealIsExit(deal);
     }
 
     // 稳定排序：毫秒时间相同则按 deal ticket，保证重复重放结果一致。
     for(int i = 1; i < ArraySize(tickets); i++)
     {
-        ulong tk = tickets[i]; long tm = timesMsc[i]; double pnl = profits[i]; int kind = kinds[i];
+        ulong tk = tickets[i]; long tm = timesMsc[i]; double pnl = profits[i]; double tradePnl = exitTradeProfits[i]; int kind = kinds[i]; bool isExit = exits[i];
         int j = i - 1;
         while(j >= 0 && (timesMsc[j] > tm || (timesMsc[j] == tm && tickets[j] > tk)))
         {
             tickets[j + 1] = tickets[j]; timesMsc[j + 1] = timesMsc[j];
-            profits[j + 1] = profits[j]; kinds[j + 1] = kinds[j]; j--;
+            profits[j + 1] = profits[j]; exitTradeProfits[j + 1] = exitTradeProfits[j]; kinds[j + 1] = kinds[j]; exits[j + 1] = exits[j]; j--;
         }
-        tickets[j + 1] = tk; timesMsc[j + 1] = tm; profits[j + 1] = pnl; kinds[j + 1] = kind;
+        tickets[j + 1] = tk; timesMsc[j + 1] = tm; profits[j + 1] = pnl; exitTradeProfits[j + 1] = tradePnl; kinds[j + 1] = kind; exits[j + 1] = isExit;
     }
 
+    int closedCount = 0;
     for(int i = 0; i < ArraySize(tickets); i++)
     {
         double pnl = profits[i];
@@ -6087,84 +6300,31 @@ bool BuildRecoverySnapshot(datetime from, datetime to, RecoverySnapshot &snapsho
             else if(snapshot.trend_realized > snapshot.trend_high) snapshot.trend_high = snapshot.trend_realized;
         }
 
-        if(pnl < 0.0) snapshot.consec_loss++;
-        else snapshot.consec_loss = 0;
-        if(Inp_ConsecLossLimit > 0 && snapshot.consec_loss >= Inp_ConsecLossLimit)
+        if(exits[i])
         {
-            snapshot.cooldown_until = (datetime)(timesMsc[i] / 1000) + Inp_CooldownMinutes * 60;
-            snapshot.consec_loss = 0;
+            closedCount++;
+            if(exitTradeProfits[i] < 0.0) snapshot.consec_loss++;
+            else snapshot.consec_loss = 0;
+            if(Inp_ConsecLossLimit > 0 && snapshot.consec_loss >= Inp_ConsecLossLimit)
+            {
+                snapshot.cooldown_until = (datetime)(timesMsc[i] / 1000) + Inp_CooldownMinutes * 60;
+                snapshot.consec_loss = 0;
+            }
+            snapshot.last_deal_msc = timesMsc[i];
+            snapshot.last_deal_ticket = tickets[i];
         }
-        snapshot.last_deal_msc = timesMsc[i];
-        snapshot.last_deal_ticket = tickets[i];
     }
-    snapshot.deal_count = ArraySize(tickets);
+    snapshot.deal_count = closedCount;
     snapshot.history_ok = true;
     return true;
 }
 
-bool ExportRecoveredPeriod(datetime periodStart, datetime periodEnd)
-{
-    if(!Inp_ExportOnReset) return true;
-    RecoverySnapshot snapshot;
-    if(!BuildRecoverySnapshot(periodStart, periodEnd, snapshot)) return false;
-
-    string dayStr = TimeToString(ToBeijing(periodStart), TIME_DATE);
-    StringReplace(dayStr, ".", "");
-    string finalName = StringFormat("TradeEZ_%I64d_%s.md", AccountInfoInteger(ACCOUNT_LOGIN), dayStr);
-    string tempName = finalName + ".tmp";
-    int h = FileOpen(tempName, FILE_WRITE | FILE_TXT | FILE_ANSI);
-    if(h == INVALID_HANDLE)
-    {
-        PrintFormat("[Recovery] 无法写入补做报告 %s，错误=%d", tempName, GetLastError());
-        return false;
-    }
-    FileWrite(h, "# TradeEZ-SOP 日内交易报告（启动恢复补做）");
-    FileWrite(h, "");
-    FileWrite(h, "| 项目 | 值 |");
-    FileWrite(h, "|------|------|");
-    FileWrite(h, "| 交易日(北京) | " + TimeToString(ToBeijing(periodStart), TIME_DATE) + " |");
-    FileWrite(h, "| 统计区间 | " + TimeToString(ToBeijing(periodStart), TIME_DATE|TIME_MINUTES) + " ~ " + TimeToString(ToBeijing(periodEnd), TIME_DATE|TIME_MINUTES) + " |");
-    FileWrite(h, "| 平仓成交数 | " + (string)snapshot.deal_count + " |");
-    FileWrite(h, "| 全部已实现盈亏 | " + DoubleToString(snapshot.all_realized, 2) + " |");
-    FileWrite(h, "| 剥头皮已实现盈亏 | " + DoubleToString(snapshot.scalp_realized, 2) + " |");
-    FileWrite(h, "| 趋势已实现盈亏 | " + DoubleToString(snapshot.trend_realized, 2) + " |");
-    FileWrite(h, "| 已实现累计峰值 | " + DoubleToString(snapshot.all_high, 2) + " |");
-    FileWrite(h, "| 离线浮盈峰值 | 无法从成交历史精确还原 |");
-    FileWrite(h, "");
-    FileWrite(h, "> 本报告由启动恢复流程按成交历史幂等补做；不使用重启时的当前余额、净值或浮动盈亏冒充历史值。");
-    FileFlush(h);
-    FileClose(h);
-    if(!FileMove(tempName, 0, finalName, FILE_REWRITE))
-    {
-        PrintFormat("[Recovery] 补做报告原子替换失败 %s，错误=%d", finalName, GetLastError());
-        FileDelete(tempName);
-        return false;
-    }
-    Print("[Recovery] 已补做统计周期报告: ", finalName);
-    return true;
-}
-
-bool ReplayMissedPeriods(datetime savedPeriod, datetime savedStatStart, datetime currentPeriod)
+bool ReplayMissedPeriods(datetime savedPeriod, datetime currentPeriod)
 {
     if(savedPeriod <= 0 || savedPeriod >= currentPeriod) return true;
-    int missed = (int)((currentPeriod - savedPeriod) / 86400);
-    int limit = MathMax(1, Inp_RecoveryLookbackDays);
-    datetime first = savedPeriod;
-    if(missed > limit)
-    {
-        first = currentPeriod - limit * 86400;
-        PrintFormat("[Recovery] 共错过 %d 个统计周期，仅自动补做最近 %d 个；更早周期保留审计缺口", missed, limit);
-    }
-    for(datetime period = first; period < currentPeriod; period += 86400)
-    {
-        if(period <= g_LastReportedPeriod) continue;
-        datetime reportFrom = (period == savedPeriod && savedStatStart > period && savedStatStart < period + 86400)
-                              ? savedStatStart : period;
-        if(!ExportRecoveredPeriod(reportFrom, period + 86400)) return false;
-        g_LastReportedPeriod = period;
-        PVSet("ReportedPeriod", (double)g_LastReportedPeriod);
-        GlobalVariablesFlush();
-    }
+    // 官方日报始终覆盖完整统计周期；手动风控重置不得截断报告。
+    SchedulePendingReports(savedPeriod, currentPeriod);
+    RetryPendingReports(currentPeriod, true); // 报告失败保留待补，不阻断当前周期恢复。
     return true;
 }
 
@@ -6261,7 +6421,7 @@ bool AttemptStartupRecovery()
 
     datetime currentPeriod = TodayStart();
     datetime savedPeriod = PVHas("StatDay") ? (datetime)(long)PVGet("StatDay") : 0;
-    datetime savedStatStart = PVHas("ResetTime") ? (datetime)(long)PVGet("ResetTime") : savedPeriod;
+    int persistedServerOffset = PVHas("PeriodServerOffset") ? (int)PVGet("PeriodServerOffset") : ServerGmtOffset();
     if(PVHas("ReportedPeriod")) g_LastReportedPeriod = (datetime)(long)PVGet("ReportedPeriod");
     bool priorNeedsAck = PVHas("RecoveryNeedsAck") && PVGet("RecoveryNeedsAck") > 0.5;
     bool scheduleChanged = savedPeriod > 0 &&
@@ -6273,6 +6433,10 @@ bool AttemptStartupRecovery()
     g_RecoveryCompletedUtc = 0;
 
     int serverOffset = ServerGmtOffset();
+    g_TimeBoundaryUncertain = savedPeriod > 0 && savedPeriod < currentPeriod && persistedServerOffset != serverOffset;
+    if(g_TimeBoundaryUncertain)
+        PrintFormat("[Recovery] 离线期间服务器UTC偏移由 %d 变为 %d 小时，历史日界按保守模式处理",
+                    persistedServerOffset / 3600, serverOffset / 3600);
     if(currentPeriod <= 0 || MathAbs(serverOffset) > 14 * 3600 || savedPeriod > currentPeriod + 86400)
     {
         g_RecoveryStatus = RECOVERY_FAILED;
@@ -6288,10 +6452,9 @@ bool AttemptStartupRecovery()
     {
         Print("[Recovery] 检测到每日重置时间配置变化；旧周期不自动补报，当前周期按成交历史重建并要求用户确认");
         savedPeriod = 0;
-        savedStatStart = 0;
     }
 
-    if(!ReplayMissedPeriods(savedPeriod, savedStatStart, currentPeriod))
+    if(!ReplayMissedPeriods(savedPeriod, currentPeriod))
     {
         g_RecoveryStatus = RECOVERY_FAILED;
         g_RecoveryReason = Lang("历史报告补做失败，已禁止开仓", "Missed-period recovery failed; entries disabled");
@@ -6346,8 +6509,20 @@ bool AttemptStartupRecovery()
     g_TrendHiInit = snapshot.trend_high_init || savedTrendHigh > -DBL_MAX;
     g_GlobalHiInit = snapshot.all_high_init || savedGlobalHigh > -DBL_MAX;
 
-    g_InitBalance = AccountInfoDouble(ACCOUNT_BALANCE) - snapshot.all_realized;
-    g_PeakBalance = MathMax(MathMax(g_InitBalance, AccountInfoDouble(ACCOUNT_BALANCE)), savedPeakBalance);
+    double rebuiltStartBalance = 0.0, rebuiltEndBalance = 0.0, rebuiltPeakBalance = 0.0;
+    if(!ReconstructAccountBalance(StatStart(), RecoveryNowServer() + 1,
+                                  rebuiltStartBalance, rebuiltEndBalance, rebuiltPeakBalance))
+    {
+        g_RecoveryStatus = RECOVERY_FAILED;
+        g_RecoveryReason = Lang("账户余额历史尚不可用，已禁止开仓并等待重试", "Account balance history unavailable; entries disabled pending retry");
+        g_RecoveryCompletedUtc = TimeGMT();
+        PVSet("RecoveryCompletedUtc", (double)g_RecoveryCompletedUtc);
+        PVSet("RecoveryResult", (double)g_RecoveryStatus);
+        GlobalVariablesFlush();
+        return false;
+    }
+    g_InitBalance = rebuiltStartBalance;
+    g_PeakBalance = MathMax(rebuiltPeakBalance, savedPeakBalance);
     double currentNet = snapshot.all_realized + AllFloatingPL();
     double knownHigh = snapshot.all_high_init ? snapshot.all_high : currentNet;
     knownHigh = MathMax(knownHigh, currentNet);
@@ -6373,17 +6548,19 @@ bool AttemptStartupRecovery()
     int gapSeconds = checkpointUtc > 0 ? (int)(TimeGMT() - checkpointUtc) : 0;
     bool uncertainGap = (CurrentSymbolPositionCount() > 0 || priorOfflineTickets > 0) &&
                         (!loadedCurrent || checkpointUtc == 0 || gapSeconds > MathMax(15, Inp_RefreshSeconds * 3));
-    if(adopted || uncertainGap || priorNeedsAck || scheduleChanged)
+    if(adopted || uncertainGap || priorNeedsAck || scheduleChanged || g_TimeBoundaryUncertain)
     {
         g_RecoveryStatus = RECOVERY_CONSERVATIVE;
         g_RecoveryAcknowledged = false;
-        g_RecoveryReason = scheduleChanged
+        g_RecoveryReason = g_TimeBoundaryUncertain
+            ? Lang("离线期间服务器时区偏移发生变化，历史日界需保守确认", "Server UTC offset changed while offline; historical boundaries require confirmation")
+            : (scheduleChanged
             ? Lang("每日重置时间已变化，当前周期已重建；请确认恢复摘要", "Daily reset schedule changed; current period rebuilt, please confirm")
             : (adopted
             ? Lang("存在缺失逐票状态，已保守接管；请确认恢复摘要", "Missing ticket state adopted conservatively; review and confirm")
             : (uncertainGap
                ? Lang("离线期间存在持仓，浮盈峰值无法验证；请确认恢复摘要", "Positions existed while offline; peak profit is unverifiable; please confirm")
-               : Lang("上次保守恢复尚未确认；请检查持仓后确认", "Previous conservative recovery still requires confirmation")));
+               : Lang("上次保守恢复尚未确认；请检查持仓后确认", "Previous conservative recovery still requires confirmation"))));
     }
     else
     {
@@ -6446,6 +6623,7 @@ bool PublishInstanceManifest()
     settings += "\"reset_minute\":" + (string)Inp_ResetMinute + ",";
     settings += "\"recovery_lookback_days\":" + (string)Inp_RecoveryLookbackDays + ",";
     settings += "\"recovery_retry_seconds\":" + (string)Inp_RecoveryRetrySeconds + ",";
+    settings += "\"tester_server_utc_offset_hours\":" + (string)Inp_TesterServerUtcOffsetHours + ",";
     settings += "\"export_on_reset\":" + ManifestBool(Inp_ExportOnReset) + "},";
     settings += "\"risk\":{";
     settings += "\"daily_max_drawdown\":" + DoubleToString(Inp_DailyMaxDrawdown, 2) + ",";
@@ -6534,6 +6712,10 @@ int OnInit()
        Inp_ScalpBETrigger <= 0 || Inp_ScalpTrailStep <= 0 ||
        Inp_RiskBufferPercent < 0.0 || Inp_MaxEntrySpreadPoints < 0 ||
        Inp_MaxQuoteAgeSeconds < 1 || Inp_MinProjectedMarginLevel <= 0.0 ||
+       Inp_TesterServerUtcOffsetHours < -12 || Inp_TesterServerUtcOffsetHours > 14 ||
+       Inp_WeeklyProfitTarget < 0.0 || Inp_WeeklyPlan1_Level < 0.0 ||
+       Inp_WeeklyPlan2_Level < Inp_WeeklyPlan1_Level || Inp_WeeklyPlan3_Level < Inp_WeeklyPlan2_Level ||
+       Inp_WeeklyPlan1_DD < 0.0 || Inp_WeeklyPlan2_DD < 0.0 ||
        (Inp_ScalpTimeLimitOn && Inp_ScalpMaxHoldSecs <= 0))
     {
         Print("[Init] 参数无效：重置/恢复参数越界，或策略保护、追踪、超时参数不符合要求");
@@ -6541,6 +6723,13 @@ int OnInit()
     }
     g_Language_ZH = Inp_DefaultChinese;
     g_DayStart    = TodayStart();
+    PrintFormat("[Clock] server=%s tick=%s gmt=%s offset=%d bj=%s period=%s reset=%02d:%02d remain=%d",
+                TimeToString(TimeTradeServer(), TIME_DATE|TIME_SECONDS),
+                TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS),
+                TimeToString(TimeGMT(), TIME_DATE|TIME_SECONDS), ServerGmtOffset(),
+                TimeToString(BeijingNow(), TIME_DATE|TIME_SECONDS),
+                TimeToString(ToBeijing(g_DayStart), TIME_DATE|TIME_SECONDS),
+                Inp_ResetHour, Inp_ResetMinute, SecondsUntilNextResetBeijing());
     g_AccountModeSupported = ((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
     g_InstanceOwnsState = AcquireInstanceLease();
 
