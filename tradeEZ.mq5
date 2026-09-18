@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  最后修改时间：2026-09-19 00:05（北京时间）       |
+//|                  最后修改时间：2026-09-19 00:53（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -107,6 +107,7 @@ input group "===== 基础 ====="
 input long     Inp_Magic             = 920716;   // EA 基础魔术号
 input long     Inp_MagicScalp        = 920717;   // 剥头皮魔术号
 input long     Inp_MagicTrend        = 920718;   // 趋势魔术号
+input string   Inp_InstanceId         = "primary"; // 稳定实例ID(同账户同品种多实例必须唯一)
 input string   Inp_CommentScalp      = "TradeEZ-SC"; // 剥头皮订单备注
 input string   Inp_CommentTrend      = "TradeEZ-TR"; // 趋势订单备注
 input int      Inp_Slippage          = 30;       // 滑点(点)
@@ -273,6 +274,33 @@ double         g_ScalpTrackPeak[];        // 峰值浮盈点数
 
 // 数组状态变化标记(脏则下次落盘,避免每 tick 写文件)
 bool           g_ArraysDirty = false;
+
+// 版本化逐票持久化记录。运行期仍沿用原数组，降低交易管理逻辑改动风险。
+struct TicketStateRecord
+{
+    ulong    ticket;
+    ulong    position_id;
+    string   symbol;
+    long     magic;
+    long     open_time_msc;
+    int      management_mode;       // 1=SCALP, 2=TREND, 3=PROMOTED
+    bool     timeout_cancelled;
+    bool     scalp_track_active;
+    double   scalp_peak_points;
+    bool     trend_reduced;
+    double   trend_peak_points;
+    double   last_volume;
+    datetime updated_utc;
+    datetime closed_utc;
+};
+TicketStateRecord g_TicketState[];
+ulong             g_StateRecoveryBlockedTickets[];
+bool              g_LegacyStateMigrated = false;
+bool              g_InstanceOwnsState = true;
+bool              g_StatePersistenceBlocked = false;
+double            g_InstanceLeaseOwner = 0.0;
+int               g_StateCheckpointSeconds = 0;
+const int         TICKET_STATE_SCHEMA = 2;
 
 // 明细舱历史缓存
 struct ClosedRow
@@ -714,6 +742,16 @@ double TotalDrawdownLimit() { return Inp_DailyMaxDrawdown; }
 //+------------------------------------------------------------------+
 //| 趋势 per-ticket 状态管理                                          |
 //+------------------------------------------------------------------+
+void MarkTicketStateDirty(bool saveNow = true)
+{
+    g_ArraysDirty = true;
+    if(saveNow && g_InstanceOwnsState)
+    {
+        SaveArrays();
+        g_ArraysDirty = false;
+    }
+}
+
 int TrIndex(ulong ticket)
 {
     for(int i = 0; i < ArraySize(g_TrTicket); i++)
@@ -732,7 +770,7 @@ int TrEnsure(ulong ticket)
     g_TrTicket[n]     = ticket;
     g_TrReduced[n]    = false;
     g_TrPeakPoints[n] = 0.0;
-    g_ArraysDirty = true;
+    MarkTicketStateDirty();
     return n;
 }
 
@@ -750,7 +788,7 @@ void TrCleanup()
             ArrayResize(g_TrTicket, last);
             ArrayResize(g_TrReduced, last);
             ArrayResize(g_TrPeakPoints, last);
-            g_ArraysDirty = true;
+            MarkTicketStateDirty(false);
         }
     }
 }
@@ -774,7 +812,7 @@ int ScalpTrackEnsure(ulong ticket)
     ArrayResize(g_ScalpTrackPeak, n + 1);
     g_ScalpTrackTicket[n] = ticket;
     g_ScalpTrackPeak[n]   = 0.0;
-    g_ArraysDirty = true;
+    MarkTicketStateDirty();
     return n;
 }
 
@@ -789,7 +827,7 @@ void ScalpTrackCleanup()
             g_ScalpTrackPeak[i]   = g_ScalpTrackPeak[last];
             ArrayResize(g_ScalpTrackTicket, last);
             ArrayResize(g_ScalpTrackPeak, last);
-            g_ArraysDirty = true;
+            MarkTicketStateDirty(false);
         }
     }
 }
@@ -810,7 +848,7 @@ void AddPromoted(ulong ticket)
     int n = ArraySize(g_PromotedTickets);
     ArrayResize(g_PromotedTickets, n + 1);
     g_PromotedTickets[n] = ticket;
-    g_ArraysDirty = true;
+    MarkTicketStateDirty();
 }
 
 // 清理已平仓的提升标记
@@ -823,7 +861,7 @@ void PromotedCleanup()
             int last = ArraySize(g_PromotedTickets) - 1;
             g_PromotedTickets[i] = g_PromotedTickets[last];
             ArrayResize(g_PromotedTickets, last);
-            g_ArraysDirty = true;
+            MarkTicketStateDirty(false);
         }
     }
 }
@@ -843,7 +881,7 @@ void AddTimeoutCancelled(ulong ticket)
     int n = ArraySize(g_TimeoutCancelled);
     ArrayResize(g_TimeoutCancelled, n + 1);
     g_TimeoutCancelled[n] = ticket;
-    g_ArraysDirty = true;
+    MarkTicketStateDirty();
 }
 void TimeoutCancelCleanup()
 {
@@ -854,7 +892,7 @@ void TimeoutCancelCleanup()
             int last = ArraySize(g_TimeoutCancelled) - 1;
             g_TimeoutCancelled[i] = g_TimeoutCancelled[last];
             ArrayResize(g_TimeoutCancelled, last);
-            g_ArraysDirty = true;
+            MarkTicketStateDirty(false);
         }
     }
 }
@@ -1022,7 +1060,7 @@ void ManageScalpTrailingStop(ulong ticket)
         PrintFormat("[峰值更新] Ticket=%I64u 旧峰值=%.1f点 → 新峰值=%.1f点",
                     ticket, g_ScalpTrackPeak[idx], profitPoints);
         g_ScalpTrackPeak[idx] = profitPoints;
-        g_ArraysDirty = true;
+        MarkTicketStateDirty();
     }
 
     // 回撤达阈值 → 平仓离场
@@ -1102,7 +1140,7 @@ void ManageTrendTrailingStop(ulong ticket)
     if(profitPoints >= Inp_TrendTrailTrigger)
     {
         // 记录浮盈峰值(用于判定回撤)
-        if(profitPoints > g_TrPeakPoints[idx]) { g_TrPeakPoints[idx] = profitPoints; g_ArraysDirty = true; }
+        if(profitPoints > g_TrPeakPoints[idx]) { g_TrPeakPoints[idx] = profitPoints; MarkTicketStateDirty(); }
 
         // 回撤达阈值 → 平仓离场
         if(g_TrPeakPoints[idx] - profitPoints >= Inp_TrendTrailStep)
@@ -1152,11 +1190,11 @@ void ManageTrendTrailingStop(ulong ticket)
         if(closeVol >= vmin && closeVol < vol)
         {
             if(g_trade.PositionClosePartial(ticket, closeVol))
-                { g_TrReduced[idx] = true; g_ArraysDirty = true; }
+                { g_TrReduced[idx] = true; MarkTicketStateDirty(); }
         }
         else
         {
-            g_TrReduced[idx] = true; g_ArraysDirty = true; // 无法再拆(手数太小),标记避免反复尝试
+            g_TrReduced[idx] = true; MarkTicketStateDirty(); // 无法再拆(手数太小),标记避免反复尝试
         }
     }
 }
@@ -1171,6 +1209,7 @@ void ManageAllTrailingStops()
         ulong tk = PositionGetTicket(i);
         if(tk == 0) continue;
         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        if(IsTicketRecoveryBlocked(tk)) continue;
         ENUM_SOP_ORDER kind = PosType();
 
         // 关键：已点"改趋势单"的剥头皮持仓 → 仍用剥头皮峰值追踪（而非趋势逻辑）
@@ -1544,8 +1583,8 @@ void CheckAllRiskControl()
 }
 
 // 连亏冷却期间,所有开仓一律禁止
-bool IsScalpAllowed() { return !g_ScalpBlocked && !g_TotalBlocked && !InCooldown(); }
-bool IsTrendAllowed() { return !g_TrendBlocked && !g_TotalBlocked && !InCooldown(); }
+bool IsScalpAllowed() { return g_InstanceOwnsState && !g_ScalpBlocked && !g_TotalBlocked && !InCooldown(); }
+bool IsTrendAllowed() { return g_InstanceOwnsState && !g_TrendBlocked && !g_TotalBlocked && !InCooldown(); }
 
 //+------------------------------------------------------------------+
 //| 周目标提示(仅建议,不自动改参数)                                 |
@@ -2098,6 +2137,15 @@ void CreateButton(string name, int x, int y, int w, int h, string text, color bg
     // 系统与持仓管理按钮统一采用语言按钮样式，完整/缩小布局共用。
     bool closeAction = name == "Btn_Close_All" || name == "Btn_Close_Scalp" ||
                        name == "Btn_Close_Trend" || name == "Btn_Close_Profit";
+    bool operationalAction = closeAction || name == "Btn_Reset_All" ||
+                             StringFind(name, "Btn_Sc_") == 0 || StringFind(name, "Btn_Tr_") == 0 ||
+                             StringFind(name, "Btn_SCDCancel_") == 0;
+    if(!g_InstanceOwnsState && operationalAction)
+    {
+        bg_color = COLOR_BTN_DISABLED_BG;
+        border_color = COLOR_BTN_DISABLED_BG;
+        text_clr = COLOR_BTN_DISABLED_TXT;
+    }
     bool systemAction = closeAction || name == "Btn_Stat_Open" ||
                         name == "Btn_Reset_All" || name == "Btn_Sc_QuickBE" ||
                         name == "Btn_Sc_ClearTP";
@@ -2917,6 +2965,10 @@ void RenderPerfectUI()
     // 大字号字体框底部留白更多，下移补偿以对齐可见字形底部。
     CreateLabelAnchor("Title", titleX, titleBottomY + Scale(2), "TradeEZ-SOP", COLOR_TEXT_HEADER, 13, true, ANCHOR_LEFT_LOWER);
     CreateLabelAnchor("Version", versionX, titleBottomY, "v1.03", COLOR_SIGNAL_PROFIT, 9, true, ANCHOR_LEFT_LOWER);
+    if(!g_InstanceOwnsState)
+        CreateLabelAnchor("ReadOnlyWarning", versionX + versionW + Scale(8), titleBottomY,
+                          Lang("实例冲突 · 只读", "INSTANCE CONFLICT · READ ONLY"),
+                          COLOR_SIGNAL_LOSS, 8, true, ANCHOR_LEFT_LOWER);
 
     int foldSize = Scale(44);
     int foldX    = StartX + displayWidth - Scale(14) - foldSize;
@@ -3367,89 +3419,232 @@ void RenderParamFooter(int y)
 //| 生命周期                                                          |
 //+------------------------------------------------------------------+
 //+------------------------------------------------------------------+
-//| 状态持久化(终端全局变量,跨切周期/重载存活)                       |
+//| 版本化状态命名空间与实例租约                                      |
 //+------------------------------------------------------------------+
-string PVKey(string k)
+string NormalizeNamespacePart(string value)
+{
+    string result = "";
+    for(int i = 0; i < StringLen(value); i++)
+    {
+        ushort c = (ushort)StringGetCharacter(value, i);
+        bool allowed = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                       (c >= 'a' && c <= 'z') || c == '-' || c == '_';
+        result += allowed ? StringSubstr(value, i, 1) : "_";
+    }
+    if(result == "") result = "default";
+    return result;
+}
+
+uint StableTextHash(string value)
+{
+    uint hash = 2166136261;
+    for(int i = 0; i < StringLen(value); i++)
+        hash = (hash ^ (uint)StringGetCharacter(value, i)) * 16777619;
+    return hash;
+}
+
+string StateNamespace()
+{
+    return IntegerToString(TICKET_STATE_SCHEMA) + "|" + AccountInfoString(ACCOUNT_SERVER) + "|" +
+           (string)AccountInfoInteger(ACCOUNT_LOGIN) + "|" + _Symbol + "|" +
+           NormalizeNamespacePart(Inp_InstanceId);
+}
+
+string StateNamespaceHash() { return (string)StableTextHash(StateNamespace()); }
+string ManagementScope()
+{
+    return AccountInfoString(ACCOUNT_SERVER) + "|" +
+           (string)AccountInfoInteger(ACCOUNT_LOGIN) + "|" + _Symbol + "|" +
+           (string)Inp_MagicScalp + "|" + (string)Inp_MagicTrend;
+}
+string ManagementScopeHash() { return (string)StableTextHash(ManagementScope()); }
+string InstanceLeaseOwnerKey() { return "GSOP2.L." + ManagementScopeHash() + ".O"; }
+string InstanceLeaseBeatKey()  { return "GSOP2.L." + ManagementScopeHash() + ".B"; }
+
+bool AcquireInstanceLease()
+{
+    double now = (double)TimeGMT();
+    if(!GlobalVariableCheck(InstanceLeaseOwnerKey()))
+        GlobalVariableSet(InstanceLeaseOwnerKey(), 0.0);
+    if(!GlobalVariableCheck(InstanceLeaseBeatKey()))
+        GlobalVariableSet(InstanceLeaseBeatKey(), 0.0);
+
+    double owner = GlobalVariableCheck(InstanceLeaseOwnerKey()) ? GlobalVariableGet(InstanceLeaseOwnerKey()) : 0.0;
+    double beat  = GlobalVariableCheck(InstanceLeaseBeatKey())  ? GlobalVariableGet(InstanceLeaseBeatKey())  : 0.0;
+    g_InstanceLeaseOwner = (double)ChartID();
+    if(owner != 0.0 && owner != g_InstanceLeaseOwner && now - beat < 30.0)
+        return false;
+
+    // CAS 抢占租约，防止两个图表在同一时刻都判断为空并同时成为管理者。
+    if(owner != g_InstanceLeaseOwner &&
+       !GlobalVariableSetOnCondition(InstanceLeaseOwnerKey(), g_InstanceLeaseOwner, owner))
+        return false;
+    GlobalVariableSet(InstanceLeaseBeatKey(), now);
+    GlobalVariablesFlush();
+    return true;
+}
+
+void RenewInstanceLease()
+{
+    if(!g_InstanceOwnsState) return;
+    if(!GlobalVariableCheck(InstanceLeaseOwnerKey()) ||
+       GlobalVariableGet(InstanceLeaseOwnerKey()) != g_InstanceLeaseOwner)
+    {
+        g_InstanceOwnsState = false;
+        Print("[State V2] 管理租约已丢失，停止持仓管理和状态写入: ", ManagementScope());
+        return;
+    }
+    GlobalVariableSet(InstanceLeaseBeatKey(), (double)TimeGMT());
+}
+
+void ReleaseInstanceLease()
+{
+    if(!g_InstanceOwnsState) return;
+    if(GlobalVariableCheck(InstanceLeaseOwnerKey()) &&
+       GlobalVariableGet(InstanceLeaseOwnerKey()) == g_InstanceLeaseOwner)
+    {
+        GlobalVariableDel(InstanceLeaseOwnerKey());
+        GlobalVariableDel(InstanceLeaseBeatKey());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 每日风控状态(终端全局变量，使用完整实例命名空间)                  |
+//+------------------------------------------------------------------+
+string PVKey(string k) { return "GSOP2.P." + StateNamespaceHash() + "." + k; }
+string LegacyPVKey(string k)
 {
     return StringFormat("GSOP_%I64d_%s", AccountInfoInteger(ACCOUNT_LOGIN), k);
 }
-void PVSet(string k, double v) { GlobalVariableSet(PVKey(k), v); }
-bool   PVHas(string k)         { return GlobalVariableCheck(PVKey(k)); }
-double PVGet(string k)         { return GlobalVariableGet(PVKey(k)); }
+void PVSet(string k, double v)
+{
+    if(g_InstanceOwnsState) GlobalVariableSet(PVKey(k), v);
+}
+bool   PVHas(string k) { return GlobalVariableCheck(PVKey(k)); }
+double PVGet(string k) { return GlobalVariableGet(PVKey(k)); }
 
-// 保存关键风控状态
 void SaveState()
 {
-    PVSet("StatDay",    (double)g_DayStart);       // 统计日戳,用于判断存档是否属于今天
+    if(!g_InstanceOwnsState) return;
+    PVSet("StatDay",    (double)g_DayStart);
     PVSet("ResetTime",  (double)g_ResetTime);
     PVSet("Cooldown",   (double)g_CooldownUntil);
     PVSet("ConsecLoss", (double)g_ConsecLoss);
     PVSet("LastDeal",   (double)g_LastDealTime);
-    // 注:g_InitBalance / g_PeakBalance 不持久化,每次 OnInit 按当前余额-今日已实现重算(自愈)
     PVSet("TodayHi",    g_TodayHighProfit);   PVSet("HiInit",   g_HighInit    ? 1 : 0);
     PVSet("ScalpHi",    g_ScalpHighProfit);   PVSet("ScHiInit", g_ScalpHiInit ? 1 : 0);
     PVSet("TrendHi",    g_TrendHighProfit);   PVSet("TrHiInit", g_TrendHiInit ? 1 : 0);
     PVSet("GlobalHi",   g_GlobalRealHigh);    PVSet("GbHiInit", g_GlobalHiInit? 1 : 0);
-    PVSet("MoatLiq",    g_MoatLiquidated ? 1 : 0);  // 护城河清盘锁定(当日,跨日不恢复)
+    PVSet("MoatLiq",    g_MoatLiquidated ? 1 : 0);
+    GlobalVariablesFlush();
 }
 
-// 尝试恢复存档;返回 true 表示存档有效(属于今天)并已载入
+bool LoadLegacyDailyState()
+{
+    if(NormalizeNamespacePart(Inp_InstanceId) != "primary") return false;
+    if(!GlobalVariableCheck(LegacyPVKey("StatDay"))) return false;
+    if((datetime)(long)GlobalVariableGet(LegacyPVKey("StatDay")) != g_DayStart) return false;
+
+    g_ResetTime       = (datetime)(long)GlobalVariableGet(LegacyPVKey("ResetTime"));
+    g_CooldownUntil   = (datetime)(long)GlobalVariableGet(LegacyPVKey("Cooldown"));
+    g_ConsecLoss      = (int)GlobalVariableGet(LegacyPVKey("ConsecLoss"));
+    g_LastDealTime    = (datetime)(long)GlobalVariableGet(LegacyPVKey("LastDeal"));
+    g_TodayHighProfit = GlobalVariableGet(LegacyPVKey("TodayHi"));
+    g_HighInit        = (GlobalVariableGet(LegacyPVKey("HiInit")) > 0.5);
+    g_ScalpHighProfit = GlobalVariableGet(LegacyPVKey("ScalpHi"));
+    g_ScalpHiInit     = (GlobalVariableGet(LegacyPVKey("ScHiInit")) > 0.5);
+    g_TrendHighProfit = GlobalVariableGet(LegacyPVKey("TrendHi"));
+    g_TrendHiInit     = (GlobalVariableGet(LegacyPVKey("TrHiInit")) > 0.5);
+    g_GlobalRealHigh  = GlobalVariableGet(LegacyPVKey("GlobalHi"));
+    g_GlobalHiInit    = (GlobalVariableGet(LegacyPVKey("GbHiInit")) > 0.5);
+    g_MoatLiquidated  = (GlobalVariableGet(LegacyPVKey("MoatLiq")) > 0.5);
+    SaveState();
+    Print("[State V2] 已迁移当前统计日的旧版全局状态");
+    return true;
+}
+
 bool LoadState()
 {
-    if(!PVHas("StatDay")) return false;
-    // 存档必须属于"当前统计日",否则视为过期(跨日后不恢复)
+    if(!PVHas("StatDay")) return LoadLegacyDailyState();
     if((datetime)(long)PVGet("StatDay") != g_DayStart) return false;
 
     g_ResetTime       = (datetime)(long)PVGet("ResetTime");
     g_CooldownUntil   = (datetime)(long)PVGet("Cooldown");
     g_ConsecLoss      = (int)PVGet("ConsecLoss");
     g_LastDealTime    = (datetime)(long)PVGet("LastDeal");
-    // g_InitBalance / g_PeakBalance 不从存档恢复,OnInit 里统一重算
     g_TodayHighProfit = PVGet("TodayHi");   g_HighInit    = (PVGet("HiInit")   > 0.5);
     g_ScalpHighProfit = PVGet("ScalpHi");   g_ScalpHiInit = (PVGet("ScHiInit") > 0.5);
     g_TrendHighProfit = PVGet("TrendHi");   g_TrendHiInit = (PVGet("TrHiInit") > 0.5);
     g_GlobalRealHigh  = PVGet("GlobalHi");  g_GlobalHiInit= (PVGet("GbHiInit") > 0.5);
-    g_MoatLiquidated  = (PVGet("MoatLiq") > 0.5);   // 恢复当日清盘锁定(重载后不误开)
+    g_MoatLiquidated  = (PVGet("MoatLiq") > 0.5);
     return true;
 }
 
 //+------------------------------------------------------------------+
-//| 数组类状态持久化(文件):超时取消名单 / 趋势追踪 / 提升名单        |
-//| 文件首行 = 统计日戳,跨日则视为过期不恢复                          |
+//| 逐票状态 V2：与统计日解耦、原子保存、身份校验                    |
 //+------------------------------------------------------------------+
-string StateFileName() { return StringFormat("GSOP_state_%I64d.csv", AccountInfoInteger(ACCOUNT_LOGIN)); }
-
-void SaveArrays()
+string StateFolder()
 {
-    int h = FileOpen(StateFileName(), FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
-    if(h == INVALID_HANDLE) return;
-    FileWrite(h, "DAY", (long)g_DayStart);
-    // 超时取消名单
-    for(int i = 0; i < ArraySize(g_TimeoutCancelled); i++)
-        FileWrite(h, "TOC", (long)g_TimeoutCancelled[i]);
-    // 快速移损提升名单
-    for(int i = 0; i < ArraySize(g_PromotedTickets); i++)
-        FileWrite(h, "PRO", (long)g_PromotedTickets[i]);
-    // 趋势追踪状态:ticket, 已减仓(0/1), 峰值点
-    for(int i = 0; i < ArraySize(g_TrTicket); i++)
-        FileWrite(h, "TRK", (long)g_TrTicket[i], g_TrReduced[i] ? 1 : 0, g_TrPeakPoints[i]);
-    // 剥头皮追踪状态:ticket, 峰值点
-    for(int i = 0; i < ArraySize(g_ScalpTrackTicket); i++)
-        FileWrite(h, "SCT", (long)g_ScalpTrackTicket[i], g_ScalpTrackPeak[i]);
-    FileClose(h);
+    return "TradeEZ\\state\\v" + IntegerToString(TICKET_STATE_SCHEMA);
 }
 
-void LoadArrays()
+string StateFileName()
 {
-    if(!FileIsExist(StateFileName())) return;
-    int h = FileOpen(StateFileName(), FILE_READ | FILE_CSV | FILE_ANSI, ',');
-    if(h == INVALID_HANDLE) return;
+    string serverHash = (string)StableTextHash(AccountInfoString(ACCOUNT_SERVER));
+    return StateFolder() + "\\" + serverHash + "_" +
+           (string)AccountInfoInteger(ACCOUNT_LOGIN) + "_" +
+           NormalizeNamespacePart(_Symbol) + "_" +
+           NormalizeNamespacePart(Inp_InstanceId) + ".csv";
+}
 
-    // 首行日戳校验
-    string tag0 = FileReadString(h);
-    long   day0 = (long)FileReadNumber(h);
-    if(tag0 != "DAY" || (datetime)day0 != g_DayStart) { FileClose(h); return; } // 过期存档
+string LegacyStateFileName()
+{
+    return StringFormat("GSOP_state_%I64d.csv", AccountInfoInteger(ACCOUNT_LOGIN));
+}
 
+void EnsureStateFolder()
+{
+    FolderCreate("TradeEZ");
+    FolderCreate("TradeEZ\\state");
+    FolderCreate(StateFolder());
+}
+
+int TicketStateIndex(ulong ticket)
+{
+    for(int i = 0; i < ArraySize(g_TicketState); i++)
+        if(g_TicketState[i].ticket == ticket) return i;
+    return -1;
+}
+
+bool IsTicketRecoveryBlocked(ulong ticket)
+{
+    for(int i = 0; i < ArraySize(g_StateRecoveryBlockedTickets); i++)
+        if(g_StateRecoveryBlockedTickets[i] == ticket) return true;
+    return false;
+}
+
+void BlockTicketStateRecovery(ulong ticket, string reason)
+{
+    if(ticket == 0 || IsTicketRecoveryBlocked(ticket)) return;
+    int n = ArraySize(g_StateRecoveryBlockedTickets);
+    ArrayResize(g_StateRecoveryBlockedTickets, n + 1);
+    g_StateRecoveryBlockedTickets[n] = ticket;
+    PrintFormat("[State V2] Ticket=%I64u 暂停自动管理：%s；等待恢复策略处理", ticket, reason);
+}
+
+int EnsureTicketStateRecord(ulong ticket)
+{
+    int idx = TicketStateIndex(ticket);
+    if(idx >= 0) return idx;
+    int n = ArraySize(g_TicketState);
+    ArrayResize(g_TicketState, n + 1);
+    g_TicketState[n].ticket = ticket;
+    g_TicketState[n].closed_utc = 0;
+    return n;
+}
+
+void ClearRuntimeTicketArrays()
+{
     ArrayResize(g_TimeoutCancelled, 0);
     ArrayResize(g_PromotedTickets, 0);
     ArrayResize(g_TrTicket, 0);
@@ -3457,47 +3652,324 @@ void LoadArrays()
     ArrayResize(g_TrPeakPoints, 0);
     ArrayResize(g_ScalpTrackTicket, 0);
     ArrayResize(g_ScalpTrackPeak, 0);
+}
+
+void AddRuntimeTicket(ulong &tickets[], ulong ticket)
+{
+    for(int i = 0; i < ArraySize(tickets); i++)
+        if(tickets[i] == ticket) return;
+    int n = ArraySize(tickets);
+    ArrayResize(tickets, n + 1);
+    tickets[n] = ticket;
+}
+
+bool ValidateTicketIdentity(const TicketStateRecord &record)
+{
+    if(!PositionSelectByTicket(record.ticket)) return false;
+    if(PositionGetString(POSITION_SYMBOL) != record.symbol || record.symbol != _Symbol) return false;
+    if((ulong)PositionGetInteger(POSITION_IDENTIFIER) != record.position_id) return false;
+    if(PositionGetInteger(POSITION_MAGIC) != record.magic) return false;
+    if((long)PositionGetInteger(POSITION_TIME_MSC) != record.open_time_msc) return false;
+    return true;
+}
+
+bool ValidateTicketStateValues(const TicketStateRecord &record)
+{
+    if(record.ticket == 0 || record.position_id == 0 || record.open_time_msc <= 0) return false;
+    if(record.management_mode < 1 || record.management_mode > 3) return false;
+    if(!MathIsValidNumber(record.scalp_peak_points) || record.scalp_peak_points < 0.0) return false;
+    if(!MathIsValidNumber(record.trend_peak_points) || record.trend_peak_points < 0.0) return false;
+    if(!MathIsValidNumber(record.last_volume) || record.last_volume < 0.0) return false;
+    return true;
+}
+
+void HydrateRuntimeFromRecord(const TicketStateRecord &record)
+{
+    if(record.timeout_cancelled) AddRuntimeTicket(g_TimeoutCancelled, record.ticket);
+    if(record.management_mode == 3) AddRuntimeTicket(g_PromotedTickets, record.ticket);
+
+    if(record.scalp_track_active)
+    {
+        int n = ArraySize(g_ScalpTrackTicket);
+        ArrayResize(g_ScalpTrackTicket, n + 1);
+        ArrayResize(g_ScalpTrackPeak, n + 1);
+        g_ScalpTrackTicket[n] = record.ticket;
+        g_ScalpTrackPeak[n] = MathMax(0.0, record.scalp_peak_points);
+    }
+
+    if(record.management_mode == 2 || record.trend_reduced || record.trend_peak_points > 0.0)
+    {
+        int n = ArraySize(g_TrTicket);
+        ArrayResize(g_TrTicket, n + 1);
+        ArrayResize(g_TrReduced, n + 1);
+        ArrayResize(g_TrPeakPoints, n + 1);
+        g_TrTicket[n] = record.ticket;
+        g_TrReduced[n] = record.trend_reduced;
+        g_TrPeakPoints[n] = MathMax(0.0, record.trend_peak_points);
+    }
+}
+
+void RefreshTicketStateRecords()
+{
+    datetime nowUtc = TimeGMT();
+
+    for(int i = 0; i < ArraySize(g_TicketState); i++)
+    {
+        if(g_TicketState[i].closed_utc != 0) continue;
+        if(!PositionSelectByTicket(g_TicketState[i].ticket) ||
+           PositionGetString(POSITION_SYMBOL) != _Symbol ||
+           (ulong)PositionGetInteger(POSITION_IDENTIFIER) != g_TicketState[i].position_id)
+        {
+            g_TicketState[i].closed_utc = nowUtc;
+            g_TicketState[i].updated_utc = nowUtc;
+        }
+    }
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        if(IsTicketRecoveryBlocked(ticket)) continue;
+        ENUM_SOP_ORDER kind = PosType();
+        if(kind == SOP_IGNORE && !IsPromoted(ticket)) continue;
+
+        int idx = EnsureTicketStateRecord(ticket);
+        g_TicketState[idx].ticket = ticket;
+        g_TicketState[idx].position_id = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
+        g_TicketState[idx].symbol = _Symbol;
+        g_TicketState[idx].magic = PositionGetInteger(POSITION_MAGIC);
+        g_TicketState[idx].open_time_msc = (long)PositionGetInteger(POSITION_TIME_MSC);
+        g_TicketState[idx].management_mode = IsPromoted(ticket) ? 3 : (int)kind;
+        g_TicketState[idx].timeout_cancelled = IsTimeoutCancelled(ticket);
+        int scIdx = ScalpTrackIndex(ticket);
+        g_TicketState[idx].scalp_track_active = (scIdx >= 0);
+        g_TicketState[idx].scalp_peak_points = (scIdx >= 0 ? g_ScalpTrackPeak[scIdx] : 0.0);
+        int trIdx = TrIndex(ticket);
+        g_TicketState[idx].trend_reduced = (trIdx >= 0 ? g_TrReduced[trIdx] : false);
+        g_TicketState[idx].trend_peak_points = (trIdx >= 0 ? g_TrPeakPoints[trIdx] : 0.0);
+        g_TicketState[idx].last_volume = PositionGetDouble(POSITION_VOLUME);
+        g_TicketState[idx].updated_utc = nowUtc;
+        g_TicketState[idx].closed_utc = 0;
+    }
+
+    const int retentionSeconds = 7 * 86400;
+    for(int i = ArraySize(g_TicketState) - 1; i >= 0; i--)
+    {
+        if(g_TicketState[i].closed_utc == 0 || nowUtc - g_TicketState[i].closed_utc <= retentionSeconds)
+            continue;
+        int last = ArraySize(g_TicketState) - 1;
+        g_TicketState[i] = g_TicketState[last];
+        ArrayResize(g_TicketState, last);
+    }
+}
+
+void SaveArrays()
+{
+    if(!g_InstanceOwnsState || g_StatePersistenceBlocked) return;
+    RefreshTicketStateRecords();
+    EnsureStateFolder();
+
+    string finalPath = StateFileName();
+    string tempPath = finalPath + ".tmp";
+    int h = FileOpen(tempPath, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+    if(h == INVALID_HANDLE)
+    {
+        PrintFormat("[State V2] 无法写入临时文件，错误=%d", GetLastError());
+        return;
+    }
+
+    FileWrite(h, "META", TICKET_STATE_SCHEMA, StateNamespace(), (long)TimeGMT(),
+              g_LegacyStateMigrated ? 1 : 0);
+    for(int i = 0; i < ArraySize(g_TicketState); i++)
+    {
+        TicketStateRecord r = g_TicketState[i];
+        FileWrite(h, "REC", (long)r.ticket, (long)r.position_id, r.symbol, r.magic,
+                  r.open_time_msc, r.management_mode, r.timeout_cancelled ? 1 : 0,
+                  r.scalp_track_active ? 1 : 0, r.scalp_peak_points,
+                  r.trend_reduced ? 1 : 0, r.trend_peak_points, r.last_volume,
+                  (long)r.updated_utc, (long)r.closed_utc);
+    }
+    FileFlush(h);
+    FileClose(h);
+
+    if(!FileMove(tempPath, 0, finalPath, FILE_REWRITE))
+    {
+        PrintFormat("[State V2] 原子替换失败，错误=%d", GetLastError());
+        FileDelete(tempPath);
+        return;
+    }
+    g_ArraysDirty = false;
+}
+
+bool LoadLegacyArrays()
+{
+    if(NormalizeNamespacePart(Inp_InstanceId) != "primary") return false;
+    if(!FileIsExist(LegacyStateFileName())) return false;
+    int h = FileOpen(LegacyStateFileName(), FILE_READ | FILE_CSV | FILE_ANSI, ',');
+    if(h == INVALID_HANDLE) return false;
+
+    string firstTag = FileReadString(h);
+    if(firstTag != "DAY") { FileClose(h); return false; }
+    FileReadNumber(h); // 旧统计日只作为来源信息，不再阻止仍在持仓的票据迁移。
+    int loaded = 0;
 
     while(!FileIsEnding(h))
     {
         string tag = FileReadString(h);
         if(tag == "") break;
+        ulong ticket = (ulong)FileReadNumber(h);
+        bool valid = PositionSelectByTicket(ticket) &&
+                     PositionGetString(POSITION_SYMBOL) == _Symbol &&
+                     PosType() != SOP_IGNORE;
+
         if(tag == "TOC")
         {
-            ulong tk = (ulong)FileReadNumber(h);
-            if(PositionSelectByTicket(tk)) { int n=ArraySize(g_TimeoutCancelled); ArrayResize(g_TimeoutCancelled,n+1); g_TimeoutCancelled[n]=tk; }
+            if(valid) { AddRuntimeTicket(g_TimeoutCancelled, ticket); loaded++; }
         }
         else if(tag == "PRO")
         {
-            ulong tk = (ulong)FileReadNumber(h);
-            if(PositionSelectByTicket(tk)) { int n=ArraySize(g_PromotedTickets); ArrayResize(g_PromotedTickets,n+1); g_PromotedTickets[n]=tk; }
+            if(valid) { AddRuntimeTicket(g_PromotedTickets, ticket); loaded++; }
         }
         else if(tag == "TRK")
         {
-            ulong  tk  = (ulong)FileReadNumber(h);
-            long   red = (long)FileReadNumber(h);
-            double pk  = FileReadNumber(h);
-            if(PositionSelectByTicket(tk))
+            long reduced = (long)FileReadNumber(h);
+            double peak = FileReadNumber(h);
+            if(valid)
             {
-                int n=ArraySize(g_TrTicket);
-                ArrayResize(g_TrTicket,n+1); ArrayResize(g_TrReduced,n+1); ArrayResize(g_TrPeakPoints,n+1);
-                g_TrTicket[n]=tk; g_TrReduced[n]=(red!=0); g_TrPeakPoints[n]=pk;
+                int n = ArraySize(g_TrTicket);
+                ArrayResize(g_TrTicket, n + 1);
+                ArrayResize(g_TrReduced, n + 1);
+                ArrayResize(g_TrPeakPoints, n + 1);
+                g_TrTicket[n] = ticket;
+                g_TrReduced[n] = (reduced != 0);
+                g_TrPeakPoints[n] = MathMax(0.0, peak);
+                loaded++;
             }
         }
         else if(tag == "SCT")
         {
-            ulong  tk = (ulong)FileReadNumber(h);
-            double pk = FileReadNumber(h);
-            if(PositionSelectByTicket(tk))
+            double peak = FileReadNumber(h);
+            if(valid)
             {
-                int n=ArraySize(g_ScalpTrackTicket);
-                ArrayResize(g_ScalpTrackTicket,n+1); ArrayResize(g_ScalpTrackPeak,n+1);
-                g_ScalpTrackTicket[n]=tk; g_ScalpTrackPeak[n]=pk;
+                int n = ArraySize(g_ScalpTrackTicket);
+                ArrayResize(g_ScalpTrackTicket, n + 1);
+                ArrayResize(g_ScalpTrackPeak, n + 1);
+                g_ScalpTrackTicket[n] = ticket;
+                g_ScalpTrackPeak[n] = MathMax(0.0, peak);
+                loaded++;
             }
         }
     }
     FileClose(h);
+    g_LegacyStateMigrated = true;
+    PrintFormat("[State V2] 旧版逐票状态迁移完成，有效记录=%d；旧文件已保留", loaded);
+    return true;
 }
+
+bool LoadTicketStateV2()
+{
+    if(!FileIsExist(StateFileName())) return false;
+    int h = FileOpen(StateFileName(), FILE_READ | FILE_CSV | FILE_ANSI, ',');
+    if(h == INVALID_HANDLE)
+    {
+        g_StatePersistenceBlocked = true;
+        PrintFormat("[State V2] 状态文件存在但无法读取；为保护原文件，本次运行禁止覆盖，错误=%d", GetLastError());
+        return true;
+    }
+
+    string meta = FileReadString(h);
+    int schema = (int)FileReadNumber(h);
+    string storedNamespace = FileReadString(h);
+    FileReadNumber(h); // saved_utc
+    g_LegacyStateMigrated = ((int)FileReadNumber(h) != 0);
+    if(meta != "META" || schema != TICKET_STATE_SCHEMA || storedNamespace != StateNamespace())
+    {
+        Print("[State V2] 文件头或命名空间不匹配，拒绝恢复: ", StateFileName());
+        FileClose(h);
+        g_StatePersistenceBlocked = true;
+        return true;
+    }
+
+    ArrayResize(g_TicketState, 0);
+    ClearRuntimeTicketArrays();
+    int restored = 0;
+    int rejected = 0;
+
+    while(!FileIsEnding(h))
+    {
+        string tag = FileReadString(h);
+        if(tag == "") break;
+        if(tag != "REC")
+        {
+            rejected++;
+            g_StatePersistenceBlocked = true;
+            Print("[State V2] 检测到无法识别的记录；为保护原文件，本次运行禁止覆盖: ", StateFileName());
+            break;
+        }
+
+        TicketStateRecord r;
+        r.ticket = (ulong)FileReadNumber(h);
+        r.position_id = (ulong)FileReadNumber(h);
+        r.symbol = FileReadString(h);
+        r.magic = (long)FileReadNumber(h);
+        r.open_time_msc = (long)FileReadNumber(h);
+        r.management_mode = (int)FileReadNumber(h);
+        r.timeout_cancelled = ((int)FileReadNumber(h) != 0);
+        r.scalp_track_active = ((int)FileReadNumber(h) != 0);
+        r.scalp_peak_points = FileReadNumber(h);
+        r.trend_reduced = ((int)FileReadNumber(h) != 0);
+        r.trend_peak_points = FileReadNumber(h);
+        r.last_volume = FileReadNumber(h);
+        r.updated_utc = (datetime)(long)FileReadNumber(h);
+        r.closed_utc = (datetime)(long)FileReadNumber(h);
+
+        int n = ArraySize(g_TicketState);
+        ArrayResize(g_TicketState, n + 1);
+        g_TicketState[n] = r;
+
+        if(r.closed_utc == 0)
+        {
+            if(ValidateTicketStateValues(r) && ValidateTicketIdentity(r))
+            {
+                HydrateRuntimeFromRecord(r);
+                restored++;
+            }
+            else
+            {
+                rejected++;
+                if(PositionSelectByTicket(r.ticket))
+                    BlockTicketStateRecovery(r.ticket, "状态字段无效或身份与当前持仓不匹配");
+                PrintFormat("[State V2] 拒绝恢复无效或身份不匹配记录 Ticket=%I64u", r.ticket);
+            }
+        }
+    }
+    FileClose(h);
+
+    // V2 文件理应覆盖所有在管持仓；缺失时不猜测历史阶段，暂停该票自动管理。
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        if(PosType() == SOP_IGNORE && !IsPromoted(ticket)) continue;
+        if(TicketStateIndex(ticket) < 0)
+        {
+            rejected++;
+            BlockTicketStateRecovery(ticket, "新版状态文件缺少该持仓记录");
+        }
+    }
+    PrintFormat("[State V2] 恢复完成，有效持仓=%d，拒绝=%d", restored, rejected);
+    return true;
+}
+
+void LoadArrays()
+{
+    if(LoadTicketStateV2()) return;
+    ClearRuntimeTicketArrays();
+    LoadLegacyArrays();
+    SaveArrays(); // 建立当前命名空间的 V2 文件；旧文件始终保留。
+}
+
+
 
 //+------------------------------------------------------------------+
 //| 发布无密钥实例清单，供独立 tradeEZSync EA 读取                    |
@@ -3584,7 +4056,7 @@ bool PublishInstanceManifest()
     string utcNow = IntegerToString((long)TimeGMT());
     string body = "{";
     body += "\"schema_version\":1,";
-    body += "\"instance_id\":\"" + (string)AccountInfoInteger(ACCOUNT_LOGIN) + "-" + (string)ChartID() + "\",";
+    body += "\"instance_id\":\"" + ManifestJsonEscape(NormalizeNamespacePart(Inp_InstanceId)) + "\",";
     body += "\"account_login\":" + (string)AccountInfoInteger(ACCOUNT_LOGIN) + ",";
     body += "\"server\":\"" + ManifestJsonEscape(AccountInfoString(ACCOUNT_SERVER)) + "\",";
     body += "\"symbol\":\"" + ManifestJsonEscape(_Symbol) + "\",";
@@ -3619,9 +4091,17 @@ int OnInit()
 {
     g_Language_ZH = Inp_DefaultChinese;
     g_DayStart    = TodayStart();
+    g_InstanceOwnsState = AcquireInstanceLease();
+
+    if(!g_InstanceOwnsState)
+    {
+        Print("[State V2] 检测到同账户/品种/Magic 的活动实例，本实例进入只读模式: ", ManagementScope());
+        Alert(Lang("检测到另一套相同配置的 TradeEZ-SOP 正在运行。\n本图表已进入只读模式，不会开仓、平仓或管理持仓。",
+                   "Another TradeEZ-SOP instance with the same account/symbol/magic is active.\nThis chart is read-only and will not trade or manage positions."));
+    }
 
     // 先尝试恢复今日存档(切周期/重载后保留连亏冷却等纪律状态)
-    if(!LoadState())
+    if(!g_InstanceOwnsState || !LoadState())
     {
         // 无有效存档 → 纪律状态全新初始化
         g_ResetTime    = TodayStart();
@@ -3639,7 +4119,8 @@ int OnInit()
     g_InitBalance = AccountInfoDouble(ACCOUNT_BALANCE) - AllRealizedPL();
     g_PeakBalance = MathMax(g_InitBalance, AccountInfoDouble(ACCOUNT_BALANCE));
 
-    LoadArrays();   // 恢复数组类状态(超时取消名单/趋势追踪/提升名单)
+    if(g_InstanceOwnsState)
+        LoadArrays();   // 恢复逐票状态(超时取消/趋势追踪/提升名单)，与统计日解耦
 
     if(MathAbs(Inp_ScalpDrawdownRatio + Inp_TrendDrawdownRatio - 100.0) > 0.01)
         Print("提示:剥头皮+趋势回撤占比之和不等于100%,请确认参数。");
@@ -3652,9 +4133,9 @@ int OnInit()
     ChartSetInteger(0, CHART_EVENT_OBJECT_DELETE, true);
     ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, true);
 
-    CheckAllRiskControl();
+    if(g_InstanceOwnsState) CheckAllRiskControl();
     RenderPerfectUI();
-    PublishInstanceManifest();
+    if(g_InstanceOwnsState) PublishInstanceManifest();
 
     EventSetTimer(MathMax(1, Inp_RefreshSeconds));
 
@@ -3664,12 +4145,23 @@ int OnInit()
 void OnDeinit(const int reason)
 {
     EventKillTimer();
+    if(g_InstanceOwnsState)
+    {
+        SaveArrays();
+        SaveState();
+        ReleaseInstanceLease();
+    }
     ObjectsDeleteAll(0, Prefix);
     ChartRedraw();
 }
 
 void OnTick()
 {
+    if(!g_InstanceOwnsState)
+    {
+        UpdateQuoteBar();
+        return;
+    }
     CheckDayRollover();
     ManageAllTrailingStops();
     CheckAllRiskControl();
@@ -3681,10 +4173,20 @@ void OnTick()
 void OnTimer()
 {
     static int manifestSeconds = 0;
-    CheckAllRiskControl();
+    RenewInstanceLease();
+    if(g_InstanceOwnsState)
+    {
+        CheckAllRiskControl();
+        g_StateCheckpointSeconds += MathMax(1, Inp_RefreshSeconds);
+        if(g_StateCheckpointSeconds >= 30)
+        {
+            g_StateCheckpointSeconds = 0;
+            SaveArrays();
+        }
+    }
     RenderPerfectUI();
     manifestSeconds += MathMax(1, Inp_RefreshSeconds);
-    if(manifestSeconds >= 60)
+    if(g_InstanceOwnsState && manifestSeconds >= 60)
     {
         manifestSeconds = 0;
         PublishInstanceManifest();
@@ -3693,8 +4195,10 @@ void OnTimer()
 
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
 {
-    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+    if(g_InstanceOwnsState &&
+       (trans.type == TRADE_TRANSACTION_DEAL_ADD || trans.type == TRADE_TRANSACTION_POSITION))
     {
+        SaveArrays(); // 新开仓、部分减仓或平仓后立即刷新逐票状态与剩余手数
         CheckAllRiskControl();
         RenderPerfectUI();
     }
@@ -3903,6 +4407,16 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
     if(sparam == Prefix + "Btn_Cab_Close")
     {
         g_ShowDetails = false;
+        RenderPerfectUI();
+        return;
+    }
+
+    // 同账户/品种/Magic 的第二实例只允许查看，禁止一切交易与状态变更。
+    if(!g_InstanceOwnsState)
+    {
+        ResetBtn(sparam);
+        Alert(Lang("当前图表处于只读模式。请先关闭另一套相同账户、品种和 Magic 配置的 TradeEZ-SOP，再进行交易操作。",
+                   "This chart is read-only. Close the other TradeEZ-SOP instance with the same account, symbol and magic settings before trading."));
         RenderPerfectUI();
         return;
     }
