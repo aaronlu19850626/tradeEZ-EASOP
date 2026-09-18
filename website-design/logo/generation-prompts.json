@@ -1,0 +1,26 @@
+{
+  "tool": "built-in image_gen",
+  "prompts": [
+    [
+      "avatar-blue",
+      "Use case: logo-brand. Reconstruct ONLY the BLUE square icon in the SMALL RED BOX at bottom left of the reference (the left of the two marked icons), as one standalone high resolution 2048x2048 PNG avatar. Match the original white geometric stylized EZ monogram exactly, blue/cyan accent, blue gradient rounded-square background. Square image, icon fills canvas, tiny transparent corner cutouts for its rounded corners, no surrounding white page, no padding, no shadow outside icon, no text, no annotations, no red border. Faithful restoration, not a new logo design."
+    ],
+    [
+      "avatar-navy",
+      "Use case: logo-brand. Reconstruct ONLY the DARK NAVY square icon in the SMALL RED BOX at bottom left of the reference (the right of the two marked icons), as one standalone high resolution 2048x2048 PNG avatar. Match the original white geometric stylized EZ monogram exactly with its subtle slate blue central accent and deep navy rounded-square background. Square image, icon fills canvas, tiny transparent corner cutouts for its rounded corners, no surrounding white page, no padding, no shadow outside icon, no text, no annotations, no red border. Faithful restoration, not a new logo design."
+    ],
+    [
+      "cover-mountain",
+      "Use case: ads-marketing. Faithfully reconstruct ONLY the top wide dark blue mountain COVER BANNER inside the large red box of the reference, as a standalone high resolution full bleed panoramic image, ideally 3840 pixels wide, original aspect ratio approximately 4.7:1. No surrounding page or red outlines or labels. Preserve exact layout: blue EZ icon on left beside large TradeEZ (Trade white, EZ blue), spaced TRADE EASY below, snow mountain on right, subtle luminous price line and chart grid. Exact bottom-left Chinese text: 让复盘更简单，让进步看得见。 Exact English beneath: THE MARKET IS HARD. YOUR REVIEW SHOULDN'T BE. Small upper-right stacked words: DISCIPLINE / DATA / INSIGHT / A BETTER YOU. Crisp perfect typography, faithful monogram, detailed realistic snowy peaks. Only this one banner; no collage."
+    ],
+    [
+      "cover-simple",
+      "Use case: ads-marketing. Faithfully reconstruct ONLY the bottom middle pale blue SIMPLE COVER BANNER within the large red box of the reference, as standalone high resolution full bleed panoramic banner, ideally 3840 pixels wide, original aspect ratio approximately 5.45:1. Keep original composition and typography. White to icy pale blue background, very subtle rising pale blue candlesticks on right. Left blue EZ icon beside TradeEZ (Trade navy, EZ blue) and spaced TRADE EASY below. Exact Chinese lower-left: 不预测市场，只复盘自己。 Exact English under it: FOCUS ON YOUR TRADES. BUILD A BETTER YOU. Upper right four subtle outlined pills reading 记录, 数据, 纪律, AI复盘. Sharp faithful original logo and typography. No red border, no page margins, no descriptive heading, no collage. Only this one banner."
+    ],
+    [
+      "cover-mobile",
+      "Use case: ads-marketing. Faithfully reconstruct ONLY the SMALL LOWER RIGHT light blue mountain banner in the large red box of the reference as one standalone high resolution image, 2560x1600 landscape matching the visible artwork's approximately 1.6:1 shape. Preserve the actual artwork shape despite the page caption saying mobile. Icy pale blue sky, snowy mountain range across bottom with tall peak on right. Near top centered blue EZ icon and TradeEZ (Trade navy, EZ bright blue), spaced TRADE EASY beneath brand. Centered navy Chinese in TWO lines exactly: 不预测市场 / 只复盘自己 . Short blue horizontal rule beneath slogan. Maintain original style, crisp typography, exact logo structure, detailed mountains. Full bleed image, no page, no red border, no labels outside artwork, no collage."
+    ]
+  ],
+  "avatar_finishing": "Extend matching opaque blue background into all four corners; preserve symbol."
+}
