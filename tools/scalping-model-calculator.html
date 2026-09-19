@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>黄金区间剥头皮模型计算器</title>
+  <style>
+    :root {
+      --bg: #07111f;
+      --panel: rgba(15, 29, 48, .92);
+      --panel-2: #101f34;
+      --line: #243b59;
+      --text: #edf4ff;
+      --muted: #91a6c1;
+      --cyan: #43d9d3;
+      --blue: #4da3ff;
+      --amber: #ffbf69;
+      --red: #ff6b78;
+      --green: #55d58b;
+      --shadow: 0 22px 70px rgba(0, 0, 0, .34);
+    }
+
+    * { box-sizing: border-box; }
+    html { color-scheme: dark; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 12% -10%, rgba(77, 163, 255, .18), transparent 32rem),
+        radial-gradient(circle at 92% 8%, rgba(67, 217, 211, .10), transparent 28rem),
+        var(--bg);
+      color: var(--text);
+      font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+
+    button, input, select { font: inherit; }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 28px; }
+    .topbar {
+      display: flex; align-items: flex-start; justify-content: space-between;
+      gap: 24px; margin-bottom: 22px;
+    }
+    .eyebrow { color: var(--cyan); font-size: 12px; letter-spacing: .16em; text-transform: uppercase; }
+    h1 { margin: 7px 0 8px; font-size: clamp(26px, 3vw, 42px); letter-spacing: -.04em; }
+    .subtitle { color: var(--muted); max-width: 780px; line-height: 1.65; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; }
+    button {
+      border: 1px solid var(--line); border-radius: 10px; padding: 10px 15px;
+      color: var(--text); background: #12243a; cursor: pointer;
+    }
+    button:hover { border-color: var(--blue); transform: translateY(-1px); }
+    button.primary { background: linear-gradient(135deg, #1677ff, #14aaa5); border-color: transparent; }
+
+    .notice {
+      display: grid; grid-template-columns: auto 1fr; gap: 12px; align-items: start;
+      padding: 14px 16px; border: 1px solid rgba(255, 191, 105, .35);
+      border-radius: 12px; background: rgba(255, 191, 105, .07); color: #ffe0b2;
+      margin-bottom: 18px; line-height: 1.55;
+    }
+    .notice strong { color: var(--amber); }
+
+    .workspace { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 18px; }
+    .panel {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+      box-shadow: var(--shadow); overflow: hidden;
+    }
+    .panel-head { padding: 18px 20px 14px; border-bottom: 1px solid var(--line); }
+    .panel-head h2 { margin: 0 0 5px; font-size: 18px; }
+    .panel-head p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .panel-body { padding: 18px 20px; }
+
+    .form-section + .form-section { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line); }
+    .form-title { margin-bottom: 12px; color: #cce0f7; font-size: 13px; font-weight: 700; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .field.wide { grid-column: 1 / -1; }
+    label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 12px; }
+    input, select {
+      width: 100%; border: 1px solid #2b4566; border-radius: 9px; padding: 10px 11px;
+      background: #091728; color: var(--text); outline: none;
+    }
+    input:focus, select:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(67,217,211,.10); }
+    .unit { color: #68809f; font-size: 11px; margin-top: 5px; }
+
+    .content { display: grid; gap: 18px; min-width: 0; }
+    .kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .kpi { padding: 16px; border: 1px solid var(--line); border-radius: 13px; background: var(--panel-2); }
+    .kpi .label { color: var(--muted); font-size: 12px; }
+    .kpi .value { margin-top: 7px; font-size: 23px; font-weight: 750; letter-spacing: -.02em; }
+    .kpi .hint { margin-top: 5px; color: #6f88a8; font-size: 11px; }
+
+    .range-card { padding: 20px; }
+    .range-title { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+    .range-title h2 { margin: 0; font-size: 18px; }
+    .range-title span { color: var(--muted); font-size: 12px; }
+    .track-wrap { padding: 32px 5px 10px; }
+    .track { position: relative; height: 74px; display: flex; overflow: visible; border-radius: 12px; border: 1px solid #35516f; }
+    .zone { display: flex; align-items: center; justify-content: center; padding: 4px; text-align: center; color: #dcecff; font-size: 11px; line-height: 1.3; }
+    .zone.danger { background: rgba(255,107,120,.18); }
+    .zone.observe { background: rgba(255,191,105,.12); }
+    .zone.core { background: rgba(67,217,211,.19); }
+    .marker { position: absolute; top: -25px; transform: translateX(-50%); color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .marker::after { content: ""; position: absolute; top: 18px; left: 50%; height: 82px; border-left: 1px dashed rgba(196,219,246,.32); }
+    .marker.center { color: var(--cyan); font-weight: 700; }
+
+    .tabs { display: flex; gap: 8px; padding: 12px 12px 0; }
+    .tab { background: transparent; color: var(--muted); }
+    .tab.active { background: #16304c; border-color: var(--blue); color: var(--text); }
+    .tab-content { display: none; padding: 18px 20px 20px; }
+    .tab-content.active { display: block; }
+    .model-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .model-card { border: 1px solid var(--line); border-radius: 13px; padding: 16px; background: #0b192a; }
+    .model-card h3 { margin: 0 0 12px; font-size: 15px; }
+    .row { display: flex; justify-content: space-between; gap: 16px; padding: 8px 0; border-bottom: 1px dashed rgba(77,104,137,.35); }
+    .row:last-child { border-bottom: 0; }
+    .row span:first-child { color: var(--muted); }
+    .row strong { text-align: right; font-weight: 650; }
+    .good { color: var(--green); }
+    .warn { color: var(--amber); }
+    .bad { color: var(--red); }
+
+    .strategy-output {
+      margin: 0; padding: 18px; border: 1px solid #2a4768; border-radius: 12px;
+      background: #071522; color: #d8e7fa; white-space: pre-wrap; line-height: 1.72;
+      font-family: "Cascadia Code", Consolas, monospace; font-size: 12px;
+    }
+    .warning-list { display: grid; gap: 9px; margin-bottom: 14px; }
+    .warning-item { padding: 10px 12px; border-radius: 9px; background: rgba(255,191,105,.08); color: #ffd99f; font-size: 12px; line-height: 1.5; }
+    .warning-item.error { background: rgba(255,107,120,.09); color: #ffb4bc; }
+    .empty { color: var(--muted); font-size: 13px; }
+    .footnote { color: #7187a4; font-size: 11px; line-height: 1.6; margin-top: 14px; }
+    .diagram {
+      margin-bottom: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 13px;
+      background: linear-gradient(180deg, rgba(18,38,62,.72), rgba(7,21,34,.92)); overflow-x: auto;
+    }
+    .diagram h3 { margin: 0 0 4px; font-size: 15px; }
+    .diagram p { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+    .diagram svg { display: block; width: 100%; min-width: 700px; height: auto; }
+    .diagram .axis { stroke: #6683a5; stroke-width: 2; }
+    .diagram .guide { stroke: #59718d; stroke-width: 1; stroke-dasharray: 5 5; }
+    .diagram .price { fill: #bcd0e8; font-size: 13px; }
+    .diagram .caption { fill: #8299b5; font-size: 12px; }
+    .diagram .signal { fill: #eef6ff; font-size: 13px; font-weight: 700; }
+    .diagram .buy-arrow { stroke: var(--green); stroke-width: 5; fill: none; }
+    .diagram .sell-arrow { stroke: var(--red); stroke-width: 5; fill: none; }
+    .diagram .revert-arrow { stroke: var(--amber); stroke-width: 5; fill: none; }
+
+    @media (max-width: 1050px) {
+      .workspace { grid-template-columns: 1fr; }
+      .kpis { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 650px) {
+      .shell { padding: 16px; }
+      .topbar { display: block; }
+      .actions { justify-content: flex-start; margin-top: 15px; }
+      .form-grid, .model-grid, .kpis { grid-template-columns: 1fr; }
+      .track-wrap { overflow-x: auto; }
+      .track { min-width: 660px; }
+    }
+    @media print {
+      body { background: #fff; color: #111; }
+      .shell { max-width: none; padding: 0; }
+      .actions, .tabs, .notice { display: none; }
+      .workspace { display: block; }
+      .panel { box-shadow: none; border-color: #bbb; break-inside: avoid; margin-bottom: 14px; }
+      .panel, .kpi, .model-card, .strategy-output { background: #fff; color: #111; }
+      .tab-content { display: block !important; }
+      input, select { border: 0; color: #111; background: #fff; padding: 0; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">TradeEZ / XAUUSD execution lab</div>
+        <h1>黄金区间剥头皮模型计算器</h1>
+        <div class="subtitle">人工定义区间，比较中枢动量与边缘回归两种模型。所有价位、金额风险和最终执行规则随参数即时更新，可直接作为EA开发规格的参数草案。</div>
+      </div>
+      <div class="actions">
+        <button id="resetBtn">恢复推荐参数</button>
+        <button id="copyBtn">复制执行策略</button>
+        <button class="primary" onclick="window.print()">打印 / 保存PDF</button>
+      </div>
+    </header>
+
+    <div class="notice">
+      <strong>口径</strong>
+      <div>买入按 Ask 成交、按 Bid 平仓；卖出按 Bid 成交、按 Ask 平仓。价格止盈/止损以实际可平仓报价计算，因此点差已进入成交路径，手续费和额外滑点另行扣除。</div>
+    </div>
+
+    <div class="workspace">
+      <aside class="panel">
+        <div class="panel-head">
+          <h2>输入参数</h2>
+          <p>只填写5项。其余策略参数由模型自动推导。</p>
+        </div>
+        <div class="panel-body">
+          <section class="form-section">
+            <div class="form-title">区间</div>
+            <div class="form-grid">
+              <div class="field wide"><label for="anchor">中心点位</label><input id="anchor" type="number" step="0.01" value="4320.50"><div class="unit">例如 4320.50</div></div>
+              <div class="field wide"><label for="distance">上下距离</label><input id="distance" type="number" step="0.10" value="2.00"><div class="unit">上下各2美元时，总区间宽度为4美元</div></div>
+              <div class="field wide"><label for="spread">当前/基准点差</label><input id="spread" type="number" step="0.01" value="0.15"><div class="unit">15点且1点=0.01时填写0.15</div></div>
+            </div>
+          </section>
+
+          <section class="form-section">
+            <div class="form-title">仓位与总风险</div>
+            <div class="form-grid">
+              <div class="field wide"><label for="lots">每笔下单手数</label><input id="lots" type="number" step="0.01" value="0.40"></div>
+              <div class="field wide"><label for="maxLoss">区间最大可承受总亏损</label><input id="maxLoss" type="number" step="10" value="100"><div class="unit">达到后撤单、全平并锁死本区间</div></div>
+            </div>
+          </section>
+
+          <section class="form-section">
+            <div class="form-title">自动计算口径</div>
+            <div class="warning-item">标准点固定为0.01。金额示例按黄金每手100盎司估算；EA开发时改用服务商合约规格和 <code>OrderCalcProfit()</code>。</div>
+          </section>
+        </div>
+      </aside>
+
+      <section class="content">
+        <div class="kpis">
+          <div class="kpi"><div class="label">区间宽度</div><div class="value" id="kpiWidth">—</div><div class="hint" id="kpiWidthPoints">—</div></div>
+          <div class="kpi"><div class="label">单笔止盈估算</div><div class="value good" id="kpiProfit">—</div><div class="hint">按每手100盎司；点差已进入成交报价</div></div>
+          <div class="kpi"><div class="label">单笔止损估算</div><div class="value bad" id="kpiLoss">—</div><div class="hint">未计手续费与异常跳价</div></div>
+          <div class="kpi"><div class="label">价格距离保本胜率</div><div class="value" id="kpiBE">—</div><div class="hint">EA以账户实际净盈亏为准</div></div>
+          <div class="kpi"><div class="label">区间总亏损熔断</div><div class="value bad" id="kpiMaxLoss">—</div><div class="hint" id="kpiLossCapacity">达到后撤单、全平并锁死</div></div>
+        </div>
+
+        <div class="panel range-card">
+          <div class="range-title"><h2>自动区间结构</h2><span id="rangeCaption">—</span></div>
+          <div class="track-wrap"><div class="track" id="rangeTrack"></div></div>
+        </div>
+
+        <div class="panel">
+          <div class="tabs">
+            <button class="tab active" data-tab="compare">模型对比</button>
+            <button class="tab" data-tab="center">中枢模型</button>
+            <button class="tab" data-tab="edge">边缘模型</button>
+            <button class="tab" data-tab="strategy">最终执行策略</button>
+          </div>
+
+          <div id="compare" class="tab-content active">
+            <div id="warnings" class="warning-list"></div>
+            <div class="model-grid">
+              <div class="model-card">
+                <h3>中枢动量模型</h3>
+                <div class="row"><span>定位</span><strong>中部确认方向后顺势</strong></div>
+                <div class="row"><span>交易频率</span><strong class="good">较高</strong></div>
+                <div class="row"><span>主要风险</span><strong>假启动与来回扫损</strong></div>
+                <div class="row"><span>推荐用途</span><strong>冷清但仍有短促摆动</strong></div>
+                <div class="row"><span>入场规则</span><strong id="centerSummary">—</strong></div>
+              </div>
+              <div class="model-card">
+                <h3>边缘回归模型</h3>
+                <div class="row"><span>定位</span><strong>边缘确认反转后逆向</strong></div>
+                <div class="row"><span>交易频率</span><strong>较低</strong></div>
+                <div class="row"><span>主要风险</span><strong class="bad">边界突破时逆势</strong></div>
+                <div class="row"><span>推荐用途</span><strong>边界多次被验证且无加速</strong></div>
+                <div class="row"><span>入场规则</span><strong id="edgeSummary">—</strong></div>
+              </div>
+            </div>
+            <p class="footnote">模型选择不是收益保证。中枢模型不能同时市价持有等量多空；应使用方向确认或OCO，一边成交后取消另一边。边缘模型禁止马丁和亏损加仓。</p>
+          </div>
+
+          <div id="center" class="tab-content">
+            <div class="diagram">
+              <h3>中枢模型图示</h3>
+              <p>访问核心区后，沿短期动量方向向外触发；进入边缘禁入区前完成交易。</p>
+              <div id="centerDiagram"></div>
+            </div>
+            <div class="model-grid">
+              <div class="model-card"><h3>做多示例</h3><div id="centerBuy"></div></div>
+              <div class="model-card"><h3>做空示例</h3><div id="centerSell"></div></div>
+            </div>
+          </div>
+
+          <div id="edge" class="tab-content">
+            <div class="diagram">
+              <h3>边缘模型图示</h3>
+              <p>价格先进入边缘候选带，确认反转后向中轴方向交易；触碰真正边界直接失效。</p>
+              <div id="edgeDiagram"></div>
+            </div>
+            <div class="model-grid">
+              <div class="model-card"><h3>下边缘做多</h3><div id="edgeBuy"></div></div>
+              <div class="model-card"><h3>上边缘做空</h3><div id="edgeSell"></div></div>
+            </div>
+          </div>
+
+          <div id="strategy" class="tab-content">
+            <pre id="strategyText" class="strategy-output"></pre>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const ids = ["anchor","distance","spread","lots","maxLoss"];
+    const defaults = Object.fromEntries(ids.map(id => [id, document.getElementById(id).value]));
+    const $ = id => document.getElementById(id);
+    const n = id => Number($(id).value);
+    const f = (v, d = 2) => Number.isFinite(v) ? v.toFixed(d) : "—";
+    const money = v => Number.isFinite(v) ? `${v >= 0 ? "+" : "−"}$${Math.abs(v).toFixed(2)}` : "—";
+    const pct = v => Number.isFinite(v) ? `${(v * 100).toFixed(1)}%` : "—";
+    const row = (label, value, cls = "") => `<div class="row"><span>${label}</span><strong class="${cls}">${value}</strong></div>`;
+
+    function calculate() {
+      const M=n("anchor"), distance=n("distance"), spread=n("spread"), lots=n("lots"), maxLoss=n("maxLoss");
+      const L=M-distance, U=M+distance, W=2*distance;
+      const point=.01, contract=100, exposure=lots*contract;
+      const corePct=.05, triggerPct=.125, edgePct=.20;
+      const maxSpread=Math.max(spread*1.35,spread+.05);
+      const triggerDistance=Math.max(W*triggerPct,spread*1.5);
+      const roomToBoundary=Math.max(0,W/2-triggerDistance-spread);
+      const tp=Math.min(Math.max(4*spread,.225*W),roomToBoundary);
+      const sl=Math.min(Math.max(2*spread,.1625*W),.20*W);
+      const serverSL=sl+Math.max(spread,.075*W);
+      const beTrigger=.67*tp, beLock=Math.min(.10,Math.max(.05,.11*tp));
+      const maxHold=Math.round(60+7.5*W);
+      const confirm=Math.max(spread,.0375*W);
+      const commissionCash=0, slippageCash=0;
+      const winCash=tp*exposure;
+      const lossCash=sl*exposure;
+      const breakeven=lossCash/(winCash+lossCash);
+
+      const coreLo=M-W*corePct, coreHi=M+W*corePct;
+      const sellTrigger=M-triggerDistance, buyTrigger=M+triggerDistance;
+      const lowerNoEntry=L+W*edgePct, upperNoEntry=U-W*edgePct;
+      const edgeBuffer=Math.max(2*spread, .10*W);
+      const edgeMax=Math.min(.20*W, .75*tp);
+      const edgeLongLo=L+edgeBuffer, edgeLongHi=L+edgeMax;
+      const edgeShortLo=U-edgeMax, edgeShortHi=U-edgeBuffer;
+      const edgeValid=edgeBuffer<edgeMax;
+
+      $("kpiWidth").textContent=`${f(W)} 美元`;
+      $("kpiWidthPoints").textContent=`上下各 ${f(distance)} / ${Math.round(W/point)} 个标准点`;
+      $("kpiProfit").textContent=money(winCash);
+      $("kpiLoss").textContent=money(-lossCash);
+      $("kpiBE").textContent=pct(breakeven);
+      $("kpiMaxLoss").textContent=money(-maxLoss);
+      $("kpiLossCapacity").textContent=lossCash>0?`约 ${Math.floor(maxLoss/lossCash)} 次标准逻辑止损`:`风险参数无效`;
+      $("rangeCaption").textContent=`L ${f(L)} / M ${f(M)} / U ${f(U)}`;
+
+      renderTrack({L,U,M,W,lowerNoEntry,upperNoEntry,coreLo,coreHi,buyTrigger,sellTrigger});
+      renderCenterDiagram({L,U,M,W,lowerNoEntry,upperNoEntry,coreLo,coreHi,buyTrigger,sellTrigger,tp});
+      renderEdgeDiagram({L,U,M,W,edgeValid,edgeLongLo,edgeLongHi,edgeShortLo,edgeShortHi,confirm});
+
+      $("centerSummary").textContent=`Ask ≥ ${f(buyTrigger)} 做多；Bid ≤ ${f(sellTrigger)} 做空`;
+      $("edgeSummary").textContent=edgeValid?`距边界 ${f(edgeBuffer)}～${f(edgeMax)} 内确认反转`:`当前成本下无有效边缘入场带`;
+
+      const centerBuyEntry=buyTrigger;
+      const centerSellEntry=sellTrigger;
+      $("centerBuy").innerHTML=[
+        row("触发",`Ask ≥ ${f(buyTrigger)}`),
+        row("逻辑止损",`Bid ≤ ${f(centerBuyEntry-sl)}`),
+        row("服务器保护",f(centerBuyEntry-serverSL)),
+        row("保本启动",`Bid ≥ ${f(centerBuyEntry+beTrigger)}`),
+        row("保本锁定",f(centerBuyEntry+beLock)),
+        row("止盈",`Bid ≥ ${f(centerBuyEntry+tp)}`),
+        row("目标净收益",money(winCash),winCash>0?"good":"bad")
+      ].join("");
+      $("centerSell").innerHTML=[
+        row("触发",`Bid ≤ ${f(sellTrigger)}`),
+        row("逻辑止损",`Ask ≥ ${f(centerSellEntry+sl)}`),
+        row("服务器保护",f(centerSellEntry+serverSL)),
+        row("保本启动",`Ask ≤ ${f(centerSellEntry-beTrigger)}`),
+        row("保本锁定",f(centerSellEntry-beLock)),
+        row("止盈",`Ask ≤ ${f(centerSellEntry-tp)}`),
+        row("目标净收益",money(winCash),winCash>0?"good":"bad")
+      ].join("");
+
+      const edgeLongEntry=(edgeLongLo+edgeLongHi)/2;
+      const edgeShortEntry=(edgeShortLo+edgeShortHi)/2;
+      const edgeLongRisk=edgeLongEntry-L;
+      const edgeShortRisk=U-edgeShortEntry;
+      const edgeLoss=((edgeLongRisk+edgeShortRisk)/2)*exposure+commissionCash+slippageCash;
+      const edgeBE=edgeLoss/(winCash+edgeLoss);
+      $("edgeBuy").innerHTML=edgeValid?[
+        row("候选带",`${f(edgeLongLo)}～${f(edgeLongHi)}`),
+        row("确认",`局部低点反弹 ${f(confirm)}`),
+        row("示例成交",f(edgeLongEntry)),
+        row("结构止损",`Bid ≤ ${f(L)}`),
+        row("止盈",`Bid ≥ ${f(edgeLongEntry+tp)}`),
+        row("价格距离保本胜率",pct(edgeBE),edgeBE<.55?"good":"warn")
+      ].join(""):row("状态","成本过高，边缘入场带消失","bad");
+      $("edgeSell").innerHTML=edgeValid?[
+        row("候选带",`${f(edgeShortLo)}～${f(edgeShortHi)}`),
+        row("确认",`局部高点回落 ${f(confirm)}`),
+        row("示例成交",f(edgeShortEntry)),
+        row("结构止损",`Ask ≥ ${f(U)}`),
+        row("止盈",`Ask ≤ ${f(edgeShortEntry-tp)}`),
+        row("价格距离保本胜率",pct(edgeBE),edgeBE<.55?"good":"warn")
+      ].join(""):row("状态","成本过高，边缘入场带消失","bad");
+
+      const warnings=[];
+      if (!(distance>0)) warnings.push(["error","上下距离必须大于0。"]);
+      if (!(lots>0)) warnings.push(["error","下单手数必须大于0。"]);
+      if (!(maxLoss>0)) warnings.push(["error","最大可承受总亏损必须大于0。"]);
+      if (!(spread>0)) warnings.push(["error","点差必须大于0。"]);
+      if (!(tp>0)) warnings.push(["error","当前区间扣除触发距离和点差后没有可用止盈空间。"]);
+      if (spread>maxSpread) warnings.push(["error",`中位点差 ${f(spread)} 已超过最大入场点差 ${f(maxSpread)}，应暂停开新仓。`]);
+      if (tp<3*spread) warnings.push(["error",`止盈只有点差的 ${f(tp/spread,1)} 倍，交易成本占比过高。`]);
+      if (buyTrigger+tp>U) warnings.push(["error","中枢多单目标越过上边界，必须缩小止盈或把触发线向中轴移动。"]);
+      if (sellTrigger-tp<L) warnings.push(["error","中枢空单目标越过下边界，必须缩小止盈或把触发线向中轴移动。"]);
+      if (beLock>=beTrigger) warnings.push(["error","保本锁定必须小于保本启动距离。"]);
+      if (serverSL<sl) warnings.push(["error","服务器灾难止损不能比逻辑止损更近。"]);
+      if (!edgeValid) warnings.push(["error","两倍点差缓冲已经挤占边缘交易带，边缘模型应禁用。"]);
+      if (lossCash>maxLoss) warnings.push(["error",`单笔逻辑止损估算 $${f(lossCash)} 已超过总亏损预算 $${f(maxLoss)}，当前手数不可启用。`]);
+      $("warnings").innerHTML=warnings.length?warnings.map(x=>`<div class="warning-item ${x[0]}">${x[1]}</div>`).join(""):`<div class="empty">参数检查未发现结构性冲突。</div>`;
+
+      const strategy = buildStrategy({L,U,M,W,distance,spread,maxSpread,coreLo,coreHi,buyTrigger,sellTrigger,lowerNoEntry,upperNoEntry,tp,sl,serverSL,maxHold,beTrigger,beLock,edgeValid,edgeLongLo,edgeLongHi,edgeShortLo,edgeShortHi,confirm,lots,contract,winCash,lossCash,breakeven,maxLoss,lossCapacity:lossCash>0?Math.floor(maxLoss/lossCash):0});
+      $("strategyText").textContent=strategy;
+      localStorage.setItem("tradeez-scalp-model",JSON.stringify(Object.fromEntries(ids.map(id=>[id,$(id).value]))));
+    }
+
+    function renderTrack(v) {
+      if (!(v.W>0)) { $("rangeTrack").innerHTML=""; return; }
+      const P=x=>Math.max(0,Math.min(100,(x-v.L)/v.W*100));
+      const zones=[
+        [v.L,v.lowerNoEntry,"下边缘禁入","danger"],
+        [v.lowerNoEntry,v.coreLo,"下方观察","observe"],
+        [v.coreLo,v.coreHi,"中轴核心","core"],
+        [v.coreHi,v.upperNoEntry,"上方观察","observe"],
+        [v.upperNoEntry,v.U,"上边缘禁入","danger"]
+      ];
+      let html=zones.map(z=>`<div class="zone ${z[3]}" style="width:${P(z[1])-P(z[0])}%">${z[2]}</div>`).join("");
+      [[v.L,"L "+f(v.L)],[v.sellTrigger,"空触发 "+f(v.sellTrigger)],[v.M,"M "+f(v.M)],[v.buyTrigger,"多触发 "+f(v.buyTrigger)],[v.U,"U "+f(v.U)]].forEach((m,i)=>{
+        html+=`<div class="marker ${i===2?"center":""}" style="left:${P(m[0])}%">${m[1]}</div>`;
+      });
+      $("rangeTrack").innerHTML=html;
+    }
+
+    function renderCenterDiagram(v) {
+      if (!(v.W>0)) { $("centerDiagram").innerHTML=""; return; }
+      const x=p=>70+860*Math.max(0,Math.min(1,(p-v.L)/v.W));
+      const buyTarget=Math.min(v.U,v.buyTrigger+v.tp);
+      const sellTarget=Math.max(v.L,v.sellTrigger-v.tp);
+      $("centerDiagram").innerHTML=`
+        <svg viewBox="0 0 1000 205" role="img" aria-label="中枢动量模型价格路径图">
+          <defs>
+            <marker id="centerBuyHead" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55d58b"/></marker>
+            <marker id="centerSellHead" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#ff6b78"/></marker>
+          </defs>
+          <rect x="70" y="62" width="${x(v.lowerNoEntry)-70}" height="54" rx="8" fill="rgba(255,107,120,.20)"/>
+          <rect x="${x(v.lowerNoEntry)}" y="62" width="${x(v.upperNoEntry)-x(v.lowerNoEntry)}" height="54" fill="rgba(77,163,255,.08)"/>
+          <rect x="${x(v.coreLo)}" y="53" width="${x(v.coreHi)-x(v.coreLo)}" height="72" rx="7" fill="rgba(67,217,211,.24)" stroke="#43d9d3"/>
+          <rect x="${x(v.upperNoEntry)}" y="62" width="${930-x(v.upperNoEntry)}" height="54" rx="8" fill="rgba(255,107,120,.20)"/>
+          <line x1="70" y1="89" x2="930" y2="89" class="axis"/>
+          ${[v.L,v.sellTrigger,v.M,v.buyTrigger,v.U].map(p=>`<line x1="${x(p)}" y1="42" x2="${x(p)}" y2="135" class="guide"/>`).join("")}
+          <path d="M ${x(v.M)} 78 L ${x(buyTarget)} 78" class="buy-arrow" marker-end="url(#centerBuyHead)"/>
+          <path d="M ${x(v.M)} 101 L ${x(sellTarget)} 101" class="sell-arrow" marker-end="url(#centerSellHead)"/>
+          <text x="${x((v.M+buyTarget)/2)}" y="65" text-anchor="middle" class="signal">向上确认 → 做多</text>
+          <text x="${x((v.M+sellTarget)/2)}" y="126" text-anchor="middle" class="signal">向下确认 → 做空</text>
+          <text x="${x(v.L)}" y="158" text-anchor="middle" class="price">L ${f(v.L)}</text>
+          <text x="${x(v.sellTrigger)}" y="177" text-anchor="middle" class="price">空触发 ${f(v.sellTrigger)}</text>
+          <text x="${x(v.M)}" y="158" text-anchor="middle" class="price">中轴 ${f(v.M)}</text>
+          <text x="${x(v.buyTrigger)}" y="177" text-anchor="middle" class="price">多触发 ${f(v.buyTrigger)}</text>
+          <text x="${x(v.U)}" y="158" text-anchor="middle" class="price">U ${f(v.U)}</text>
+          <text x="${x((v.L+v.lowerNoEntry)/2)}" y="35" text-anchor="middle" class="caption">边缘禁入</text>
+          <text x="${x(v.M)}" y="35" text-anchor="middle" class="caption">核心重置</text>
+          <text x="${x((v.upperNoEntry+v.U)/2)}" y="35" text-anchor="middle" class="caption">边缘禁入</text>
+        </svg>`;
+    }
+
+    function renderEdgeDiagram(v) {
+      if (!(v.W>0)) { $("edgeDiagram").innerHTML=""; return; }
+      const x=p=>70+860*Math.max(0,Math.min(1,(p-v.L)/v.W));
+      if (!v.edgeValid) {
+        $("edgeDiagram").innerHTML=`<div class="warning-item error">当前点差使两倍点差缓冲超过候选带上限，边缘模型自动禁用。</div>`;
+        return;
+      }
+      const longMid=(v.edgeLongLo+v.edgeLongHi)/2, shortMid=(v.edgeShortLo+v.edgeShortHi)/2;
+      $("edgeDiagram").innerHTML=`
+        <svg viewBox="0 0 1000 205" role="img" aria-label="边缘回归模型价格路径图">
+          <defs><marker id="edgeHead" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#ffbf69"/></marker></defs>
+          <rect x="70" y="62" width="860" height="54" rx="10" fill="rgba(77,163,255,.07)" stroke="#35516f"/>
+          <rect x="70" y="62" width="${x(v.edgeLongLo)-70}" height="54" rx="8" fill="rgba(255,107,120,.24)"/>
+          <rect x="${x(v.edgeLongLo)}" y="54" width="${x(v.edgeLongHi)-x(v.edgeLongLo)}" height="70" rx="7" fill="rgba(255,191,105,.24)" stroke="#ffbf69"/>
+          <rect x="${x(v.edgeShortLo)}" y="54" width="${x(v.edgeShortHi)-x(v.edgeShortLo)}" height="70" rx="7" fill="rgba(255,191,105,.24)" stroke="#ffbf69"/>
+          <rect x="${x(v.edgeShortHi)}" y="62" width="${930-x(v.edgeShortHi)}" height="54" rx="8" fill="rgba(255,107,120,.24)"/>
+          <line x1="70" y1="89" x2="930" y2="89" class="axis"/>
+          <path d="M ${x(longMid)} 99 Q ${x(longMid)-28} 38 ${x(v.M)} 76" class="revert-arrow" marker-end="url(#edgeHead)"/>
+          <path d="M ${x(shortMid)} 79 Q ${x(shortMid)+28} 38 ${x(v.M)} 102" class="revert-arrow" marker-end="url(#edgeHead)"/>
+          <text x="${x(longMid)}" y="145" text-anchor="middle" class="signal">低点反弹 ${f(v.confirm)} → 买</text>
+          <text x="${x(shortMid)}" y="145" text-anchor="middle" class="signal">高点回落 ${f(v.confirm)} → 卖</text>
+          <text x="${x(v.L)}" y="176" text-anchor="middle" class="price">下边界 ${f(v.L)}</text>
+          <text x="${x(v.M)}" y="176" text-anchor="middle" class="price">目标方向 / 中轴 ${f(v.M)}</text>
+          <text x="${x(v.U)}" y="176" text-anchor="middle" class="price">上边界 ${f(v.U)}</text>
+          <text x="${x(longMid)}" y="38" text-anchor="middle" class="caption">下边缘候选带</text>
+          <text x="${x(shortMid)}" y="38" text-anchor="middle" class="caption">上边缘候选带</text>
+          <text x="${x(v.L)+8}" y="89" class="caption">突破即失效</text>
+          <text x="${x(v.U)-8}" y="89" text-anchor="end" class="caption">突破即失效</text>
+        </svg>`;
+    }
+
+    function buildStrategy(v) {
+      return `【一、区间定义】
+用户中心点：${f(v.M)}，上下距离各 ${f(v.distance)}。
+自动区间：${f(v.L)} ～ ${f(v.U)}，总宽度 ${f(v.W)}。
+Bid ≤ ${f(v.L)} 或 Ask ≥ ${f(v.U)} 时，立即禁止新仓、撤销本区间挂单、平掉本区间持仓并锁死 RangeID。价格返回区间也不得自动恢复。
+
+【二、共同交易门控】
+1. 当前点差必须 ≤ ${f(v.maxSpread)}；当前基准点差为 ${f(v.spread)}。
+2. 同时最多持有一笔策略仓位，一边成交后取消另一边候选信号。
+3. 进入下方 ${f(v.L)}～${f(v.lowerNoEntry)} 或上方 ${f(v.upperNoEntry)}～${f(v.U)} 时禁止新开中枢单。
+4. 平仓后必须重新访问中轴核心区 ${f(v.coreLo)}～${f(v.coreHi)} 才能重新武装。
+5. 交易请求进入 PENDING 后禁止重复发送，等待 OnTradeTransaction 核销。
+
+【三、中枢动量模型（默认主模型）】
+做多：价格访问中轴核心区后，500毫秒净上涨达到确认阈值且上涨Tick占优，Ask ≥ ${f(v.buyTrigger)} 时买入。
+做空：价格访问中轴核心区后，500毫秒净下跌达到确认阈值且下跌Tick占优，Bid ≤ ${f(v.sellTrigger)} 时卖出。
+禁止同时市价开多和开空；实现为软件OCO。
+
+多单退出：
+- 逻辑止损：Bid ≤ 实际开仓Ask − ${f(v.sl)}。
+- 灾难SL：开仓价 − ${f(v.serverSL)}，提交到服务器。
+- 止盈：Bid ≥ 实际开仓Ask + ${f(v.tp)}。
+- 浮盈达到 ${f(v.beTrigger)} 后，保护线推进到开仓价 + ${f(v.beLock)}。
+
+空单退出：
+- 逻辑止损：Ask ≥ 实际开仓Bid + ${f(v.sl)}。
+- 灾难SL：开仓价 + ${f(v.serverSL)}，提交到服务器。
+- 止盈：Ask ≤ 实际开仓Bid − ${f(v.tp)}。
+- 浮盈达到 ${f(v.beTrigger)} 后，保护线推进到开仓价 − ${f(v.beLock)}。
+
+初始阶段最长持仓 ${v.maxHold} 秒；到期未进入盈利保护则市价退出。进入盈利保护后由峰值/保护逻辑管理，阶段不得回退。
+
+【四、边缘回归模型（可选、默认低优先级）】
+${v.edgeValid?`下边缘候选带 ${f(v.edgeLongLo)}～${f(v.edgeLongHi)}，必须先形成局部低点并反弹 ${f(v.confirm)} 才允许买入。
+上边缘候选带 ${f(v.edgeShortLo)}～${f(v.edgeShortHi)}，必须先形成局部高点并回落 ${f(v.confirm)} 才允许卖出。
+触碰真正边界不再尝试反转，直接执行区间熔断。禁止马丁、禁止亏损补仓、禁止同一次贴边重复开单。`:`当前成本下边缘候选带无效，边缘模型必须关闭。`}
+
+【五、金额与总亏损退出】
+手数 ${f(v.lots,2)}，合约大小 ${f(v.contract,0)}。
+单笔止盈金额估算：${money(v.winCash)}。
+单笔逻辑止损金额估算：${money(-v.lossCash)}。
+价格距离保本胜率：${pct(v.breakeven)}。
+用户总亏损上限：$${f(v.maxLoss)}，约可承受 ${v.lossCapacity} 次标准逻辑止损。
+实时计算本 RangeID 的“已实现净盈亏 + 未实现浮盈亏 + 手续费”。当合计 ≤ -$${f(v.maxLoss)} 时，无条件禁止新仓、撤销挂单、平掉全部持仓并永久锁死区间。不得等待价格边界。
+金额示例按每手100盎司估算；EA必须使用实际合约规格和 OrderCalcProfit() 计算，手续费以账户真实成交记录为准。
+
+【六、执行优先级】
+区间熔断 > 已有仓位退出 > 点差和权限门控 > 状态核销 > 新入场判断。
+任何平仓或撤单调用返回 true 只代表请求结构通过；必须检查服务器 retcode，并由 OnTradeTransaction 确认最终成交、拒绝或残仓。`;
+    }
+
+    ids.forEach(id => $(id).addEventListener("input", calculate));
+    document.querySelectorAll(".tab").forEach(btn=>btn.addEventListener("click",()=>{
+      document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+      document.querySelectorAll(".tab-content").forEach(x=>x.classList.remove("active"));
+      btn.classList.add("active"); $(btn.dataset.tab).classList.add("active");
+    }));
+    $("resetBtn").addEventListener("click",()=>{ids.forEach(id=>$(id).value=defaults[id]);calculate();});
+    $("copyBtn").addEventListener("click",async()=>{
+      const text=$("strategyText").textContent;
+      try {
+        if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
+        else {
+          const area=document.createElement("textarea"); area.value=text; area.style.position="fixed"; area.style.opacity="0";
+          document.body.appendChild(area); area.select(); document.execCommand("copy"); area.remove();
+        }
+        const old=$("copyBtn").textContent; $("copyBtn").textContent="已复制"; setTimeout(()=>$("copyBtn").textContent=old,1200);
+      } catch (_) {
+        const old=$("copyBtn").textContent; $("copyBtn").textContent="复制失败，请手动选择"; setTimeout(()=>$("copyBtn").textContent=old,1800);
+      }
+    });
+    try {
+      const saved=JSON.parse(localStorage.getItem("tradeez-scalp-model")||"null");
+      if(saved) ids.forEach(id=>{if(saved[id]!==undefined)$(id).value=saved[id]});
+    } catch (_) {}
+    calculate();
+  </script>
+</body>
+</html>

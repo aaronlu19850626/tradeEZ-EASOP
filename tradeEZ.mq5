@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //|                                           TradeEZ_SOP_EA.mq5      |
 //|                    TradeEZ-SOP 分控 EA (UI 1:1 复刻 UI-TEST)      |
-//|                  最后修改时间：2026-09-19 05:48（北京时间）       |
+//|                  最后修改时间：2026-09-19 15:57（北京时间）       |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "TradeEZ-SOP"
@@ -55,6 +55,21 @@ uint GetCurrentThreadId();
 #define COLOR_GOLD              C'212,175,55'     // 金色外边框
 
 #define PANEL_FONT              "Segoe UI"
+
+// 策略测试器自动场景。默认关闭，真实图表禁止启用。
+enum ENUM_TEST_SCENARIO
+{
+    TEST_OFF        = 0,
+    TEST_SMOKE      = 1,
+    TEST_FULL       = 2,
+    TEST_SCALP      = 3,
+    TEST_TREND      = 4,
+    TEST_RISK       = 5,
+    TEST_BATCH      = 6,
+    TEST_PERIOD     = 7,
+    TEST_RECOVERY_A = 8,
+    TEST_RECOVERY_B = 9
+};
 
 //+------------------------------------------------------------------+
 //| 尺寸与对齐核心常量（支持全局缩放，适配任意DPI）                    |
@@ -178,6 +193,13 @@ input int      Inp_CooldownMinutes      = 10;    // 连续亏损熔断冷却(分
 input bool     Inp_EnableCircuitBreaker = true;  // 启用熔断
 input bool     Inp_AlertOnBreaker       = true;  // 熔断弹窗
 input bool     Inp_CloseOnDailyDrawdown = false; // 日回撤熔断时强平本品种全部仓位/挂单
+
+input group "===== 策略测试器（实盘必须关闭） ====="
+input ENUM_TEST_SCENARIO Inp_TestScenario = TEST_OFF; // 仅策略测试器执行自动场景
+input string   Inp_TestRunId          = "default";    // 报告/状态隔离标识
+input int      Inp_TestMaxSeconds     = 120;          // 单场景最长模拟秒数
+input int      Inp_TestBatchSize      = 20;           // 后续批量场景规模(1~100)
+input bool     Inp_TestAutoCleanup    = true;         // 测试结束自动清理本轮持仓与挂单
 
 input group "===== 新增风险门禁 ====="
 input double   Inp_RiskBufferPercent       = 10.0;  // 预计止损风险附加缓冲%
@@ -365,6 +387,30 @@ bool           g_PriceEditActive = false; // 输入期间暂停整面板重建,�
 
 // 下单去抖(防止一次点击触发重复下单)
 ulong          g_LastOrderMs = 0;
+
+// 策略测试器自动场景运行状态（仅 Inp_TestScenario != TEST_OFF 时使用）。
+int            g_TestStep = 0;
+datetime       g_TestStartedAt = 0;
+datetime       g_TestStepDeadline = 0;
+int            g_TestPassCount = 0;
+int            g_TestFailCount = 0;
+bool           g_TestReportWritten = false;
+bool           g_TestFinished = false;
+string         g_TestFailureReason = "";
+string         g_TestEvents = "";
+bool           g_TestReadyWaitLogged = false;
+int            g_TestEntryOpIndex = -1;
+
+enum ENUM_TEST_STEP
+{
+    TEST_STEP_IDLE = 0,
+    TEST_STEP_WAIT_READY,
+    TEST_STEP_WAIT_ENTRY,
+    TEST_STEP_WAIT_CLOSE,
+    TEST_STEP_CLEANUP,
+    TEST_STEP_DONE,
+    TEST_STEP_FAILED
+};
 
 // 剥头皮超时强平:已被用户取消倒计时的 ticket(不再强平)
 ulong          g_TimeoutCancelled[];
@@ -6704,8 +6750,254 @@ bool PublishInstanceManifest()
 //+------------------------------------------------------------------+
 //| 入口函数                                                          |
 //+------------------------------------------------------------------+
+datetime TesterScenarioClock()
+{
+    datetime now = TimeCurrent();
+    datetime server = TimeTradeServer();
+    if(server > now) now = server;
+    return now;
+}
+
+string TesterScenarioId()
+{
+    string id = Inp_TestRunId;
+    if(id == "") id = "default";
+    StringReplace(id, "\\", "_");
+    StringReplace(id, "/", "_");
+    StringReplace(id, " ", "_");
+    StringReplace(id, ":", "_");
+    return id;
+}
+
+void TesterScenarioRecord(string status, string name, string detail)
+{
+    if(status == "PASS") g_TestPassCount++;
+    else if(status == "FAIL") g_TestFailCount++;
+    g_TestEvents += StringFormat("[%s] %s | %s\n", status, name, detail);
+    PrintFormat("[TEST][%s] %s | %s", status, name, detail);
+}
+
+string TesterScenarioStepName()
+{
+    if(g_TestStep == TEST_STEP_WAIT_READY) return "WAIT_READY";
+    if(g_TestStep == TEST_STEP_WAIT_ENTRY) return "WAIT_ENTRY";
+    if(g_TestStep == TEST_STEP_WAIT_CLOSE) return "WAIT_CLOSE";
+    if(g_TestStep == TEST_STEP_CLEANUP) return "CLEANUP";
+    if(g_TestStep == TEST_STEP_DONE) return "DONE";
+    if(g_TestStep == TEST_STEP_FAILED) return "FAILED";
+    return "IDLE";
+}
+
+string TesterScenarioReportBase()
+{
+    string stamp = TimeToString(g_TestStartedAt, TIME_DATE|TIME_SECONDS);
+    StringReplace(stamp, ".", "");
+    StringReplace(stamp, ":", "");
+    StringReplace(stamp, " ", "_");
+    return "TradeEZ_Test_" + TesterScenarioId() + "_" + stamp;
+}
+
+void TesterScenarioWriteReport()
+{
+    if(g_TestReportWritten) return;
+    g_TestReportWritten = true;
+    string base = TesterScenarioReportBase();
+    string mdPath = base + ".md";
+    int h = FileOpen(mdPath, FILE_WRITE|FILE_TXT|FILE_ANSI, 0, CP_UTF8);
+    if(h != INVALID_HANDLE)
+    {
+        FileWriteString(h, "# TradeEZ-SOP 策略测试报告\n\n");
+        FileWriteString(h, "| 项目 | 值 |\n|---|---|\n");
+        FileWriteString(h, "| 场景 | " + (string)Inp_TestScenario + " |\n");
+        FileWriteString(h, "| Run ID | " + TesterScenarioId() + " |\n");
+        FileWriteString(h, "| 品种 | " + _Symbol + " |\n");
+        FileWriteString(h, "| 开始时间 | " + TimeToString(g_TestStartedAt, TIME_DATE|TIME_SECONDS) + " |\n");
+        FileWriteString(h, "| 结果 | " + ((g_TestFailCount == 0 && g_TestFinished && g_TestStep == TEST_STEP_DONE) ? "PASS" : "FAIL") + " |\n");
+        FileWriteString(h, "| PASS 数 | " + (string)g_TestPassCount + " |\n");
+        FileWriteString(h, "| FAIL 数 | " + (string)g_TestFailCount + " |\n");
+        FileWriteString(h, "| 失败原因 | " + g_TestFailureReason + " |\n\n");
+        FileWriteString(h, "## 事件\n\n" + g_TestEvents);
+        FileWriteString(h, "\n## 结束状态\n\n");
+        FileWriteString(h, "- 当前品种空仓空单：" + (SymbolIsFlat() ? "是" : "否") + "\n");
+        FileWriteString(h, "- 剩余持仓：" + (string)PositionsTotal() + "\n");
+        FileWriteString(h, "- 剩余挂单：" + (string)OrdersTotal() + "\n");
+        FileClose(h);
+    }
+    string csvPath = base + ".csv";
+    h = FileOpen(csvPath, FILE_WRITE|FILE_TXT|FILE_ANSI, ',', CP_UTF8);
+    if(h != INVALID_HANDLE)
+    {
+        FileWrite(h, "scenario", "run_id", "symbol", "result", "pass_count", "fail_count", "failure_reason");
+        FileWrite(h, (string)Inp_TestScenario, TesterScenarioId(), _Symbol,
+                  (g_TestFailCount == 0 && g_TestFinished && g_TestStep == TEST_STEP_DONE) ? "PASS" : "FAIL",
+                  (string)g_TestPassCount, (string)g_TestFailCount, g_TestFailureReason);
+        FileClose(h);
+    }
+    PrintFormat("[TEST] 报告已生成：%s / %s", mdPath, csvPath);
+}
+
+void TesterScenarioFail(string reason)
+{
+    if(g_TestFinished) return;
+    g_TestFailureReason = reason;
+    g_TestStep = TEST_STEP_FAILED;
+    g_TestFinished = true;
+    if(Inp_TestAutoCleanup && !SymbolIsFlat())
+    {
+        CloseAllOrders("tester_cleanup", "", true);
+        g_TestStep = TEST_STEP_CLEANUP;
+        g_TestStepDeadline = TesterScenarioClock() + 30;
+    }
+    TesterScenarioRecord("FAIL", "场景结束", reason);
+    if(g_TestStep != TEST_STEP_CLEANUP) TesterScenarioWriteReport();
+}
+
+void TesterScenarioFinish()
+{
+    if(g_TestFinished) return;
+    g_TestFinished = true;
+    g_TestStep = TEST_STEP_DONE;
+    TesterScenarioRecord("PASS", "场景结束", "SMOKE 场景完成且本轮交易已清理");
+    TesterScenarioWriteReport();
+}
+
+void TesterScenarioTick()
+{
+    if(!MQLInfoInteger(MQL_TESTER) || Inp_TestScenario == TEST_OFF || g_TestReportWritten) return;
+    datetime now = TesterScenarioClock();
+    if(g_TestStartedAt == 0)
+    {
+        g_TestStartedAt = now;
+        g_TestStep = TEST_STEP_WAIT_READY;
+        // 测试日可能从券商每日维护窗口开始。等待市场/策略时段不属于交易请求超时，
+        // 最多允许历史时间推进 8 小时；真正提交交易请求后才使用 Inp_TestMaxSeconds。
+        g_TestStepDeadline = now + MathMax(8 * 3600, Inp_TestMaxSeconds);
+        if(Inp_TestScenario != TEST_SMOKE)
+        {
+            TesterScenarioFail("当前版本只实现 TEST_SMOKE；其余场景将在后续迭代启用");
+            return;
+        }
+        TesterScenarioRecord("PASS", "测试入口", "策略测试器自动场景已启动");
+    }
+    if(g_TestStep == TEST_STEP_CLEANUP)
+    {
+        if(SymbolIsFlat() || now >= g_TestStepDeadline)
+        {
+            if(!SymbolIsFlat()) g_TestFailureReason += "；自动清理超时，仍有残留交易";
+            TesterScenarioWriteReport();
+        }
+        return;
+    }
+    if(g_TestFinished) return;
+    if(now >= g_TestStepDeadline)
+    {
+        string detail = "场景步骤超时 stage=" + TesterScenarioStepName();
+        if(g_TestEntryOpIndex >= 0 && g_TestEntryOpIndex < ArraySize(g_TradeOps))
+        {
+            detail += StringFormat(" op=%s state=%d retcode=%u",
+                                   g_TradeOps[g_TestEntryOpIndex].operation_id,
+                                   g_TradeOps[g_TestEntryOpIndex].state,
+                                   g_TradeOps[g_TestEntryOpIndex].last_retcode);
+        }
+        else if(g_TestStep == TEST_STEP_WAIT_READY)
+            detail += "；8个历史小时内未进入券商开市且EA允许交易的时段";
+        else
+            detail += "；可能没有有效历史Tick或交易请求未完成";
+        TesterScenarioFail(detail);
+        return;
+    }
+    if(g_TestStep == TEST_STEP_WAIT_READY)
+    {
+        if(g_RecoveryStatus == RECOVERY_FAILED)
+        {
+            TesterScenarioFail("启动恢复失败：" + g_RecoveryReason);
+            return;
+        }
+        if(g_RecoveryStatus == RECOVERY_CHECKING || !g_InstanceOwnsState) return;
+        if(!SymbolIsFlat())
+        {
+            TesterScenarioFail("测试开始前当前品种不是空仓，拒绝接管已有交易");
+            return;
+        }
+        bool marketClosed = IsMarketClosed();
+        bool offSession = Inp_UseSession && !InSession();
+        if(marketClosed || offSession)
+        {
+            if(!g_TestReadyWaitLogged)
+            {
+                string why = marketClosed ? "券商休市/盘间维护" : "EA非交易时段";
+                TesterScenarioRecord("INFO", "等待可交易时段",
+                                     why + "；该等待不占用交易步骤的" +
+                                     (string)Inp_TestMaxSeconds + "秒超时");
+                g_TestReadyWaitLogged = true;
+            }
+            return;
+        }
+        g_TestReadyWaitLogged = false;
+        int opCountBefore = ArraySize(g_TradeOps);
+        g_TestStep = TEST_STEP_WAIT_ENTRY;
+        OpenMarket(SOP_SCALP, true);
+        if(ArraySize(g_TradeOps) <= opCountBefore)
+        {
+            TesterScenarioFail("H-01 开仓前置校验未通过，未创建交易请求；请查看同一时刻的[REJECT]日志");
+            return;
+        }
+        g_TestEntryOpIndex = ArraySize(g_TradeOps) - 1;
+        TesterScenarioRecord("INFO", "H-01 请求提交",
+                             StringFormat("op=%s state=%d retcode=%u",
+                                          g_TradeOps[g_TestEntryOpIndex].operation_id,
+                                          g_TradeOps[g_TestEntryOpIndex].state,
+                                          g_TradeOps[g_TestEntryOpIndex].last_retcode));
+        g_TestStepDeadline = now + MathMax(30, Inp_TestMaxSeconds);
+        return;
+    }
+    if(g_TestStep == TEST_STEP_WAIT_ENTRY)
+    {
+        if(g_TestEntryOpIndex < 0 || g_TestEntryOpIndex >= ArraySize(g_TradeOps))
+        {
+            TesterScenarioFail("H-01 交易请求记录丢失，无法核对开仓结果");
+            return;
+        }
+        int opState = g_TradeOps[g_TestEntryOpIndex].state;
+        if(opState == TRADE_OP_FAILED || opState == TRADE_OP_CANCELLED)
+        {
+            TesterScenarioFail(StringFormat("H-01 开仓请求失败 op=%s state=%d retcode=%u",
+                                            g_TradeOps[g_TestEntryOpIndex].operation_id,
+                                            opState,
+                                            g_TradeOps[g_TestEntryOpIndex].last_retcode));
+            return;
+        }
+        if(CountScalpPositions() > 0)
+        {
+            TesterScenarioRecord("PASS", "H-01 剥头皮市价多", "服务器已形成受管持仓");
+            g_TestStep = TEST_STEP_WAIT_CLOSE;
+            g_TestStepDeadline = now + MathMax(30, Inp_TestMaxSeconds);
+            CloseByKind(SOP_SCALP);
+        }
+        return;
+    }
+    if(g_TestStep == TEST_STEP_WAIT_CLOSE)
+    {
+        if(SymbolIsFlat())
+        {
+            TesterScenarioRecord("PASS", "H-02 分类平仓", "剥头皮持仓已由请求闭环确认清零");
+            TesterScenarioFinish();
+        }
+    }
+}
+
 int OnInit()
 {
+    if(Inp_TestScenario != TEST_OFF && !MQLInfoInteger(MQL_TESTER))
+    {
+        Print("[TEST] 拒绝：自动测试场景只能在 MT5 策略测试器运行，真实图表必须使用 TEST_OFF。");
+        return INIT_PARAMETERS_INCORRECT;
+    }
+    if(Inp_TestMaxSeconds < 10 || Inp_TestBatchSize < 1 || Inp_TestBatchSize > 100)
+    {
+        Print("[TEST] 参数无效：Inp_TestMaxSeconds 至少10秒，Inp_TestBatchSize 必须为1~100。");
+        return INIT_PARAMETERS_INCORRECT;
+    }
     if(Inp_ResetHour < 0 || Inp_ResetHour > 23 || Inp_ResetMinute < 0 || Inp_ResetMinute > 59 ||
        Inp_RecoveryLookbackDays < 1 || Inp_RecoveryRetrySeconds < 5 ||
        Inp_ScalpSL_Points <= 0 || Inp_TrendSL_Points <= 0 || Inp_ScalpTP_Points < 0 ||
@@ -6783,6 +7075,15 @@ int OnInit()
 void OnDeinit(const int reason)
 {
     EventKillTimer();
+    if(MQLInfoInteger(MQL_TESTER) && Inp_TestScenario != TEST_OFF && !g_TestReportWritten)
+    {
+        if(g_TestStartedAt == 0) g_TestStartedAt = TesterScenarioClock();
+        if(g_TestFailureReason == "") g_TestFailureReason = "测试器在场景完成前结束运行";
+        g_TestFinished = true;
+        g_TestStep = TEST_STEP_FAILED;
+        TesterScenarioRecord("FAIL", "场景结束", g_TestFailureReason);
+        TesterScenarioWriteReport();
+    }
     if(g_InstanceOwnsState)
     {
         if(g_RecoveryStatus != RECOVERY_CHECKING && g_RecoveryStatus != RECOVERY_FAILED)
@@ -6814,6 +7115,7 @@ void OnTick()
 
     // 每tick更新报价条(不重建整个面板,避免打字被打断)
     UpdateQuoteBar(); // 紧凑面板也需要实时报价
+    TesterScenarioTick();
 }
 
 void OnTimer()
@@ -6856,6 +7158,7 @@ void OnTimer()
         manifestSeconds = 0;
         PublishInstanceManifest();
     }
+    TesterScenarioTick();
 }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)

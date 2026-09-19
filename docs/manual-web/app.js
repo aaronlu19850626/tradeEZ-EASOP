@@ -1,0 +1,10 @@
+const $=s=>document.querySelector(s);
+const sections=[...document.querySelectorAll('main section')],links=[...document.querySelectorAll('nav a')];
+$('#search').addEventListener('input',e=>{const q=e.target.value.trim().toLowerCase();let count=0;sections.forEach(s=>{const show=!q||s.textContent.toLowerCase().includes(q);s.hidden=!show;const link=links.find(a=>a.hash==='#'+s.id);if(link)link.hidden=!show;if(show)count++});$('#searchResult').textContent=q?(count?'找到 '+count+' 个相关章节':'没有找到相关内容，请换个关键词。'):'';});
+const observer=new IntersectionObserver(entries=>{for(const e of entries)if(e.isIntersecting){links.forEach(a=>a.classList.toggle('active',a.hash==='#'+e.target.id));}},{rootMargin:'-15% 0px -65% 0px',threshold:0});sections.forEach(s=>observer.observe(s));
+const viewer=$('#viewer');document.querySelectorAll('[data-image]').forEach(b=>b.addEventListener('click',()=>{const img=$('#largeImage');img.src=b.dataset.image;img.alt=b.querySelector('img').alt;viewer.showModal();}));$('#closeViewer').addEventListener('click',()=>viewer.close());viewer.addEventListener('click',e=>{if(e.target===viewer)viewer.close()});
+const checks=[...document.querySelectorAll('[data-check]')];function updateChecks(){ $('#checkProgress').textContent='已完成 '+checks.filter(c=>c.checked).length+' / '+checks.length+' 项';try{localStorage.setItem('tradeez-guide-checks',JSON.stringify(checks.map(c=>c.checked)))}catch{}}
+try{const saved=JSON.parse(localStorage.getItem('tradeez-guide-checks')||'[]');checks.forEach((c,i)=>c.checked=!!saved[i])}catch{}
+checks.forEach(c=>c.addEventListener('change',updateChecks));$('#clearChecks').addEventListener('click',()=>{checks.forEach(c=>c.checked=false);updateChecks()});updateChecks();
+$('#print').addEventListener('click',()=>{const closed=[...document.querySelectorAll('details:not([open])')];const hidden=sections.filter(s=>s.hidden);closed.forEach(d=>d.open=true);hidden.forEach(s=>s.hidden=false);window.print();closed.forEach(d=>d.open=false);hidden.forEach(s=>s.hidden=true)});
+
